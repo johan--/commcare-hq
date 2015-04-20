@@ -15,8 +15,8 @@ Flip Elasticsearch aliases. (See
 
     $ ./manage.py ptop_es_manage --flip_all_aliases
 
-Start pillowtop. pillowtop listens for couchDB changes, reads new
-documents, and passes them on to elasticsearch or PosgreSQL. ::
+Start pillowtop. pillowtop listens for CouchDB changes, reads new
+documents, and passes them on to Elasticsearch or PosgreSQL. ::
 
     $ ./manage.py run_ptop --all
 
