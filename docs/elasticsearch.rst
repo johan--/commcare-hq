@@ -1,6 +1,8 @@
 ElasticSearch
 =============
 
+.. _elasticsearch_indexes:
+
 Indexes
 -------
 We have indexes for each of the following doc types:

@@ -10,9 +10,8 @@ The Django development server: ::
 
     $ ./manage.py runserver
 
-Flip pillowtop elasticsearch aliases:
-.. TOOD: What does that mean?
-::
+Flip Elasticsearch aliases. (See
+:ref:`Elasticsearch Indexes <elasticsearch_indexes>` for more information) ::
 
     $ ./manage.py ptop_es_manage --flip_all_aliases
 
