@@ -1,3 +1,4 @@
+# coding=utf-8
 """
 Fluff calculators that pertain to specific cases/beneficiaries (mothers)
 These are used in the Beneficiary Payment Report and Conditions Met Report
@@ -6,6 +7,9 @@ import re
 import datetime
 from decimal import Decimal
 from django.core.urlresolvers import reverse
+from django.template.defaultfilters import yesno
+from custom.opm.constants import InvalidRow, BIRTH_PREP_XMLNS, CHILDREN_FORMS, CFU1_XMLNS, DOMAIN, CFU2_XMLNS, \
+    MONTH_AMT, TWO_YEAR_AMT, THREE_YEAR_AMT
 from dimagi.utils.dates import months_between, first_of_next_month, add_months_to_date
 
 from dimagi.utils.dates import add_months
@@ -14,8 +18,6 @@ from dimagi.utils.decorators.memoized import memoized
 from django.utils.translation import ugettext as _
 
 from corehq.util.translation import localize
-
-from .constants import *
 
 
 EMPTY_FIELD = "---"
@@ -48,22 +50,34 @@ VHND_NO = 'VHND_no.png'
 
 class OPMCaseRow(object):
 
-    def __init__(self, case, report, child_index=1):
+    def __init__(self, case, report, child_index=1, is_secondary=False, explicit_month=None, explicit_year=None):
         self.child_index = child_index
         self.case = case
         self.report = report
         self.data_provider = report.data_provider
         self.block = report.block.lower()
-        self.month = report.month
-        self.year = report.year
+        self.month = explicit_month or report.month
+        self.year = explicit_year or report.year
+        self.is_secondary = is_secondary
 
         if not report.is_rendered_as_email:
-            self.img_elem = '<div style="width:160px !important;"><img src="/static/opm/img/%s"></div>'
+            self.img_elem = '<div style="width:160px !important;"><img src="/static/opm/img/%s">' \
+                            '<text class="image-descriptor" style="display:none">%s</text></div>'
         else:
-            self.img_elem = '<div><img src="/static/opm/img/%s"></div>'
+            self.img_elem = '<div><img src="/static/opm/img/%s"><text class="image-descriptor" ' \
+                            'style="display:none">%s</text></div>'
 
         self.set_case_properties()
-        self.add_extra_children()
+        self.last_month_row = None
+        if not is_secondary:
+            self.add_extra_children()
+            # if we were called directly, set the last month's row on this
+            last_year, last_month = add_months(self.year, self.month, -1)
+            try:
+                self.last_month_row = OPMCaseRow(case, report, 1, is_secondary=True,
+                                                 explicit_month=last_month, explicit_year=last_year)
+            except InvalidRow:
+                pass
 
     @property
     def readable_status(self):
@@ -92,21 +106,26 @@ class OPMCaseRow(object):
     def case_id(self):
         return self.case._id
 
+    def get_date_property(self, property):
+        prop = self.case_property(property)
+        if prop and not isinstance(prop, datetime.date):
+            raise InvalidRow("{} must be a date!".format(property))
+        return prop
+
     @property
     @memoized
     def dod(self):
-        dod = self.case_property('dod')
-        if dod and not isinstance(dod, datetime.date):
-            raise InvalidRow('Delivery date must be a date!')
-        return dod
+        return self.get_date_property('dod')
 
     @property
     @memoized
     def edd(self):
-        edd = self.case_property('edd')
-        if edd and not isinstance(edd, datetime.date):
-            raise InvalidRow('EDD must be a date!')
-        return edd
+        return self.get_date_property('edd')
+
+    @property
+    @memoized
+    def lmp(self):
+        return self.get_date_property('lmp_date')
 
     @property
     @memoized
@@ -127,14 +146,21 @@ class OPMCaseRow(object):
             return 'pregnant'
         else:
             # no dates, not valid
-            raise InvalidRow()
+            raise InvalidRow("Case doesn't specify an EDD or DOD.")
 
     @property
     @memoized
     def preg_month(self):
         if self.status == 'pregnant':
+            if not self.edd:
+                raise InvalidRow('No edd found for pregnant mother.')
             base_window_start = add_months_to_date(self.edd, -9)
-            non_adjusted_month = len(months_between(base_window_start, self.reporting_window_start)) - 1
+            try:
+                non_adjusted_month = len(months_between(base_window_start, self.reporting_window_start)) - 1
+            except AssertionError:
+                raise InvalidRow('Mother LMP ({}) was after the reporting window date ({})'.format(
+                    base_window_start, self.reporting_window_start
+                ))
 
             # the date to check one month after they first become eligible,
             # aka the end of their fourth month of pregnancy
@@ -213,7 +239,10 @@ class OPMCaseRow(object):
 
     def set_case_properties(self):
         if self.child_age is None and self.preg_month is None:
-            raise InvalidRow
+            raise InvalidRow("Window not found")
+
+        if self.window > 14:
+            raise InvalidRow(_('Child is past window 14 (was {}'.format(self.window)))
 
         name = self.case_property('name', EMPTY_FIELD)
         if getattr(self.report,  'show_html', True):
@@ -236,7 +265,7 @@ class OPMCaseRow(object):
         self.account_number = unicode(account) if account else ''
         # fake cases will have accounts beginning with 111
         if re.match(r'^111', self.account_number):
-            raise InvalidRow
+            raise InvalidRow("Account begins with 111, assuming test case")
 
     @property
     def closed_date(self):
@@ -244,13 +273,25 @@ class OPMCaseRow(object):
             return EMPTY_FIELD
         return str(self.case_property('closed_on', EMPTY_FIELD))
 
-    def condition_image(self, image_y, image_n, condition):
+    @property
+    def closed_in_reporting_month(self):
+        if not self.closed:
+            return False
+
+        closed_datetime = self.case_property('closed_on', EMPTY_FIELD)
+        if closed_datetime and not isinstance(closed_datetime, datetime.datetime):
+            raise InvalidRow('Closed date is not of datetime.datetime type')
+        closed_date = closed_datetime.date()
+        return closed_date >= self.reporting_window_start and\
+            closed_date < self.reporting_window_end
+
+    def condition_image(self, image_y, image_n, descriptor_y, descriptor_n, condition):
         if condition is None:
             return ''
         elif condition is True:
-            return self.img_elem % image_y
+            return self.img_elem % (image_y, descriptor_y)
         elif condition is False:
-            return self.img_elem % image_n
+            return self.img_elem % (image_n, descriptor_n)
 
     @property
     def preg_attended_vhnd(self):
@@ -301,6 +342,9 @@ class OPMCaseRow(object):
 
     @property
     def preg_weighed(self):
+        return self.preg_weighed_trimestered(self.preg_month)
+
+    def preg_weighed_trimestered(self, query_preg_month):
         def _from_case(property):
             return self.case_property(property, 0) == 'received'
 
@@ -310,13 +354,13 @@ class OPMCaseRow(object):
                 for form in self.filtered_forms(BIRTH_PREP_XMLNS, **filter_kwargs)
             )
 
-        if self.preg_month == 6:
-            if not self.is_service_available('vhnd_adult_scale_available', months=3):
+        if self.preg_month == 6 and query_preg_month == 6:
+            if not self.is_service_available('func_bigweighmach', months=3):
                 return True
 
             return _from_case('weight_tri_1') or _from_forms({'explicit_start': self.preg_first_eligible_datetime})
-        elif self.preg_month == 9:
-            if not self.is_service_available('vhnd_adult_scale_available', months=3):
+        elif self.preg_month == 9 and query_preg_month == 9:
+            if not self.is_service_available('func_bigweighmach', months=3):
                 return True
 
             return _from_case('weight_tri_2') or _from_forms({'months_before': 3})
@@ -361,8 +405,8 @@ class OPMCaseRow(object):
 
     @property
     def child_growth_calculated(self):
-        if self.child_age % 3 == 0:
-            if not self.is_service_available('vhnd_child_scale_available', months=3):
+        if self.child_age and self.child_age % 3 == 0:
+            if not self.is_service_available('func_childweighmach', months=3):
                 return True
 
             xpath = self.child_xpath('form/child_{num}/child{num}_child_growthmon')
@@ -371,11 +415,31 @@ class OPMCaseRow(object):
                 for form in self.filtered_forms(CHILDREN_FORMS, 3)
             )
 
+    def child_growth_calculated_in_window(self, query_age):
+        """
+            query_age - must be last month of a window, multiple of 3
+            given last month of a window, this returns if
+            the child in that window attended at least 1 growth session or not
+        """
+        # do not handle middle months of a window
+        if query_age is 0 or query_age % 3 != 0:
+            return None
+        if self.child_age in [query_age - 2, query_age - 1, query_age]:
+            months_in_window = self.child_age % 3 or 3
+            if not self.is_service_available('func_childweighmach', months=months_in_window):
+                return True
+
+            xpath = self.child_xpath('form/child_{num}/child{num}_child_growthmon')
+            return any(
+                form.xpath(xpath) == '1'
+                for form in self.filtered_forms(CHILDREN_FORMS, months_in_window)
+            )
+
     @property
     def preg_received_ifa(self):
         if self.preg_month == 6:
             if self.block == "atri":
-                if not self.is_service_available('vhnd_ifa_available', months=3):
+                if not self.is_service_available('stock_ifatab', months=3):
                     return True
 
                 def _from_case():
@@ -392,7 +456,7 @@ class OPMCaseRow(object):
     @property
     def child_received_ors(self):
         if self.child_age % 3 == 0:
-            if not self.is_service_available('vhnd_ors_available', months=3):
+            if not self.is_service_available('stock_ors', months=3):
                 return True
 
             for form in self.filtered_forms(CHILDREN_FORMS, 3):
@@ -402,8 +466,24 @@ class OPMCaseRow(object):
             return True
 
     @property
+    def child_with_diarhea_received_ors(self):
+        for form in self.filtered_forms(CHILDREN_FORMS):
+            xpath = self.child_xpath('form/child_{num}/child{num}_child_orszntreat')
+            if form.xpath(xpath) and form.xpath(xpath) == '1':
+                return True
+        return False
+
+    @property
+    def child_has_diarhea(self):
+        for form in self.filtered_forms(CHILDREN_FORMS):
+            xpath = self.child_xpath('form/child_{num}/child{num}_suffer_diarrhea')
+            if form.xpath(xpath) == '1':
+                return True
+        return False
+
+    @property
     def child_weighed_once(self):
-        if self.child_age == 3:
+        if self.child_age == 3 and self.block == 'atri':
             # This doesn't depend on a VHND - it should happen at the hospital
             def _test(form):
                 return form.xpath(self.child_xpath('form/child_{num}/child{num}_child_weight')) == '1'
@@ -415,7 +495,7 @@ class OPMCaseRow(object):
 
     @property
     def child_birth_registered(self):
-        if self.child_age == 6:
+        if self.child_age == 6 and self.block == 'atri':
             if not self.is_vhnd_last_three_months:
                 return True
 
@@ -428,8 +508,8 @@ class OPMCaseRow(object):
 
     @property
     def child_received_measles_vaccine(self):
-        if self.child_age == 12:
-            if not self.is_service_available('vhnd_measles_vacc_available', months=3):
+        if self.child_age == 12 and self.block == 'atri':
+            if not self.is_service_available('stock_measlesvacc', months=3):
                 return True
 
             def _test(form):
@@ -454,11 +534,12 @@ class OPMCaseRow(object):
     def child_image_four(self):
         if self.block == 'atri':
             if self.child_age == 3:
-                return (CHILD_WEIGHT_Y, CHILD_WEIGHT_N)
+                return (CHILD_WEIGHT_Y, CHILD_WEIGHT_N, "जन्म के समय वजन तौला गया",
+                        "जन्म के समय वजन नहीं तौला गया")
             if self.child_age == 6:
-                return (C_REGISTER_Y, C_REGISTER_N)
+                return (C_REGISTER_Y, C_REGISTER_N, "जन्म पंजीकृत", "जन्म पंजीकृत नहीं")
             if self.child_age == 12:
-                return (MEASLEVACC_Y, MEASLEVACC_N)
+                return (MEASLEVACC_Y, MEASLEVACC_N, "खसरे का टिका लगाया", "खसरे का टिका नहीं लगाया")
 
     @property
     def child_breastfed(self):
@@ -469,7 +550,7 @@ class OPMCaseRow(object):
 
     @property
     def weight_grade_normal(self):
-        if self.block == "wazirganj":
+        if self.block == "atri":
             if self.child_age in [24, 36]:
                 if self.child_index == 1:
                     form_prop = 'interpret_grade'
@@ -483,13 +564,31 @@ class OPMCaseRow(object):
                     return self.child_age/12
                 return False
 
+    def weight_grade_status(self, status):
+        if self.status == 'pregnant':
+            return False
+        if self.child_index == 1:
+            form_prop = 'interpret_grade'
+        else:
+            form_prop = 'interpret_grade_{}'.format(self.child_index)
+
+        forms = self.filtered_forms(CHILDREN_FORMS, 1)
+        if len(forms) == 0:
+            return False
+        form = sorted(forms, key=lambda form: form.received_on)[-1]
+        # callers' responsibility to pass acceptable statuses
+        # status can be one of SAM, MAM, normal, overweight
+        if form.form.get(form_prop) == status:
+            return True
+        return False
+
     @property
     def birth_spacing_years(self):
         """
         returns None if inapplicable, False if not met, or
         2 for 2 years, or 3 for 3 years.
         """
-        if self.block == "atri":
+        if self.block == "wazirganj":
             if self.child_age in [24, 36]:
                 for form in self.filtered_forms(CHILDREN_FORMS):
                     if form.form.get('birth_spacing_prompt') == '1':
@@ -506,6 +605,10 @@ class OPMCaseRow(object):
     @memoized
     def vhnd_available(self):
         return self.is_service_available('vhnd_available', months=1)
+
+    @property
+    def vhnd_available_display(self):
+        return yesno(self.vhnd_available)
 
     @property
     @memoized
@@ -525,12 +628,21 @@ class OPMCaseRow(object):
             prop=prop,
         ))
 
+    @property
+    def num_children(self):
+        if self.status == 'pregnant':
+            return 0
+        return int(self.case_property("live_birth_amount", 0))
+
     def add_extra_children(self):
         if self.child_index == 1:
             # app supports up to three children only
-            num_children = min(int(self.case_property("live_birth_amount", 1)), 3)
+            num_children = min(self.num_children, 3)
             if num_children > 1:
-                extra_child_objects = [(self.__class__(self.case, self.report, child_index=num + 2)) for num in range(num_children - 1)]
+                extra_child_objects = [
+                    self.__class__(self.case, self.report, child_index=num + 2, is_secondary=True)
+                    for num in range(num_children - 1)
+                ]
                 self.report.set_extra_row_objects(extra_child_objects)
 
     @property
@@ -541,20 +653,9 @@ class OPMCaseRow(object):
     @property
     def all_conditions_met(self):
         if self.status == 'mother':
-            relevant_conditions = [
-                self.child_attended_vhnd,
-                self.child_growth_calculated,
-                self.child_received_ors,
-                self.child_condition_four,
-                self.child_breastfed,
-            ]
+            return self.child_followup
         else:
-            relevant_conditions = [
-                self.preg_attended_vhnd,
-                self.preg_weighed,
-                self.preg_received_ifa,
-            ]
-        return False not in relevant_conditions
+            return self.bp_conditions
 
     @property
     def month_amt(self):
@@ -580,11 +681,112 @@ class OPMCaseRow(object):
             amt=self.cash_amt,
         )
 
+    @property
+    def bp1(self):
+        if 3 < self.preg_month < 7:
+            return self.bp_conditions
+
+    @property
+    def bp2(self):
+        if 6 < self.preg_month < 10:
+            return self.bp_conditions
+
+    @property
+    @memoized
+    def bp_conditions(self):
+        if self.status == "pregnant":
+            return False not in [
+                self.preg_attended_vhnd,
+                self.preg_weighed,
+                self.preg_received_ifa,
+            ]
+
+    @property
+    @memoized
+    def child_followup(self):
+        """
+        wazirganj - total_soft_conditions = 1
+        """
+        if self.status == 'mother':
+            return False not in [
+                self.child_attended_vhnd,
+                self.child_received_ors,
+                self.child_growth_calculated,
+                self.child_weighed_once,
+                self.child_birth_registered,
+                self.child_received_measles_vaccine,
+                self.child_breastfed,
+            ]
+
+    def bad_edd(self):
+        """The expected date of delivery is beyond program range"""
+        # EDD is more than nine months from the date the report is run
+        if self.edd and self.edd > add_months_to_date(datetime.date.today(), 9):
+            return _("Incorrect EDD")
+
+    def bad_dod(self):
+        """DOD doesn't line up with the EDD (more than a month's difference)"""
+        if (self.dod and self.edd
+            and abs(self.edd - self.dod) > datetime.timedelta(days=30)):
+            return _("Incorrect DOD")
+
+    def bad_lmp(self):
+        """The LMP date is beyond program range"""
+        if self.lmp and not (self.lmp < datetime.date.today()):
+            return _("Incorrect LMP date")
+
+    def bad_account_num(self):
+        """Account number is incorrect"""
+        if not (11 <= len(self.account_number) <= 16):
+            return _("Account number is the wrong length")
+
+    def bad_ifsc(self):
+        """IFSC is not precisely 11 characters"""
+        if len(self.ifs_code) != 11:
+            return _("IFSC {} incorrect").format(self.ifs_code)
+
+    @property
+    def issues(self):
+        return ", ".join(filter(None, [
+            self.bad_edd(),
+            self.bad_dod(),
+            self.bad_lmp(),
+            self.bad_account_num(),
+            self.bad_ifsc(),
+        ]))
+
+    @property
+    def bp1_cash(self):
+        return MONTH_AMT if self.bp1 else 0
+
+    @property
+    def bp2_cash(self):
+        return MONTH_AMT if self.bp2 else 0
+
+    @property
+    def child_cash(self):
+        return MONTH_AMT if self.child_followup else 0
+
+    @property
+    def total_cash(self):
+        """
+        This exists as a function separate from cash_amt only to be certain
+        that it's consistent with the values being summed
+        """
+        amount = min(
+            MONTH_AMT,
+            self.bp1_cash + self.bp2_cash + self.child_cash
+        ) + self.year_end_bonus_cash
+        assert amount == self.cash_amt, "The CMR and BPR disagree on payment!"
+        return amount
+
 
 class ConditionsMet(OPMCaseRow):
     method_map = [
+        ('serial_number', _("Serial number"), True),
         ('name', _("List of Beneficiaries"), True),
         ('awc_name', _("AWC Name"), True),
+        ('awc_code', _("AWC Code"), True),
         ('block_name', _("Block Name"), True),
         ('husband_name', _("Husband Name"), True),
         ('readable_status', _("Current status"), True),
@@ -599,32 +801,44 @@ class ConditionsMet(OPMCaseRow):
         ('five', _("Condition 5"), True),
         ('cash', _("Payment Amount"), True),
         ('case_id', _('Case ID'), True),
-        ('owner_id', _("Owner Id"), False),
-        ('closed', _('Closed'), False),
         ('closed_date', _("Closed On"), True),
-        ('village', _("Village Name"), False),
+        ('payment_last_month', _("Payment amount received last month (Rs.)"), True),
+        ('cash_received_last_month', _("Cash received last month"), True),
     ]
 
-    def __init__(self, case, report, child_index=1):
-        super(ConditionsMet, self).__init__(case, report, child_index=child_index)
+    def __init__(self, case, report, child_index=1, awc_codes={}, **kwargs):
+        super(ConditionsMet, self).__init__(case, report, child_index=child_index, **kwargs)
+        self.serial_number = child_index
+        self.payment_last_month = "Rs.%d" % self.last_month_row.cash_amt if self.last_month_row else 0
+        self.cash_received_last_month = self.last_month_row.vhnd_available_display if self.last_month_row else 'no'
+        self.awc_code = awc_codes.get(self.awc_name, EMPTY_FIELD)
+
         if self.status == 'mother':
             self.child_name = self.case_property(self.child_xpath("child{num}_name"), EMPTY_FIELD)
-            self.one = self.condition_image(C_ATTENDANCE_Y, C_ATTENDANCE_N, self.child_attended_vhnd)
-            self.two = self.condition_image(C_WEIGHT_Y, C_WEIGHT_N, self.child_growth_calculated)
-            self.three = self.condition_image(ORSZNTREAT_Y, ORSZNTREAT_N, self.child_received_ors)
+            self.one = self.condition_image(C_ATTENDANCE_Y, C_ATTENDANCE_N, "पोषण दिवस में उपस्थित",
+                                            "पोषण दिवस में उपस्थित नही", self.child_attended_vhnd)
+            self.two = self.condition_image(C_WEIGHT_Y, C_WEIGHT_N, "विकास की निगरानी रखी",
+                                            "विकास की निगरानी नहीं रखी", self.child_growth_calculated)
+            self.three = self.condition_image(ORSZNTREAT_Y, ORSZNTREAT_N, "दस्त होने पर ओ.आर.एस लेना",
+                                              "दस्त होने पर ओ.आर.एस नही लिया", self.child_received_ors)
             if self.child_condition_four is not None:
-                self.four = self.condition_image(self.child_image_four[0], self.child_image_four[1], self.child_condition_four)
+                self.four = self.condition_image(self.child_image_four[0], self.child_image_four[1],
+                                                 self.child_image_four[2], self.child_image_four[3],
+                                                 self.child_condition_four)
             else:
                 self.four = ''
-            self.five = self.condition_image(EXCBREASTFED_Y, EXCBREASTFED_N, self.child_breastfed)
+            self.five = self.condition_image(EXCBREASTFED_Y, EXCBREASTFED_N, "केवल माँ का दूध खिलाया गया",
+                                             "केवल माँ का दूध नहीं खिलाया गया", self.child_breastfed)
         elif self.status == 'pregnant':
             self.child_name = EMPTY_FIELD
-            self.one = self.condition_image(M_ATTENDANCE_Y, M_ATTENDANCE_N, self.preg_attended_vhnd)
-            self.two = self.condition_image(M_WEIGHT_Y, M_WEIGHT_N, self.preg_weighed)
-            self.three = self.condition_image(IFA_Y, IFA_N, self.preg_received_ifa)
+            self.one = self.condition_image(M_ATTENDANCE_Y, M_ATTENDANCE_N, "पोषण दिवस में उपस्थित",
+                                            "पोषण दिवस में उपस्थित नही", self.preg_attended_vhnd)
+            self.two = self.condition_image(M_WEIGHT_Y, M_WEIGHT_N, "गर्भवती का वज़न लेना",
+                                            "गर्भवती का वज़न नहीं लेना", self.preg_weighed)
+            self.three = self.condition_image(IFA_Y, IFA_N, "तीस आयरन की गोलियां लेना",
+                                              "तीस आयरन की गोलियां नही लिया", self.preg_received_ifa)
             self.four = ''
             self.five = ''
-
         if self.child_age in (24, 36):
             if self.block == 'atri':
                 met, pos, neg = self.weight_grade_normal, GRADE_NORMAL_Y, GRADE_NORMAL_N
@@ -632,14 +846,14 @@ class ConditionsMet(OPMCaseRow):
                 met, pos, neg = self.birth_spacing_years, SPACING_PROMPT_Y, SPACING_PROMPT_N
 
             if met:
-                self.five = self.img_elem % pos
+                self.five = self.img_elem % (pos, "")
             elif met is False:
-                self.five = self.img_elem % neg
+                self.five = self.img_elem % (neg, "")
             else:
                 self.five = ''
 
         if not self.vhnd_available:
-            self.one = self.img_elem % VHND_NO
+            self.one = self.img_elem % (VHND_NO, "पोषण दिवस का आयोजन नहीं हुआ")
 
 
 class Beneficiary(OPMCaseRow):
@@ -662,58 +876,21 @@ class Beneficiary(OPMCaseRow):
         ('bp2_cash', _("Birth Preparedness Form 2"), True),
         ('child_cash', _("Child Followup Form"), True),
         ('year_end_bonus_cash', _("Bonus Payment"), True),
-        ('total', _("Amount to be paid to beneficiary"), True),
+        ('total_cash', _("Amount to be paid to beneficiary"), True),
         ('case_id', _('Case ID'), True),
         ('owner_id', _("Owner ID"), False),
         ('closed_date', _("Closed On"), True),
+        ('vhnd_available_display', _('VHND organised this month'), True),
+        ('payment_last_month', _('Payment last month'), True),
+        ('issues', _("Issues"), True),
     ]
 
-    def __init__(self, case, report, child_index=1):
-        super(Beneficiary, self).__init__(case, report, child_index=child_index)
+    def __init__(self, case, report, child_index=1, **kwargs):
+        super(Beneficiary, self).__init__(case, report, child_index=child_index, **kwargs)
         self.child_count = 0 if self.status == "pregnant" else 1
-        self.bp1_cash = MONTH_AMT if self.bp1 else 0
-        self.bp2_cash = MONTH_AMT if self.bp2 else 0
-        self.child_cash = MONTH_AMT if self.child_followup else 0
-        self.total = min(
-            MONTH_AMT,
-            self.bp1_cash + self.bp2_cash + self.child_cash
-        )
-        self.total += self.year_end_bonus_cash
+
         # Show only cases that require payment
-        if self.total == 0:
-            raise InvalidRow
+        if self.total_cash == 0:
+            raise InvalidRow("Case does not require payment")
 
-    @property
-    def bp1(self):
-        if 3 < self.preg_month < 7:
-            return self.bp_conditions
-
-    @property
-    def bp2(self):
-        if 6 < self.preg_month < 10:
-            return self.bp_conditions
-
-    @property
-    def bp_conditions(self):
-        if self.status == "pregnant":
-            return False not in [
-                self.preg_attended_vhnd,
-                self.preg_weighed,
-                self.preg_received_ifa,
-            ]
-
-    @property
-    def child_followup(self):
-        """
-        wazirganj - total_soft_conditions = 1
-        """
-        if self.status == 'mother':
-            return False not in [
-                self.child_attended_vhnd,
-                self.child_received_ors,
-                self.child_growth_calculated,
-                self.child_weighed_once,
-                self.child_birth_registered,
-                self.child_received_measles_vaccine,
-                self.child_breastfed,
-            ]
+        self.payment_last_month = self.last_month_row.total_cash if self.last_month_row else 0

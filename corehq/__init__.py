@@ -29,7 +29,11 @@ def REPORTS(project):
     from corehq.apps.reports.standard.cases.careplan import make_careplan_reports
     from corehq.apps.reports.standard.maps import DemoMapReport, DemoMapReport2, DemoMapCaseList
 
-    reports = [
+    reports = []
+
+    reports.extend(_get_configurable_reports(project))
+
+    reports.extend([
         (ugettext_lazy("Monitor Workers"), (
             monitoring.WorkerActivityReport,
             monitoring.DailyFormStatsReport,
@@ -45,14 +49,13 @@ def REPORTS(project):
         (ugettext_lazy("Manage Deployments"), (
             deployments.ApplicationStatusReport,
             receiverwrapper.SubmissionErrorReport,
-            phonelog.FormErrorReport,
             phonelog.DeviceLogDetailsReport,
             deployments.SyncHistoryReport,
         )),
         (ugettext_lazy("Demos for Previewers"), (
             DemoMapReport, DemoMapReport2, DemoMapCaseList,
         )),
-    ]
+    ])
 
     if project.commtrack_enabled:
         reports.insert(0, (ugettext_lazy("Commtrack"), (
@@ -80,14 +83,16 @@ def REPORTS(project):
         messaging_reports.extend([
             sms.MessagesReport,
         ])
-    # always have this historical report visible
-    messaging_reports.append(sms.MessageLogReport)
+    # always have these historical reports visible
+    messaging_reports.extend([
+        sms.MessageLogReport,
+        ivr.CallLogReport,
+        ivr.ExpectedCallbackReport,
+    ])
 
     project_can_use_inbound_sms = domain_has_privilege(project.name, privileges.INBOUND_SMS)
     if project_can_use_inbound_sms:
         messaging_reports.extend([
-            ivr.CallLogReport,
-            ivr.ExpectedCallbackReport,
             system_overview.SystemOverviewReport,
             system_overview.SystemUsersReport,
         ])
@@ -97,7 +102,6 @@ def REPORTS(project):
     reports.append(messaging)
 
     reports.extend(_get_dynamic_reports(project))
-    reports.extend(_get_configurable_reports(project))
 
     return reports
 
@@ -149,18 +153,21 @@ def _get_configurable_reports(project):
             # this is really annoying.
             # the report metadata should really be pulled outside of the report classes
             @classmethod
-            def get_url(cls, domain):
+            def get_url(cls, domain, **kwargs):
                 return reverse(ConfigurableReport.slug, args=[domain, config._id])
+
+            @classmethod
+            def show_in_navigation(cls, domain=None, project=None, user=None):
+                return config.visible or (user and toggles.USER_CONFIGURABLE_REPORTS.enabled(user.username))
 
             return type('DynamicReport{}'.format(config._id), (GenericReportView, ), {
                 'name': config.title,
-                'description': config.description,
+                'description': config.description or None,
                 'get_url': get_url,
+                'show_in_navigation': show_in_navigation,
             })
 
-        yield (_('Configurable Reports'), [_make_report_class(config) for config in configs])
-
-
+        yield (_('Project Reports'), [_make_report_class(config) for config in configs])
 
 from corehq.apps.data_interfaces.interfaces import CaseReassignmentInterface
 from corehq.apps.importer.base import ImportCases
@@ -176,7 +183,7 @@ DATA_INTERFACES = (
 EDIT_DATA_INTERFACES = (
     (ugettext_lazy('Edit Data'), (
         CaseReassignmentInterface,
-        ImportCases
+        ImportCases,
     )),
 )
 
@@ -309,7 +316,7 @@ TABS = (
     ProjectInfoTab,
     ReportsTab,
     ProjectDataTab,
-    CommTrackSetupTab,
+    SetupTab,
     ProjectUsersTab,
     ApplicationsTab,
     CloudcareTab,

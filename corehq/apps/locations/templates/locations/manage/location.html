@@ -2,16 +2,29 @@
 {% load i18n %}
 {% load hq_shared_tags %}
 {% load hqstyle_tags %}
+{% load crispy_forms_tags %}
+
+{% block head %} {{ block.super }}
+    <link rel="stylesheet" href="{% static 'hqwebapp/js/lib/jquery-ui-datepicker/datepicker-theme/jquery-ui-1.8.17.custom.css' %}" />
+    <link rel="stylesheet" href="{% static 'hqwebapp/js/lib/jquery-ui/multiselect/ui.multiselect.css' %}" />
+{% endblock %}
 
 {% block js %}{{ block.super }}
     <script src="{% static 'users/js/key_filters.js' %}"></script>
-    <script src="{% static 'hqwebapp/js/ui-element.js' %}"></script>
     <script type="text/javascript" src="{% static 'locations/ko/location_drilldown.async.js' %}"></script>
+    <script src="{% static 'hqwebapp/js/ui-element.js' %}"></script>
+    <script src="{% static 'hqwebapp/js/lib/jquery-ui/jquery-ui-1.9.2.multiselect-deps.custom.min.js' %}"></script>
+    <script src="{% static 'hqwebapp/js/lib/jquery-ui/multiselect/ui.multiselect.js' %}"></script>
 {% endblock %}
 
 {% block js-inline %}{{ block.super }}
     <script type="text/javascript">
         var LOAD_LOCS_URL = '{{ api_root }}';
+
+        // for product per location selection
+        $(function () {
+            $("#id_selected_ids").width(800).height(400).multiselect();
+        });
     </script>
 {% endblock %}
 
@@ -43,14 +56,6 @@
             });
         });
 
-      function handleChange() {
-          var data = customDataEditor.val();
-          $("input#metadata-input").val(JSON.stringify(data));
-      }
-      customDataEditor = uiElement.map_list('{{ location.get_id}}', "{% trans 'Location Data' %}");
-      customDataEditor.val({{ metadata|JSON }});
-      customDataEditor.on('change', handleChange);
-      $("#loc_form .custom-data-controls").append(customDataEditor.ui);
 
       $("#loc_form :button[type='submit']").click(function(e) {
           if (loc_id != null && model.selected_locid() != model.orig_parent_id) {
@@ -68,50 +73,76 @@
     });
   </script>
 
-  <form id="loc_form" class="form form-horizontal" name="product" method="post">
-    {% bootstrap_form_errors form %}
-    {% bootstrap_fieldset form "Location Information" %}
+  <ul class="nav nav-tabs">
+    <li class="active"><a href="#basic-info" data-toggle="tab">{% trans "Basic" %}</a></li>
 
-    {% if form.sub_forms %}<hr />{% endif %}
-    {% for loc_type, subform in form.sub_forms.items %}
-    <div style="display: none;" class="custom_subform" loctype="{{ loc_type }}">
-      {% include 'hqstyle/forms/basic_fieldset.html' with form=subform %}
-    </div>
-    {% endfor %}
-    <input name="metadata" id="metadata-input" type="hidden"/>
-    <fieldset>
-        <legend>{% trans "Custom Location Data" %}</legend>
-        <div class="control-group">
-            <label class="control-label">{% trans 'Current Data' %}</label>
-
-            <div class="controls custom-data-controls"></div>
-        </div>
-    </fieldset>
-
-    {% if consumption %}
-      <legend>{% trans "Default monthly consumption values" %}</legend>
-      {% for code, amount in consumption %}
-        <div class="control-group">
-          <label class="control-label">{{ code }}</label>
-          <div class="controls">
-            <span class="uneditable-input">
-              {{ amount }}
-            </span>
-          </div>
-        </div>
-      {% endfor %}
+    {% if products_per_location_form %}
+      <li><a href="#products" data-toggle="tab">{% trans "Products" %}</a></li>
     {% endif %}
 
-    <div class="form-actions"><button type="submit" class="btn btn-primary">
-        {% if location.get_id %}{% trans 'Update' %}{% else %}{% trans 'Create' %}{% endif %} {% trans 'Location' %}
-    </button></div>
-  </form>
+    {% if location.get_id and location.location_type.can_have_children %}
+    <li>
+      <a href="{% url "create_location" domain %}?parent={{ location.get_id }}">
+        {% trans "New Child Location" %}
+      </a>
+    </li>
+    {% endif %}
+  </ul>
+
+  <div class="tab-content">
+    <div class="tab-pane active" id="basic-info">
+      <form id="loc_form" class="form form-horizontal" name="product" method="post">
+        {% bootstrap_form_errors form %}
+        {% bootstrap_fieldset form "Location Information" %}
+
+        {% crispy form.custom_data.form %}
+        <input type="hidden" name="form_type" value="location-settings" />
+
+        {% if consumption %}
+          <legend>{% trans "Default monthly consumption values" %}</legend>
+          {% for code, amount in consumption %}
+            <div class="control-group">
+              <label class="control-label">{{ code }}</label>
+              <div class="controls">
+                <span class="uneditable-input">
+                  {{ amount }}
+                </span>
+              </div>
+            </div>
+          {% endfor %}
+        {% endif %}
+
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary">
+            {% if location.get_id %}
+              {% trans 'Update' %}
+            {% else %}
+              {% trans 'Create' %}
+            {% endif %}
+            {% trans 'Location' %}
+          </button>
+        </div>
+      </form>
+    </div>
+
+    {% if products_per_location_form %}
+      <div class="tab-pane" id="products">
+        <div class="row-fluid">
+          <form class="form disable-on-submit" id="edit_products" action="" method='post'>
+            <legend>{% trans 'Specify Products Per Location' %}</legend>
+            {% crispy products_per_location_form %}
+            <input type="hidden" name="form_type" value="location-products" />
+          </form>
+        </div>
+      </div>
+    {% endif %}
+  </div>
 
 </div>
 {% endblock %}
 
 {% block modals %}{{ block.super }}
-    
+
 <div id="reparenting" class="modal hide fade">
   <div class="modal-header">
     <a class="close" data-dismiss="modal">&times;</a>

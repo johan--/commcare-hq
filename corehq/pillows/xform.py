@@ -38,17 +38,17 @@ def flatten(d, parent_key='', delimiter='/'):
 class XFormPillow(HQPillow):
     document_class = XFormInstance
     couch_filter = "couchforms/xforms"
-    es_index_prefix = "xforms"
     es_alias = "xforms"
     es_type = "xform"
     es_index = XFORM_INDEX
     include_docs = False
 
-    #for simplicity, the handlers are managed on the domain level
+    # for simplicity, the handlers are managed on the domain level
     handler_domain_map = {}
-
-    #type level mapping
     default_mapping = XFORM_MAPPING
+
+    def get_unique_id(self):
+        return XFORM_INDEX
 
     def change_transform(self, doc_dict, include_props=True):
         if self.get_domain(doc_dict) is None:

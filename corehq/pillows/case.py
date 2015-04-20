@@ -21,7 +21,6 @@ class CasePillow(HQPillow):
     """
     document_class = CommCareCase
     couch_filter = "case/casedocs"
-    es_index_prefix = "hqcases"
     es_alias = "hqcases"
     es_type = "case"
 
@@ -37,7 +36,7 @@ class CasePillow(HQPillow):
         doc_dict, lock = lock_manager(
             super(CasePillow, self).change_trigger(changes_dict)
         )
-        if doc_dict['doc_type'] == 'CommCareCase-Deleted':
+        if doc_dict and doc_dict['doc_type'] == 'CommCareCase-Deleted':
             if self.doc_exists(doc_dict):
                 self.get_es().delete(path=self.get_doc_path_typed(doc_dict))
             return None
@@ -54,12 +53,6 @@ class CasePillow(HQPillow):
             'es_meta': self.es_meta,
             'mapping': self.default_mapping,
         })
-
-    def get_mapping_from_type(self, doc_dict):
-
-        return {
-            self.get_type_string(doc_dict): self.default_mapping
-        }
 
     def get_type_string(self, doc_dict):
         return self.es_type

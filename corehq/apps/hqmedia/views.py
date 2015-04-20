@@ -11,13 +11,14 @@ from django.views.generic import View, TemplateView
 
 from couchdbkit.exceptions import ResourceNotFound
 
-from django.http import HttpResponse, Http404, HttpResponseRedirect, HttpResponseServerError, HttpResponseBadRequest
+from django.http import HttpResponse, Http404, HttpResponseServerError, HttpResponseBadRequest
 
 from django.shortcuts import render
+from corehq import privileges
 
 from corehq.apps.app_manager.decorators import safe_download, require_can_edit_apps
 from corehq.apps.app_manager.view_helpers import ApplicationViewMixin
-from corehq.apps.app_manager.models import get_app, RemoteApp
+from corehq.apps.app_manager.models import get_app
 from corehq.apps.hqmedia.cache import BulkMultimediaStatusCache
 from corehq.apps.hqmedia.controller import MultimediaBulkUploadController, MultimediaImageUploadController, MultimediaAudioUploadController, MultimediaVideoUploadController
 from corehq.apps.hqmedia.decorators import login_with_permission_from_post
@@ -30,6 +31,7 @@ from dimagi.utils.decorators.memoized import memoized
 from dimagi.utils.django.cached_object import CachedObject
 from soil.util import expose_download
 from django.utils.translation import ugettext as _
+from django_prbac.decorators import requires_privilege_raise404
 
 
 class BaseMultimediaView(ApplicationViewMixin, View):
@@ -298,10 +300,14 @@ class BaseProcessFileUploadView(BaseProcessUploadedView):
     def form_path(self):
         return self.request.POST.get('path', '')
 
-    def validate_file(self):
+    @property
+    def file_ext(self):
         def file_ext(filename):
             _, extension = os.path.splitext(filename)
             return extension
+        return file_ext(self.uploaded_file.name)
+
+    def validate_file(self):
         def possible_extensions(filename):
             possible_type = guess_type(filename)[0]
             if not possible_type:
@@ -309,13 +315,20 @@ class BaseProcessFileUploadView(BaseProcessUploadedView):
             return guess_all_extensions(guess_type(filename)[0])
 
         if not self.mime_type:
-            raise BadMediaFileException("Did not process a mime type!")
+            raise BadMediaFileException(_("Did not process a mime type!"))
         base_type = self.mime_type.split('/')[0]
         if base_type not in self.valid_base_types():
-            raise BadMediaFileException("Not a valid %s file." % self.media_class.get_nice_name().lower())
-        ext = file_ext(self.uploaded_file.name)
-        if ext.lower() not in possible_extensions(self.form_path):
-            raise BadMediaFileException("File %s has an incorrect file type (%s)." % (self.uploaded_file.name, ext))
+            raise BadMediaFileException(
+                _("Not a valid %s file.")
+                % self.media_class.get_nice_name().lower()
+            )
+        if self.file_ext.lower() not in possible_extensions(self.form_path):
+            raise BadMediaFileException(
+                _("File {name}s has an incorrect file type {ext}.").format(
+                    name=self.uploaded_file.name,
+                    ext=self.file_ext,
+                )
+            )
 
     def process_upload(self):
         self.uploaded_file.file.seek(0)
@@ -349,6 +362,33 @@ class ProcessImageFileUploadView(BaseProcessFileUploadView):
         return ['image']
 
 
+class ProcessLogoFileUploadView(ProcessImageFileUploadView):
+    name = "hqmedia_uploader_logo"
+
+    @method_decorator(requires_privilege_raise404(privileges.COMMCARE_LOGO_UPLOADER))
+    def post(self, request, *args, **kwargs):
+        return super(ProcessLogoFileUploadView, self).post(request, *args, **kwargs)
+
+    @property
+    def form_path(self):
+        return ("jr://file/commcare/logo/data/%s%s"
+                % (self.filename, self.file_ext))
+
+    @property
+    def filename(self):
+        return self.kwargs.get('logo_name')
+
+    def process_upload(self):
+        if self.app.logo_refs is None:
+            self.app.logo_refs = {}
+        ref = super(
+            ProcessLogoFileUploadView, self
+        ).process_upload()
+        self.app.logo_refs[self.filename] = ref['ref']
+        self.app.save()
+        return ref
+
+
 class ProcessAudioFileUploadView(BaseProcessFileUploadView):
     media_class = CommCareAudio
     name = "hqmedia_uploader_audio"
@@ -366,6 +406,22 @@ class ProcessVideoFileUploadView(BaseProcessFileUploadView):
     def valid_base_types(cls):
         return ['video']
 
+
+class RemoveLogoView(BaseMultimediaView):
+    name = "hqmedia_remove_logo"
+
+    @property
+    def logo_slug(self):
+        if self.request.method == 'POST':
+            return self.request.POST.get('logo_slug')
+        return None
+
+    @method_decorator(requires_privilege_raise404(privileges.COMMCARE_LOGO_UPLOADER))
+    def post(self, *args, **kwargs):
+        if self.logo_slug in self.app.logo_refs:
+            del self.app.logo_refs[self.logo_slug]
+            self.app.save()
+        return HttpResponse()
 
 class CheckOnProcessingFile(BaseMultimediaView):
     name = "hqmedia_check_processing"

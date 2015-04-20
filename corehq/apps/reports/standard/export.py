@@ -1,14 +1,15 @@
 from collections import defaultdict
 import json
 import logging
+from datetime import timedelta, datetime
 from django.conf import settings
 
 from django.utils.translation import ugettext_noop, ugettext_lazy
 from django.http import Http404
 from casexml.apps.case.models import CommCareCase
-from django_prbac.exceptions import PermissionDenied
-from django_prbac.utils import ensure_request_has_privilege
-from corehq import privileges, toggles
+from dimagi.utils.decorators.memoized import memoized
+from django_prbac.utils import has_privilege
+from corehq import privileges
 
 from corehq.apps.data_interfaces.dispatcher import DataInterfaceDispatcher
 
@@ -48,12 +49,9 @@ class FormExportReportBase(ExportReport, DatespanMixin):
 
     @property
     def can_view_deid(self):
-        try:
-            ensure_request_has_privilege(self.request, privileges.DEIDENTIFIED_DATA)
-        except PermissionDenied:
-            return False
-        return True
+        return has_privilege(self.request, privileges.DEIDENTIFIED_DATA)
 
+    @memoized
     def get_saved_exports(self):
         # add saved exports. because of the way in which the key is stored
         # (serialized json) this is a little bit hacky, but works.
@@ -106,6 +104,34 @@ class ExcelExportReport(FormExportReportBase):
     report_template_path = "reports/reportdata/excel_export_data.html"
     icon = "icon-list-alt"
 
+    @classmethod
+    def display_in_dropdown(cls, domain=None, project=None, user=None):
+        return True
+
+    def _get_domain_attachments_size(self):
+        # hash of app_id, xmlns to size of attachments
+        startkey = [self.domain]
+
+        db = Application.get_db()
+        view = db.view('attachments/attachments', startkey=startkey,
+                       endkey=startkey + [{}], group_level=3, reduce=True,
+                       group=True)
+        return {(a['key'][1], a['key'][2]): sizeof_fmt(a['value']) for a in view}
+
+    def properties(self, size_hash):
+        properties = dict()
+        exports = self.get_saved_exports()
+
+        for export in exports:
+            for table in export.tables:
+                properties[export.name] = {
+                    'xmlns': export.index[1],
+                    'export_id': export._id,
+                    'size': size_hash.get((export.app_id, export.index[1]), None),
+                }
+
+        return properties
+
     @property
     def report_context(self):
         # This map for this view emits twice, once with app_id and once with {}, letting you join across all app_ids.
@@ -114,15 +140,9 @@ class ExcelExportReport(FormExportReportBase):
         unknown_forms = []
         startkey = [self.domain]
         db = Application.get_db()  # the view emits from both forms and applications
-        is_multimedia_previewer = toggles.MULTIMEDIA_EXPORT.enabled(self.request.user.username)
-        if is_multimedia_previewer:
-            # hash of xmlns to size of attachments
-            size_hash = {a['key'][2]: a['value'] for a in db.view('attachments/attachments',
-                                                                  startkey=startkey,
-                                                                  endkey=startkey + [{}],
-                                                                  group_level=3,
-                                                                  reduce=True,
-                                                                  group=True)}
+
+        size_hash = self._get_domain_attachments_size()
+
         for f in db.view('exports_forms/by_xmlns',
                          startkey=startkey, endkey=startkey + [{}], group=True,
                          stale=settings.COUCH_STALE_QUERY):
@@ -141,8 +161,12 @@ class ExcelExportReport(FormExportReportBase):
                 unknown_forms.append(form)
 
             form['current_app'] = form.get('app')
-            if is_multimedia_previewer and form['xmlns'] in size_hash:
-                form['size'] = sizeof_fmt(size_hash[form['xmlns']])
+            if 'id' in form['app']:
+                key = (form['app']['id'], form['xmlns'])
+            else:
+                key = None
+            if key in size_hash:
+                form['size'] = size_hash[key]
             else:
                 form['size'] = None
             forms.append(form)
@@ -225,6 +249,8 @@ class ExcelExportReport(FormExportReportBase):
                         form['duplicate'] = True
                     else:
                         form['no_suggestions'] = True
+                    key = (None, form['xmlns'])
+                    form['size'] = size_hash.get(key, None)
 
         def _sortkey(form):
             app_id = form['app']['id']
@@ -252,13 +278,20 @@ class ExcelExportReport(FormExportReportBase):
         # if there is a custom group export defined grab it here
         groups = HQGroupExportConfiguration.by_domain(self.domain)
         context = super(ExcelExportReport, self).report_context
+
+        # Check if any custom exports are in the size hash
+        saved_exports_has_media = any((e.app_id, e.index[1]) in size_hash for e in context['saved_exports'])
+
         context.update(
             forms=forms,
             edit=self.request.GET.get('edit') == 'true',
             group_exports=[group.form_exports for group in groups
                 if group.form_exports],
+            group_export_cutoff=datetime.utcnow() - timedelta(days=settings.SAVED_EXPORT_ACCESS_CUTOFF),
             report_slug=self.slug,
-            is_multimedia_previewer=is_multimedia_previewer
+            property_hash=self.properties(size_hash),
+            exports_has_media=size_hash,
+            saved_exports_has_media=saved_exports_has_media
         )
         return context
 
@@ -270,6 +303,10 @@ class CaseExportReport(ExportReport):
               'corehq.apps.reports.filters.select.GroupFilter']
     report_template_path = "reports/reportdata/case_export_data.html"
     icon = "icon-share"
+
+    @classmethod
+    def display_in_dropdown(cls, domain=None, project=None, user=None):
+        return True
 
     def get_filter_params(self):
         return self.request.GET.copy()
@@ -340,7 +377,8 @@ class DeidExportReport(FormExportReportBase):
     def report_context(self):
         context = super(DeidExportReport, self).report_context
         context.update(
-            ExcelExportReport_name=ExcelExportReport.name
+            ExcelExportReport_name=ExcelExportReport.name,
+            is_deid_form_report=True
         )
         return context
 

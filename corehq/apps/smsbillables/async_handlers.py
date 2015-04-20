@@ -1,17 +1,18 @@
 import json
 import logging
 from couchdbkit import ResourceNotFound
-from django.utils.encoding import force_unicode
-from django_countries.countries import COUNTRIES
-from phonenumbers import COUNTRY_CODE_TO_REGION_CODE
 from django.utils.translation import ugettext_lazy as _
 from corehq.apps.accounting.utils import fmt_dollar_amount
 from corehq.apps.hqwebapp.async_handler import BaseAsyncHandler
 from corehq.apps.hqwebapp.encoders import LazyEncoder
 from corehq.apps.sms.mixin import SMSBackend
+from corehq.apps.sms.models import INCOMING, OUTGOING
 from corehq.apps.sms.util import get_backend_by_class_name
 from corehq.apps.smsbillables.exceptions import SMSRateCalculatorError
 from corehq.apps.smsbillables.models import SmsGatewayFeeCriteria, SmsGatewayFee, SmsUsageFee
+from corehq.apps.smsbillables.utils import country_name_from_isd_code_or_empty
+from corehq.util.quickcache import quickcache
+
 
 NONMATCHING_COUNTRY = 'nonmatching'
 logger = logging.getLogger('accounting')
@@ -73,10 +74,8 @@ class SMSRatesSelect2AsyncHandler(BaseAsyncHandler):
             country_code__exact=None
         ).values_list('country_code', flat=True).distinct()
         final_codes = []
-        countries = dict(COUNTRIES)
         for code in country_codes:
-            cc = COUNTRY_CODE_TO_REGION_CODE.get(code)
-            country_name = force_unicode(countries.get(cc[0])) if cc else ''
+            country_name = country_name_from_isd_code_or_empty(code)
             final_codes.append((code, country_name))
 
         search_term = self.data.get('searchString')
@@ -103,3 +102,64 @@ class SMSRatesSelect2AsyncHandler(BaseAsyncHandler):
             } for r in response]
         }, cls=LazyEncoder)
         return success
+
+
+class PublicSMSRatesAsyncHandler(BaseAsyncHandler):
+    slug = 'public_sms_rate_calc'
+    allowed_actions = 'public_rate'
+
+    @property
+    def public_rate_response(self):
+        return self.get_rate_table(self.data.get('country_code'))
+
+    @quickcache(['country_code'], timeout=24 * 60 * 60)
+    def get_rate_table(self, country_code):
+        backends = SMSBackend.view(
+            'sms/global_backends',
+            reduce=False,
+            include_docs=True,
+        ).all()
+
+        def _directed_fee(direction, backend_api_id, backend_instance_id):
+            gateway_fee = SmsGatewayFee.get_by_criteria(
+                backend_api_id,
+                direction,
+                backend_instance=backend_instance_id,
+                country_code=country_code
+            )
+            if not gateway_fee:
+                return None
+            usd_gateway_fee = gateway_fee.amount / gateway_fee.currency.rate_to_default
+            usage_fee = SmsUsageFee.get_by_criteria(direction)
+            return fmt_dollar_amount(usage_fee.amount + usd_gateway_fee)
+
+        rate_table = []
+
+        from corehq.apps.sms.test_backend import TestSMSBackend
+
+        for backend_instance in backends:
+            backend_instance = backend_instance.wrap_correctly()
+            # Skip Testing backends
+            if isinstance(backend_instance, TestSMSBackend):
+                continue
+
+            # skip if country is not in supported countries
+            if backend_instance.supported_countries:
+                if ('*' not in backend_instance.supported_countries and
+                   str(country_code) not in backend_instance.supported_countries):
+                    continue
+
+            gateway_fee_incoming = _directed_fee(
+                INCOMING,
+                backend_instance.incoming_api_id or backend_instance.get_api_id(),
+                backend_instance._id
+            )
+            gateway_fee_outgoing = _directed_fee(OUTGOING, backend_instance.get_api_id(), backend_instance._id)
+
+            if gateway_fee_outgoing or gateway_fee_incoming:
+                rate_table.append({
+                    'gateway': backend_instance.display_name,
+                    'inn': gateway_fee_incoming or 'NA',  # 'in' is reserved
+                    'out': gateway_fee_outgoing or 'NA'
+                })
+        return rate_table

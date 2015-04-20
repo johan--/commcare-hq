@@ -1,5 +1,6 @@
 from decimal import Decimal
 import uuid
+import logging
 from xml.etree import ElementTree
 from couchdbkit.exceptions import ResourceNotFound
 from couchdbkit.ext.django.schema import *
@@ -16,25 +17,21 @@ from corehq.apps.cachehq.mixins import CachedCouchDocumentMixin
 from corehq.apps.commtrack import const
 from corehq.apps.consumption.shortcuts import get_default_monthly_consumption
 from corehq.apps.hqcase.utils import submit_case_blocks
-from corehq.apps.users.models import CommCareUser
 from casexml.apps.stock.utils import months_of_stock_remaining, state_stock_category
 from corehq.apps.domain.models import Domain
 from couchforms.signals import xform_archived, xform_unarchived
-from dimagi.utils.couch.database import iter_docs
 from dimagi.utils import parsing as dateparse
 from copy import copy
 from django.dispatch import receiver
 from corehq.apps.locations.signals import location_created, location_edited
 from corehq.apps.locations.models import Location, SQLLocation
 from corehq.apps.products.models import Product, SQLProduct
-from corehq.apps.commtrack.const import StockActions, RequisitionActions, RequisitionStatus, USER_LOCATION_OWNER_MAP_TYPE, DAYS_IN_MONTH
+from corehq.apps.commtrack.const import StockActions, RequisitionActions, RequisitionStatus, DAYS_IN_MONTH
 from corehq.apps.commtrack.xmlutil import XML
-from corehq.apps.commtrack.exceptions import LinkedSupplyPointNotFoundError
 from couchexport.models import register_column_type, ComplexExportColumn
 from dimagi.utils.dates import force_to_datetime
 from django.db import models
 from django.db.models.signals import post_save, post_delete
-from dimagi.utils.parsing import json_format_datetime
 
 from dimagi.utils.decorators.memoized import memoized
 
@@ -113,20 +110,6 @@ class CommtrackActionConfig(DocumentSchema):
         return self.action in REQUISITION_ACTION_TYPES
 
 
-class LocationType(DocumentSchema):
-    name = StringProperty()
-    code = StringProperty()
-    allowed_parents = StringListProperty()
-    administrative = BooleanProperty()
-
-    @classmethod
-    def wrap(cls, obj):
-        from corehq.apps.commtrack.util import unicode_slug
-        if not obj.get('code'):
-            obj['code'] = unicode_slug(obj['name'])
-        return super(LocationType, cls).wrap(obj)
-
-
 class CommtrackRequisitionConfig(DocumentSchema):
     # placeholder class for when this becomes fancier
     enabled = BooleanProperty(default=False)
@@ -156,6 +139,7 @@ class ConsumptionConfig(DocumentSchema):
     min_window = IntegerProperty(default=10)
     optimal_window = IntegerProperty()
     use_supply_point_type_default_consumption = BooleanProperty(default=False)
+    exclude_invalid_periods = BooleanProperty(default=False)
 
 
 class StockLevelsConfig(DocumentSchema):
@@ -216,15 +200,12 @@ class CommtrackConfig(CachedCouchDocumentMixin, Document):
     multiaction_enabled = BooleanProperty()
     multiaction_keyword_ = StringProperty()
 
-    location_types = SchemaListProperty(LocationType)
-
     requisition_config = SchemaProperty(CommtrackRequisitionConfig)
     openlmis_config = SchemaProperty(OpenLMISConfig)
 
     # configured on Advanced Settings page
     use_auto_emergency_levels = BooleanProperty(default=False)
 
-    sync_location_fixtures = BooleanProperty(default=True)
     sync_consumption_fixtures = BooleanProperty(default=True)
     use_auto_consumption = BooleanProperty(default=False)
     consumption_config = SchemaProperty(ConsumptionConfig)
@@ -281,6 +262,7 @@ class CommtrackConfig(CachedCouchDocumentMixin, Document):
             min_window=self.consumption_config.min_window,
             max_window=self.consumption_config.optimal_window,
             default_monthly_consumption_function=_default_monthly_consumption,
+            exclude_invalid_periods=self.consumption_config.exclude_invalid_periods
         )
 
     def get_ota_restore_settings(self):
@@ -523,20 +505,41 @@ class StockTransaction(object):
                     yield _txn(action=const.StockActions.RECEIPTS, case_id=dst,
                                section_id=section_id, quantity=quantity)
 
+        def _quantity_or_none(value, config, section_id):
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                logging.error((
+                    "Non-numeric quantity submitted on domain %s for "
+                    "a %s ledger" % (config.domain, section_id)
+                ))
+                return None
+
         section_id = action_node.attrib.get('section-id', None)
         grouped_entries = section_id is not None
         if grouped_entries:
-            quantity = float(product_node.attrib.get('quantity'))
-            for txn in _yield_txns(section_id, quantity):
-                yield txn
-
+            quantity = _quantity_or_none(
+                product_node.attrib.get('quantity'),
+                config,
+                section_id
+            )
+            # make sure quantity is not an empty, unset node value
+            if quantity is not None:
+                for txn in _yield_txns(section_id, quantity):
+                    yield txn
         else:
             values = [child for child in product_node]
             for value in values:
                 section_id = value.attrib.get('section-id')
-                quantity = float(value.attrib.get('quantity'))
-                for txn in _yield_txns(section_id, quantity):
-                    yield txn
+                quantity = _quantity_or_none(
+                    value.attrib.get('quantity'),
+                    config,
+                    section_id
+                )
+                # make sure quantity is not an empty, unset node value
+                if quantity is not None:
+                    for txn in _yield_txns(section_id, quantity):
+                        yield txn
 
     def to_xml(self, E=None, **kwargs):
         if not E:
@@ -600,6 +603,8 @@ class SupplyPointCase(CommCareCase):
     @property
     @memoized
     def location(self):
+        if self.location_id is None:
+            return None
         try:
             return Location.get(self.location_id)
         except ResourceNotFound:
@@ -614,11 +619,11 @@ class SupplyPointCase(CommCareCase):
         return cls.get(caseblock._id)
 
     @classmethod
-    def create_from_location(cls, domain, location, owner_id=None):
+    def create_from_location(cls, domain, location):
         # a supply point is currently just a case with a special type
         id = uuid.uuid4().hex
         user_id = const.get_commtrack_user_id(domain)
-        owner_id = owner_id or user_id
+        owner_id = location.group_id
         kwargs = {'external_id': location.external_id} if location.external_id else {}
         caseblock = CaseBlock(
             case_id=id,
@@ -695,13 +700,17 @@ class SupplyPointCase(CommCareCase):
         )
 
     @classmethod
-    def get_by_location(cls, location):
+    def get_by_location_id(cls, domain, location_id):
         return cls.view(
             'commtrack/supply_point_by_loc',
-            key=[location.domain, location._id],
+            key=[domain, location_id],
             include_docs=True,
             classes={'CommCareCase': SupplyPointCase},
         ).one()
+
+    @classmethod
+    def get_by_location(cls, location):
+        return cls.get_by_location_id(location.domain, location._id)
 
     @classmethod
     def get_or_create_by_location(cls, location):
@@ -711,6 +720,14 @@ class SupplyPointCase(CommCareCase):
                 location.domain,
                 location
             )
+            # todo: if you come across this after july 2015 go search couchlog
+            # and see how frequently this is happening.
+            # if it's not happening at all we should remove it.
+            logging.warning('supply_point_dynamically_created, {}, {}, {}'.format(
+                location.name,
+                sp._id,
+                location.domain,
+            ))
 
         return sp
 
@@ -910,150 +927,6 @@ class RequisitionTransaction(StockTransaction):
         return 'requisition'
 
 
-class CommTrackUser(CommCareUser):
-    class Meta:
-        # This is necessary otherwise syncdb will confuse this app with users
-        app_label = "commtrack"
-
-
-    @classmethod
-    def wrap(cls, data):
-        # lazy migration from commtrack_location to locations
-        if 'commtrack_location' in data:
-            original_location = data['commtrack_location']
-            del data['commtrack_location']
-
-            instance = super(CommTrackUser, cls).wrap(data)
-            instance.save()
-
-            try:
-                original_location_object = Location.get(original_location)
-            except ResourceNotFound:
-                # if there was bad data in there before, we can ignore it
-                return instance
-            instance.set_locations([original_location_object])
-
-            return instance
-        else:
-            return super(CommTrackUser, cls).wrap(data)
-
-    @classmethod
-    def by_domain(cls, domain, is_active=True, reduce=False, limit=None, skip=0, strict=False, doc_type=None):
-        doc_type = doc_type or 'CommCareUser'
-        return super(CommTrackUser, cls).by_domain(domain, is_active, reduce, limit, skip, strict, doc_type)
-
-    def get_location_map_case(self):
-        try:
-            from corehq.apps.commtrack.util import location_map_case_id
-            return CommCareCase.get(location_map_case_id(self))
-        except ResourceNotFound:
-            return None
-
-    @property
-    def location(self):
-        """ Legacy method. To be removed when the site supports multiple locations """
-        if self.locations:
-            return self.locations[0]
-        else:
-            return None
-
-    def get_linked_supply_point_ids(self):
-        mapping = self.get_location_map_case()
-        if mapping:
-            return [index.referenced_id for index in mapping.indices]
-        return []
-
-    def get_linked_supply_points(self):
-        for doc in iter_docs(CommCareCase.get_db(), self.get_linked_supply_point_ids()):
-            yield SupplyPointCase.wrap(doc)
-
-    @property
-    def locations(self):
-        def _gen():
-            location_ids = [sp.location_id for sp in self.get_linked_supply_points()]
-            for doc in iter_docs(Location.get_db(), location_ids):
-                yield Location.wrap(doc)
-
-        return list(_gen())
-
-    def supply_point_index_mapping(self, supply_point, clear=False):
-        if supply_point:
-            return {
-                'supply_point-' + supply_point._id:
-                (
-                    supply_point.type,
-                    supply_point._id if not clear else ''
-                )
-            }
-        else:
-            raise LinkedSupplyPointNotFoundError(
-                "There was no linked supply point for the location."
-            )
-
-    def add_location(self, location, create_sp_if_missing=False):
-        sp = SupplyPointCase.get_or_create_by_location(location)
-
-        from corehq.apps.commtrack.util import submit_mapping_case_block
-        submit_mapping_case_block(self, self.supply_point_index_mapping(sp))
-
-    def clear_locations(self):
-        mapping = self.get_location_map_case()
-        if mapping:
-            mapping.delete()
-
-    def submit_location_block(self, caseblock):
-        submit_case_blocks(
-            ElementTree.tostring(caseblock.as_xml(format_datetime=json_format_datetime)),
-            self.domain,
-            self.username,
-            self._id
-        )
-
-    def set_locations(self, locations):
-        if set([loc._id for loc in locations]) == set([loc._id for loc in self.locations]):
-            # don't do anything if the list passed is the same
-            # as the users current locations. the check is a little messy
-            # as we can't compare the location objects themself
-            return
-
-        self.clear_locations()
-
-        if not locations:
-            return
-
-        index = {}
-        for location in locations:
-            sp = SupplyPointCase.get_by_location(location)
-            index.update(self.supply_point_index_mapping(sp))
-
-        from corehq.apps.commtrack.util import location_map_case_id
-        caseblock = CaseBlock(
-            create=True,
-            case_type=USER_LOCATION_OWNER_MAP_TYPE,
-            case_id=location_map_case_id(self),
-            version=V2,
-            owner_id=self._id,
-            index=index
-        )
-
-        self.submit_location_block(caseblock)
-
-    def remove_location(self, location):
-        sp = SupplyPointCase.get_by_location(location)
-
-        mapping = self.get_location_map_case()
-
-        if mapping and location._id in [loc._id for loc in self.locations]:
-            caseblock = CaseBlock(
-                create=False,
-                case_id=mapping._id,
-                version=V2,
-                index=self.supply_point_index_mapping(sp, True)
-            )
-
-            self.submit_location_block(caseblock)
-
-
 class ActiveManager(models.Manager):
     """
     Filter any object that is associated to an archived product.
@@ -1094,10 +967,10 @@ class StockState(models.Model):
     @property
     def resupply_quantity_needed(self):
         monthly_consumption = self.get_monthly_consumption()
-        if monthly_consumption is not None:
-            stock_levels = self.get_domain().commtrack_settings.stock_levels_config
+        if monthly_consumption is not None and self.sql_location is not None:
+            overstock = self.sql_location.location_type.overstock_threshold
             needed_quantity = int(
-                monthly_consumption * stock_levels.overstock_threshold
+                monthly_consumption * overstock
             )
             return int(max(needed_quantity - self.stock_on_hand, 0))
         else:
@@ -1145,7 +1018,7 @@ class StockState(models.Model):
         unique_together = ('section_id', 'case_id', 'product_id')
 
 
-@register_column_type
+@register_column_type()
 class StockExportColumn(ComplexExportColumn):
     """
     A special column type for case exports. This will export a column
@@ -1200,12 +1073,11 @@ def sync_location_supply_point(loc):
     if not domain.commtrack_enabled:
         return
 
-    def _needs_supply_point(loc, config):
+    def _needs_supply_point(loc, domain):
         """Exclude administrative-only locs"""
-        return loc.location_type in [loc_type.name for loc_type in config.location_types if not loc_type.administrative]
+        return loc.location_type in [loc_type.name for loc_type in domain.location_types if not loc_type.administrative]
 
-    config = domain.commtrack_settings
-    if _needs_supply_point(loc, config):
+    if _needs_supply_point(loc, domain):
         supply_point = SupplyPointCase.get_by_location(loc)
         if supply_point:
             supply_point.update_from_location(loc)

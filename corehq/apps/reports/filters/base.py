@@ -1,14 +1,12 @@
 import pytz
 from django.template.loader import render_to_string
-#from corehq.apps.reports.cache import CacheableRequestMixIn, request_cache
-from corehq.apps.reports.cache import CacheableRequestMixIn
 from dimagi.utils.decorators.memoized import memoized
 # For translations
 from django.utils.translation import ugettext as _
 from django.utils.translation import ugettext_noop
 
 
-class BaseReportFilter(CacheableRequestMixIn):   # (CacheableRequestMixIn):
+class BaseReportFilter(object):
     """
         For filtering the results of CommCare HQ Reports.
 
@@ -21,6 +19,7 @@ class BaseReportFilter(CacheableRequestMixIn):   # (CacheableRequestMixIn):
     label = None
     css_class = "span4"
     help_text = None
+    is_cacheable = False
 
     def __init__(self, request, domain=None, timezone=pytz.utc, parent_report=None):
         if self.slug is None:
@@ -96,6 +95,10 @@ class BaseSingleOptionFilter(BaseReportFilter):
     template = "reports/filters/single_option.html"
     default_text = ugettext_noop("Filter by...")
     placeholder = ''
+    is_paginated = False
+    pagination_source = None  # url for paginated data
+    async_handler = None
+    async_action = None
 
     @property
     def options(self):
@@ -112,22 +115,32 @@ class BaseSingleOptionFilter(BaseReportFilter):
 
     @property
     def filter_context(self):
-        options = self.options
-        if not isinstance(options, list) and not isinstance(options[0], tuple) and not len(options[0]) == 2:
-            raise ValueError("options must return a list of option tuples [('value','text')].")
-        options = [dict(val=o[0], text=o[1]) for o in self.options]
+        options = []
+        if not self.is_paginated:
+            options = self.options
+            if not isinstance(options, list) and not isinstance(options[0], tuple) and not len(options[0]) == 2:
+                raise ValueError("options must return a list of option tuples [('value','text')].")
+            options = [dict(val=o[0], text=o[1]) for o in self.options]
         return {
             'select': {
                 'options': options,
                 'default_text': self.default_text,
                 'selected': self.selected,
                 'placeholder': self.placeholder,
-            }
+            },
+            'pagination': {
+                'enabled': self.is_paginated,
+                'url': self.pagination_source,
+                'handler': self.async_handler.slug if self.async_handler else '',
+                'action': self.async_action,
+            },
         }
 
     @classmethod
     def get_value(cls, request, domain):
         value = super(BaseSingleOptionFilter, cls).get_value(request, domain)
+        if cls.is_paginated:
+            return value if value else None
         if isinstance(cls, cls):
             instance = cls
         else:
@@ -230,7 +243,6 @@ class BaseDrilldownOptionFilter(BaseReportFilter):
         return self.get_labels()
 
     @property
-#    @request_cache('drilldownfiltercontext')
     def filter_context(self):
         controls = []
         for level, label in enumerate(self.rendered_labels):

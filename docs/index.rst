@@ -33,7 +33,9 @@ Welcome to CommCareHQ's documentation!
    profiling
    elasticsearch
    couchdb
+   dhis2_integration
    test_coverage
+   advanced_app_features
 
 .. TODO: Finish these, and add them after "intended_audience"
 ..  getting_started

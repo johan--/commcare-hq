@@ -27,11 +27,12 @@ class ApisTest(TestCase):
         self.assertEqual(location.name, "Test facility")
         self.assertEqual(location.type, "facility")
         self.assertEqual(location.parent_id, 369)
-        self.assertEqual(location.latitude, "")
-        self.assertEqual(location.longitude, "")
+        self.assertEqual(location.latitude, "1.15")
+        self.assertEqual(location.longitude, "3.14")
         self.assertEqual(location.code, "testfacility")
         self.assertEqual(location.supervised_by, 591)
         self.assertEqual(location.groups, [])
+        self.assertIsNotNone(location.supply_points)
 
     def test_parse_webuser_json(self):
         with open(os.path.join(self.datapath, 'sample_webusers.json')) as f:
@@ -55,19 +56,13 @@ class ApisTest(TestCase):
         self.assertEqual(smsuser.id, 2342)
         self.assertEqual(smsuser.name, "Test1")
         self.assertEqual(smsuser.role, "Other")
-        self.assertEqual(smsuser.supply_point, 324)
+        self.assertEqual(smsuser.supply_point.id, 456)
+        self.assertEqual(smsuser.supply_point.location_id, 591)
+        self.assertEqual(smsuser.supply_point.name, "aa55")
+        self.assertEqual(smsuser.supply_point.active, True)
         self.assertEqual(smsuser.email, None)
         self.assertEqual(smsuser.is_active, "True")
         self.assertEqual(smsuser.phone_numbers, ["+2222222222"])
-
-    def test_parse_productstock_json(self):
-        with open(os.path.join(self.datapath, 'sample_productstocks.json')) as f:
-            product_stock = ProductStock(json.loads(f.read())[0])
-        self.assertEqual(None, product_stock.auto_monthly_consumption)
-        self.assertEqual("2011-09-01T22:41:35.039236", product_stock.last_modified)
-        self.assertEqual("ip", product_stock.product)
-        self.assertEqual(0.0, product_stock.quantity)
-        self.assertEqual(68, product_stock.supply_point)
 
     def test_parse_stocktransaction_json(self):
         with open(os.path.join(self.datapath, 'sample_stocktransactions.json')) as f:

@@ -13,6 +13,7 @@ from dimagi.utils.couch.database import get_safe_write_kwargs
 from dimagi.utils.modules import try_import
 from dimagi.utils.parsing import json_format_datetime
 from corehq.apps.domain.models import Domain
+from couchdbkit import ResourceNotFound
 
 phone_number_re = re.compile("^\d+$")
 
@@ -30,6 +31,10 @@ class BadSMSConfigException(Exception):
 
 
 class BackendProcessingException(Exception):
+    pass
+
+
+class UnrecognizedBackendException(Exception):
     pass
 
 
@@ -74,10 +79,6 @@ class VerifiedNumber(Document):
             # Circular import
             from corehq.apps.users.models import CommCareUser
             return CommCareUser.get(self.owner_id)
-        elif self.owner_doc_type == "CommTrackUser":
-            # Circular import
-            from corehq.apps.commtrack.models import CommTrackUser
-            return CommTrackUser.get(self.owner_id)
         elif self.owner_doc_type == 'WebUser':
             # Circular importsms
             from corehq.apps.users.models import WebUser
@@ -152,13 +153,28 @@ class VerifiedNumber(Document):
         return v if (include_pending or (v and v.verified)) else None
 
     @classmethod
-    def by_domain(cls, domain):
+    def by_domain(cls, domain, ids_only=False):
         result = cls.view("sms/verified_number_by_domain",
                           startkey=[domain],
                           endkey=[domain, {}],
-                          include_docs=True,
+                          include_docs=(not ids_only),
                           reduce=False).all()
-        return result
+        if ids_only:
+            return [row['id'] for row in result]
+        else:
+            return result
+
+    @classmethod
+    def count_by_domain(cls, domain):
+        result = cls.view("sms/verified_number_by_domain",
+            startkey=[domain],
+            endkey=[domain, {}],
+            include_docs=False,
+            reduce=True).all()
+        if result:
+            return result[0]['value']
+        return 0
+
 
 def add_plus(phone_number):
     return ('+' + phone_number) if not phone_number.startswith('+') else phone_number
@@ -182,9 +198,16 @@ class MobileBackend(Document):
     base_doc = "MobileBackend"
     domain = StringProperty()               # This is the domain that the backend belongs to, or None for global backends
     name = StringProperty()                 # The name to use when setting this backend for a contact
+    display_name = StringProperty()         # Simple name to display to users - e.g. Twilio
+    incoming_api_id = StringProperty()      # Some Gateways have different API ids for IN/OUT
     authorized_domains = ListProperty(StringProperty)  # A list of additional domains that are allowed to use this backend
     is_global = BooleanProperty(default=True)  # If True, this backend can be used for any domain
     description = StringProperty()          # (optional) A description of this backend
+    # A list of countries that this backend supports.
+    # This information is displayed in the gateway list UI.
+    # If this this backend represents an international gateway,
+    # set this to: ['*']
+    supported_countries = ListProperty(StringProperty)
     # TODO: Once the ivr backends get refactored, can remove these two properties:
     outbound_module = StringProperty()      # The fully-qualified name of the outbound module to be used (sms backends: must implement send(); ivr backends: must implement initiate_outbound_call() )
     outbound_params = DictProperty()        # The parameters which will be the keyword arguments sent to the outbound module's send() method
@@ -347,7 +370,7 @@ class SMSLoadBalancingMixin(Document):
         Defined as a property here so that subclasses can override if
         necessary.
         """
-        return self._phone_numbers
+        return self.x_phone_numbers
 
     def get_load_balancing_interval(self):
         """
@@ -463,6 +486,42 @@ class SMSBackend(MobileBackend):
     def send(msg, *args, **kwargs):
         raise NotImplementedError("send() method not implemented")
 
+    @classmethod
+    def get_opt_in_keywords(cls):
+        """
+        Override to specify a set of opt-in keywords to use for this
+        backend type.
+        """
+        return []
+
+    @classmethod
+    def get_opt_out_keywords(cls):
+        """
+        Override to specify a set of opt-out keywords to use for this
+        backend type.
+        """
+        return []
+
+    @classmethod
+    def get_wrapped(cls, backend_id):
+        try:
+            backend = SMSBackend.get(backend_id)
+        except ResourceNotFound:
+            raise UnrecognizedBackendException("Backend %s not found" %
+                backend_id)
+        return backend.wrap_correctly()
+
+    def wrap_correctly(self):
+        from corehq.apps.sms.util import get_available_backends
+        backend_classes = get_available_backends()
+        doc_type = self.doc_type
+        if doc_type in backend_classes:
+            return backend_classes[doc_type].wrap(self.to_json())
+        else:
+            raise UnrecognizedBackendException("Backend %s has an "
+                "unrecognized doc type." % self._id)
+
+
 class BackendMapping(Document):
     domain = StringProperty()
     is_global = BooleanProperty()
@@ -560,9 +619,14 @@ class CommCareMobileContactMixin(object):
         if v is not None and (v.owner_doc_type != self.doc_type or v.owner_id != self._id):
             raise PhoneNumberInUseException("Phone number is already in use.")
 
-    def save_verified_number(self, domain, phone_number, verified, backend_id, ivr_backend_id=None, only_one_number_allowed=False):
+    def save_verified_number(self, domain, phone_number, verified, backend_id=None, ivr_backend_id=None, only_one_number_allowed=False):
         """
         Saves the given phone number as this contact's verified phone number.
+
+        backend_id - the name of an SMSBackend to use when sending SMS to
+            this number; if specified, this will override any project or
+            global settings for which backend will be used to send sms to
+            this number
 
         return  The VerifiedNumber
         raises  InvalidFormatException if the phone number format is invalid

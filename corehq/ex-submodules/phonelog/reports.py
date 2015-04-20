@@ -2,7 +2,6 @@ import json
 import logging
 from django.db.models import Count, Q
 from django.utils import html
-import pytz
 from corehq.apps.reports.datatables.DTSortType import DATE
 from corehq.apps.reports.filters.devicelog import (
     DeviceLogDevicesFilter,
@@ -20,11 +19,10 @@ from corehq.apps.reports.datatables import (
 )
 from corehq.apps.reports.util import _report_user_dict, SimplifiedUserInfo
 from corehq.apps.users.models import CommCareUser
+from corehq.util.timezones.conversions import ServerTime
 from dimagi.utils.decorators.memoized import memoized
-from dimagi.utils.timezones import utils as tz_utils
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext_noop
-from dimagi.utils.timezones.utils import adjust_datetime_to_timezone
 from .models import DeviceReportEntry
 from .utils import device_users_by_xform
 
@@ -41,131 +39,7 @@ TAGS = {
 }
 
 
-class PhonelogReport(GetParamsMixin, DeploymentsReport, DatespanMixin,
-                     PaginatedReportMixin):
-    fields = ['corehq.apps.reports.filters.users.UserTypeFilter',
-              'corehq.apps.reports.filters.select.GroupFilter',
-              'corehq.apps.reports.filters.dates.DatespanFilter']
-
-    special_notice = DATA_NOTICE
-    ajax_pagination = True
-    total_records = 0
-
-
-class FormErrorReport(PhonelogReport):
-    name = ugettext_noop("Errors & Warnings Summary")
-    slug = "form_errors"
-    fields = ['corehq.apps.reports.filters.users.UserTypeFilter',
-              'corehq.apps.reports.filters.select.GroupFilter',
-              'corehq.apps.reports.filters.dates.DatespanFilter']
-
-    special_notice = DATA_NOTICE
-    is_cacheable = False
-    default_sort = {'users': 'asc'}
-
-    @property
-    def headers(self):
-        return DataTablesHeader(
-            DataTablesColumn("Username", span=4, prop_name='users'),
-            DataTablesColumn("Number of Warnings", span=2,
-                             sort_type=DTSortType.NUMERIC,
-                             prop_name='warnings'),
-            DataTablesColumn("Number of Errors", span=2,
-                             sort_type=DTSortType.NUMERIC, prop_name='errors')
-        )
-
-    @property
-    @memoized
-    def all_logs(self):
-        return DeviceReportEntry.objects.filter(
-            domain__exact=self.domain,
-            date__range=[self.datespan.startdate_param_utc,
-                         self.datespan.enddate_param_utc],
-        )
-
-    @property
-    @memoized
-    def error_logs(self):
-        return self.all_logs.filter(type__in=TAGS["error"])
-
-    @property
-    @memoized
-    def warning_logs(self):
-        return self.all_logs.filter(type__in=TAGS["warning"])
-
-    @property
-    def users_to_show(self):
-        by, direction = self.get_sorting_block()[0].items()[0]
-        paged = slice(self.pagination.start,
-                      self.pagination.start + self.pagination.count)
-        if by == 'users':
-            self.total_records = len(self.users)
-            return sorted(self.users, reverse=direction == 'desc')[paged]
-        logs = {"errors": self.error_logs, "warnings": self.warning_logs}[by]
-        self.total_records = logs.values('username').annotate(
-            usernames=Count('username')).count()
-
-        if direction == 'desc':
-            username_data = logs.values('username').annotate(
-                usernames=Count('username')).order_by('usernames')[paged]
-        else:
-            username_data = logs.values('username').annotate(
-                usernames=Count('username')).order_by('-usernames')[paged]
-        usernames = [uc["username"] for uc in username_data]
-
-        def make_user(username):
-            user = CommCareUser.get_by_username(
-                '%s@%s.commcarehq.org' % (username, self.domain))
-            if user:
-                return _report_user_dict(user)
-            return SimplifiedUserInfo(
-                raw_username=username,
-                username_in_report=username,
-                user_id=None,
-                is_active=None,
-            )
-
-        return [make_user(u) for u in usernames]
-
-    @property
-    def rows(self):
-        rows = []
-        query_string = self.request.META['QUERY_STRING']
-        child_report_url = DeviceLogDetailsReport.get_url(domain=self.domain)
-        for user in self.users_to_show:
-            error_count = self.error_logs.filter(
-                username__exact=user.raw_username).count()
-            warning_count = self.warning_logs.filter(
-                username__exact=user.raw_username).count()
-
-            formatted_warning_count = (
-                '<span class="label label-warning">%d</span>' % warning_count
-                if warning_count > 0
-                else '<span class="label">%d</span>' % warning_count
-            )
-            formatted_error_count = (
-                '<span class="label label-important">%d</span>' % error_count
-                if error_count > 0
-                else '<span class="label">%d</span>' % error_count
-            )
-
-            username_formatted = (
-                '<a href="%(url)s?%(query_string)s%(error_slug)s=True'
-                '&%(username_slug)s=%(raw_username)s">%(username)s</a>'
-            ) % {
-                "url": child_report_url,
-                "error_slug": DeviceLogTagFilter.errors_only_slug,
-                "username_slug": DeviceLogUsersFilter.slug,
-                "username": user.username_in_report,
-                "raw_username": user.raw_username,
-                "query_string": "%s&" % query_string if query_string else ""
-            }
-            rows.append([username_formatted, formatted_warning_count,
-                         formatted_error_count])
-        return rows
-
-
-class DeviceLogDetailsReport(PhonelogReport):
+class DeviceLogDetailsReport(GetParamsMixin, DeploymentsReport, DatespanMixin, PaginatedReportMixin):
     name = ugettext_noop("Device Log Details")
     slug = "log_details"
     fields = ['corehq.apps.reports.filters.dates.DatespanFilter',
@@ -181,8 +55,12 @@ class DeviceLogDetailsReport(PhonelogReport):
         "time message": "label-warning",
         "send-all": "label-info",
     }
+    special_notice = DATA_NOTICE
+    ajax_pagination = True
+    total_records = 0
     default_rows = 100
     default_sort = {'date': 'asc'}
+    inclusive = False
 
     @property
     def headers(self):
@@ -251,12 +129,7 @@ class DeviceLogDetailsReport(PhonelogReport):
     @property
     def breadcrumbs(self):
         breadcrumbs = None
-        if self.errors_only:
-            breadcrumbs = dict(
-                title=FormErrorReport.name,
-                link=FormErrorReport.get_url(domain=self.domain)
-            )
-        elif self.goto_key:
+        if self.goto_key:
             breadcrumbs = dict(
                 title=self.name,
                 link=self.get_url(domain=self.domain)
@@ -277,8 +150,10 @@ class DeviceLogDetailsReport(PhonelogReport):
             )
         elif self.goto_key:
             log = self.goto_log
-            date = adjust_datetime_to_timezone(log.date, from_tz=pytz.utc, to_tz=self.timezone)
-            new_title = "Last %s Logs <small>before %s</small>" % (self.limit, date.strftime("%b %d, %Y %H:%M"))
+            new_title = "Last %s Logs <small>before %s</small>" % (
+                self.limit,
+                ServerTime(log.date).user_time(self.timezone).ui_string()
+            )
         return mark_safe(new_title)
 
     @property
@@ -327,9 +202,8 @@ class DeviceLogDetailsReport(PhonelogReport):
 
         self.total_records = logs.count()
         for log in logs.order_by(self.ordering)[paged]:
-            date = str(log.date)
-            date_fmt = tz_utils.string_to_prertty_time(
-                date, self.timezone, fmt="%b %d, %Y %H:%M:%S")
+            ui_date = (ServerTime(log.date)
+                        .user_time(self.timezone).ui_string())
 
             username = log.username
             username_fmt = '<a href="%(url)s">%(username)s</a>' % {
@@ -392,7 +266,7 @@ class DeviceLogDetailsReport(PhonelogReport):
                 '<i class="icon icon-info-sign"></i></a>'
             ) % (version.split(' ')[0], html.escape(version))
 
-            row_set.append([date_fmt, log_tag_format, username_fmt,
+            row_set.append([ui_date, log_tag_format, username_fmt,
                             device_users_fmt, device_fmt, log.msg, ver_format])
         return row_set
 

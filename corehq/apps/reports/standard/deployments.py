@@ -29,8 +29,8 @@ class DeploymentsReport(GenericTabularReport, ProjectReport, ProjectReportParame
    
     @classmethod
     def show_in_navigation(cls, domain=None, project=None, user=None):
-        # for commtrack/connect projects - only show if the user can view apps
-        if project.commtrack_enabled or project.commconnect_enabled:
+        # for commtrack projects - only show if the user can view apps
+        if project.commtrack_enabled:
             return user and (user.is_superuser or user.has_permission(domain, 'edit_apps'))
         return super(DeploymentsReport, cls).show_in_navigation(domain, project, user)
 
@@ -65,6 +65,8 @@ def _build_html(version, version_source):
 class ApplicationStatusReport(DeploymentsReport):
     name = ugettext_noop("Application Status")
     slug = "app_status"
+    emailable = True
+    exportable = True
     fields = ['corehq.apps.reports.filters.users.UserTypeFilter',
               'corehq.apps.reports.filters.select.GroupFilter',
               'corehq.apps.reports.filters.select.SelectApplicationFilter']
@@ -151,11 +153,12 @@ class SyncHistoryReport(DeploymentsReport):
     @property
     def headers(self):
         headers = DataTablesHeader(
+            DataTablesColumn(_("Sync Log")),
             DataTablesColumn(_("Sync Date"), sort_type=DTSortType.NUMERIC),
             DataTablesColumn(_("# of Cases"), sort_type=DTSortType.NUMERIC),
             DataTablesColumn(_("Sync Duration"), sort_type=DTSortType.NUMERIC),
         )
-        headers.custom_sort = [[0, 'desc']]
+        headers.custom_sort = [[1, 'desc']]
         return headers
 
     @property
@@ -173,6 +176,7 @@ class SyncHistoryReport(DeploymentsReport):
             endkey=[user_id],
             descending=True,
             reduce=False,
+            limit=10
         )]
 
         def _sync_log_to_row(sync_log):
@@ -193,8 +197,14 @@ class SyncHistoryReport(DeploymentsReport):
                         -1,
                     )
 
+            def _fmt_id(sync_log_id):
+                return '<a href="/search/?q={id}" target="_blank">{id:.5}...</a>'.format(
+                    id=sync_log_id
+                )
+
             num_cases = len(sync_log.cases_on_phone)
             return [
+                _fmt_id(sync_log.get_id),
                 _fmt_date(sync_log.date),
                 format_datatables_data(num_cases, num_cases),
                 _fmt_duration(sync_log.duration),
@@ -211,10 +221,10 @@ def _fmt_date(date):
         return _bootstrap_class(delta, timedelta(days=7), timedelta(days=3))
 
     if not date:
-        return format_datatables_data('<span class="label">{0}</span>'.format(_("Never")), -1)
+        return format_datatables_data(u'<span class="label">{0}</span>'.format(_("Never")), -1)
     else:
         return format_datatables_data(
-            '<span class="{cls}">{text}</span>'.format(
+            u'<span class="{cls}">{text}</span>'.format(
                 cls=_timedelta_class(datetime.utcnow() - date),
                 text=naturaltime(date),
             ),

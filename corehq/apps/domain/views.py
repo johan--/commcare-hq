@@ -1,9 +1,14 @@
+import copy
 import datetime
 from decimal import Decimal
 import logging
 import uuid
 from couchdbkit import ResourceNotFound
+from corehq.const import USER_DATE_FORMAT
+from custom.dhis2.forms import Dhis2SettingsForm
+from custom.dhis2.models import Dhis2Settings
 import dateutil
+from django.core.mail import send_mail
 from django.core.paginator import Paginator
 from django.views.generic import View
 from casexml.apps.case.mock import CaseBlock
@@ -14,7 +19,9 @@ from corehq.apps.accounting.decorators import (
 )
 from corehq.apps.accounting.exceptions import PaymentRequestError
 from corehq.apps.accounting.payment_handlers import (
-    InvoiceStripePaymentHandler, CreditStripePaymentHandler,
+    BulkStripePaymentHandler,
+    CreditStripePaymentHandler,
+    InvoiceStripePaymentHandler,
 )
 from corehq.apps.accounting.subscription_changes import DomainDowngradeStatusHandler
 from corehq.apps.accounting.forms import EnterprisePlanContactForm
@@ -27,19 +34,17 @@ from corehq.apps.smsbillables.async_handlers import SMSRatesAsyncHandler, SMSRat
 from corehq.apps.smsbillables.forms import SMSRateCalculatorForm
 from corehq.apps.users.models import DomainInvitation
 from corehq.apps.fixtures.models import FixtureDataType
-from corehq.toggles import NAMESPACE_DOMAIN, all_toggles
+from corehq.toggles import NAMESPACE_DOMAIN, all_toggles, CAN_EDIT_EULA, TRANSFER_DOMAIN, GLOBAL_SMS_RATES
 from corehq.util.context_processors import get_domain_type
 from dimagi.utils.couch.resource_conflict import retry_resource
 from django.conf import settings
-from django.contrib.sites.models import Site
 from django.template.loader import render_to_string
 from django.utils.decorators import method_decorator
 from django.utils.safestring import mark_safe
 
-from corehq import toggles, privileges, feature_previews
+from corehq import privileges, feature_previews, toggles
 from django_prbac.decorators import requires_privilege_raise404
-from django_prbac.exceptions import PermissionDenied
-from django_prbac.utils import ensure_request_has_privilege
+from django_prbac.utils import has_privilege
 
 from corehq.apps.accounting.models import (
     Subscription, CreditLine, SoftwareProductType,
@@ -47,9 +52,10 @@ from corehq.apps.accounting.models import (
     BillingAccountType, BillingAccountAdmin,
     Invoice, BillingRecord, InvoicePdf, PaymentMethodType,
     PaymentMethod,
+    EntryPoint,
 )
 from corehq.apps.accounting.usage import FeatureUsageCalculator
-from corehq.apps.accounting.user_text import get_feature_name, PricingTable, DESC_BY_EDITION, PricingTableFeatures
+from corehq.apps.accounting.user_text import get_feature_name, PricingTable, DESC_BY_EDITION
 from corehq.apps.hqwebapp.models import ProjectSettingsTab
 from corehq.apps import receiverwrapper
 from django.core.urlresolvers import reverse
@@ -58,15 +64,16 @@ from django.http import HttpResponseRedirect, HttpResponse, Http404
 from django.shortcuts import redirect, render
 from corehq.apps.domain.calculations import CALCS, CALC_FNS, CALC_ORDER, dom_calc
 
-from corehq.apps.domain.decorators import (domain_admin_required,
-    login_required, require_superuser, login_and_domain_required)
+from corehq.apps.domain.decorators import (
+    domain_admin_required, login_required, require_superuser, login_and_domain_required
+)
 from corehq.apps.domain.forms import (
     DomainGlobalSettingsForm, DomainMetadataForm, SnapshotSettingsForm,
-    SnapshotApplicationForm, DomainDeploymentForm, DomainInternalForm,
+    SnapshotApplicationForm, DomainInternalForm, PrivacySecurityForm,
     ConfirmNewSubscriptionForm, ProBonoForm, EditBillingAccountInfoForm,
-    ConfirmSubscriptionRenewalForm, SnapshotFixtureForm,
+    ConfirmSubscriptionRenewalForm, SnapshotFixtureForm, TransferDomainForm
 )
-from corehq.apps.domain.models import Domain, LICENSES
+from corehq.apps.domain.models import Domain, LICENSES, TransferDomainRequest
 from corehq.apps.domain.utils import normalize_domain_name
 from corehq.apps.hqwebapp.views import BaseSectionPageView, BasePageView, CRUDPaginatedViewMixin
 from corehq.apps.orgs.models import Organization, OrgRequest, Team
@@ -74,7 +81,7 @@ from corehq.apps.domain.forms import ProjectSettingsForm
 from dimagi.utils.decorators.memoized import memoized
 from dimagi.utils.django.email import send_HTML_email
 
-from dimagi.utils.web import get_ip, json_response
+from dimagi.utils.web import get_ip, json_response, get_site_domain
 from corehq.apps.users.decorators import require_can_edit_web_users
 from corehq.apps.receiverwrapper.forms import GenericRepeaterForm, FormRepeaterForm
 from corehq.apps.receiverwrapper.models import FormRepeater, CaseRepeater, ShortFormRepeater, AppStructureRepeater, \
@@ -85,16 +92,22 @@ import json
 from dimagi.utils.post import simple_post
 import cStringIO
 from PIL import Image
-from django.utils.translation import ugettext as _, ugettext_noop, ugettext_lazy
-from django.core.cache import cache
-from toggle.models import Toggle, generate_toggle_id
-from toggle.shortcuts import get_toggle_cache_key, update_toggle_cache, namespaced_item
+from django.utils.translation import ugettext as _, ugettext_noop
+from toggle.models import Toggle
 
 
 accounting_logger = logging.getLogger('accounting')
 
 # Domain not required here - we could be selecting it for the first time. See notes domain.decorators
 # about why we need this custom login_required decorator
+
+PAYMENT_ERROR_MESSAGES = {
+    400: _('Your request was not formatted properly.'),
+    403: _('Forbidden.'),
+    404: _('Page not found.'),
+    500: _("There was an error processing your request."
+           " We're working quickly to fix the issue. Please try again shortly."),
+}
 
 
 @login_required
@@ -111,6 +124,20 @@ def select(request, domain_select_template='domain/select.html'):
         'open_invitations': open_invitations,
     }
     return render(request, domain_select_template, additional_context)
+
+
+@require_superuser
+def incomplete_email(request,
+                     incomplete_email_template='domain/incomplete_email.html'):
+    from corehq.apps.domain.tasks import (
+        incomplete_self_started_domains,
+        incomplete_domains_to_email
+    )
+    context = {
+        'self_started': incomplete_self_started_domains,
+        'dimagi_owned': incomplete_domains_to_email,
+    }
+    return render(request, incomplete_email_template, context)
 
 
 class DomainViewMixin(object):
@@ -276,12 +303,12 @@ class BaseEditProjectInfoView(BaseAdminProjectSettingsView):
         context = super(BaseEditProjectInfoView, self).main_context
         context.update({
             'autocomplete_fields': self.autocomplete_fields,
-            'commtrack_enabled': self.domain_object.commtrack_enabled, # ideally the template gets access to the domain doc through
-                # some other means. otherwise it has to be supplied to every view reachable in that sidebar (every
-                # view whose template extends users_base.html); mike says he's refactoring all of this imminently, so
-                # i will not worry about it until he is done
+            'commtrack_enabled': self.domain_object.commtrack_enabled,
+            # ideally the template gets access to the domain doc through
+            # some other means. otherwise it has to be supplied to every view reachable in that sidebar (every
+            # view whose template extends users_base.html); mike says he's refactoring all of this imminently, so
+            # i will not worry about it until he is done
             'call_center_enabled': self.domain_object.call_center_config.enabled,
-            'restrict_superusers': self.domain_object.restrict_superusers,
             'cloudcare_releases':  self.domain_object.cloudcare_releases,
         })
         return context
@@ -297,18 +324,8 @@ class EditBasicProjectInfoView(BaseEditProjectInfoView):
         return self.request.couch_user.is_previewer()
 
     @property
-    def autocomplete_fields(self):
-        return ['project_type']
-
-    @property
     def can_use_custom_logo(self):
-        try:
-            ensure_request_has_privilege(
-                self.request, privileges.CUSTOM_BRANDING
-            )
-        except PermissionDenied:
-            return False
-        return True
+        return has_privilege(self.request, privileges.CUSTOM_BRANDING)
 
     @property
     @memoized
@@ -320,7 +337,6 @@ class EditBasicProjectInfoView(BaseEditProjectInfoView):
             'call_center_case_owner': self.domain_object.call_center_config.case_owner_id,
             'call_center_case_type': self.domain_object.call_center_config.case_type,
             'commtrack_enabled': self.domain_object.commtrack_enabled,
-            'secure_submissions': self.domain_object.secure_submissions,
         }
         if self.request.method == 'POST':
             if self.can_user_see_meta:
@@ -339,19 +355,6 @@ class EditBasicProjectInfoView(BaseEditProjectInfoView):
             )
 
         if self.can_user_see_meta:
-            for attr in [
-                'project_type',
-                'customer_type',
-                'commconnect_enabled',
-                'survey_management_enabled',
-                'sms_case_registration_enabled',
-                'sms_case_registration_type',
-                'sms_case_registration_owner_id',
-                'sms_case_registration_user_id',
-                'restrict_superusers',
-                'secure_submissions',
-            ]:
-                initial[attr] = getattr(self.domain_object, attr)
             initial.update({
                 'is_test': self.domain_object.is_test,
                 'cloudcare_releases': self.domain_object.cloudcare_releases,
@@ -381,52 +384,6 @@ class EditBasicProjectInfoView(BaseEditProjectInfoView):
                 messages.success(request, _("Project settings saved!"))
             else:
                 messages.error(request, _("There seems to have been an error saving your settings. Please try again!"))
-        return self.get(request, *args, **kwargs)
-
-
-class EditDeploymentProjectInfoView(BaseEditProjectInfoView):
-    template_name = 'domain/admin/info_deployment.html'
-    urlname = 'domain_deployment_info'
-    page_title = ugettext_noop("Deployment")
-
-    @property
-    def autocomplete_fields(self):
-        return ['city', 'countries', 'region']
-
-    @property
-    @memoized
-    def deployment_info_form(self):
-        if self.request.method == 'POST':
-            return DomainDeploymentForm(self.request.POST)
-
-        initial = {
-            'deployment_date': self.domain_object.deployment.date.date if self.domain_object.deployment.date else "",
-            'public': 'true' if self.domain_object.deployment.public else 'false',
-        }
-        for attr in [
-            'city',
-            'countries',
-            'region',
-            'description',
-        ]:
-            initial[attr] = getattr(self.domain_object.deployment, attr)
-        return DomainDeploymentForm(initial=initial)
-
-    @property
-    def page_context(self):
-        return {
-            'deployment_info_form': self.deployment_info_form,
-        }
-
-    def post(self, request, *args, **kwargs):
-        if self.deployment_info_form.is_valid():
-            if self.deployment_info_form.save(self.domain_object):
-                messages.success(request,
-                                 _("The deployment information for project %s was successfully updated!")
-                                 % self.domain_object.name)
-            else:
-                messages.error(request, _("There seems to have been an error. Please try again!"))
-
         return self.get(request, *args, **kwargs)
 
 
@@ -472,6 +429,35 @@ class EditMyProjectSettingsView(BaseProjectSettingsView):
         if self.my_project_settings_form.is_valid():
             self.my_project_settings_form.save(self.request.couch_user, self.domain)
             messages.success(request, _("Your project settings have been saved!"))
+        return self.get(request, *args, **kwargs)
+
+
+class EditDhis2SettingsView(BaseProjectSettingsView):
+    template_name = 'domain/admin/dhis2_settings.html'
+    urlname = 'dhis2_settings'
+    page_title = ugettext_noop("DHIS2 API settings")
+
+    @property
+    @memoized
+    def dhis2_settings_form(self):
+        settings_ = Dhis2Settings.for_domain(self.domain_object.name)
+        initial = settings_.dhis2 if settings_ else {'enabled': False}
+        if self.request.method == 'POST':
+            return Dhis2SettingsForm(self.request.POST, initial=initial)
+        return Dhis2SettingsForm(initial=initial)
+
+    @property
+    def page_context(self):
+        return {
+            'dhis2_settings_form': self.dhis2_settings_form,
+        }
+
+    def post(self, request, *args, **kwargs):
+        if self.dhis2_settings_form.is_valid():
+            if self.dhis2_settings_form.save(self.domain_object):
+                messages.success(request, _('DHIS2 API settings successfully updated'))
+            else:
+                messages.error(request, _('There seems to have been an error. Please try again.'))
         return self.get(request, *args, **kwargs)
 
 
@@ -636,20 +622,39 @@ class DomainSubscriptionView(DomainAccountingSettings):
         next_subscription = {
             'exists': False,
             'can_renew': False,
+            'name': None,
+            'price': None,
         }
         cards = None
         general_credits = None
         if subscription:
             cards = get_customer_cards(self.account, self.request.user.username, self.domain)
-            date_end = (subscription.date_end.strftime("%d %B %Y")
+            date_end = (subscription.date_end.strftime(USER_DATE_FORMAT)
                         if subscription.date_end is not None else "--")
 
             if subscription.date_end is not None:
                 if subscription.is_renewed:
+
+                    next_products = self.get_product_summary(subscription.next_subscription.plan_version,
+                                                             self.account,
+                                                             subscription)
+
+                    if len(next_products) > 1:
+                        accounting_logger.error(
+                            "[BILLING] "
+                            "There seem to be multiple ACTIVE NEXT subscriptions for the "
+                            "subscriber %s. Odd, right? The latest one by "
+                            "date_created was used, but consider this an issue."
+                            % self.account
+                        )
+
                     next_subscription.update({
                         'exists': True,
-                        'date_start': subscription.next_subscription.date_start.strftime("%d %B %Y"),
+                        'date_start': subscription.next_subscription.date_start.strftime(USER_DATE_FORMAT),
+                        'name': subscription.next_subscription.plan_version.plan.name,
+                        'price': next_products[0]['monthly_fee'],
                     })
+
                 else:
                     days_left = (subscription.date_end - datetime.date.today()).days
                     next_subscription.update({
@@ -669,9 +674,9 @@ class DomainSubscriptionView(DomainAccountingSettings):
             'features': self.get_feature_summary(plan_version, self.account, subscription),
             'general_credit': general_credits,
             'css_class': "label-plan %s" % plan_version.plan.edition.lower(),
-            'is_dimagi_subscription': subscription.do_not_invoice if subscription is not None else False,
+            'do_not_invoice': subscription.do_not_invoice if subscription is not None else False,
             'is_trial': subscription.is_trial if subscription is not None else False,
-            'date_start': (subscription.date_start.strftime("%d %B %Y")
+            'date_start': (subscription.date_start.strftime(USER_DATE_FORMAT)
                            if subscription is not None else None),
             'date_end': date_end,
             'cards': cards,
@@ -724,7 +729,11 @@ class DomainSubscriptionView(DomainAccountingSettings):
             feature_info = {
                 'name': get_feature_name(feature_rate.feature.feature_type, self.product),
                 'usage': usage,
-                'remaining': feature_rate.monthly_limit - usage,
+                'remaining': (
+                    feature_rate.monthly_limit - usage
+                    if feature_rate.monthly_limit != -1
+                    else _('Unlimited')
+                ),
                 'credit': self._fmt_credit(),
                 'type': feature_rate.feature.feature_type,
             }
@@ -752,6 +761,7 @@ class DomainSubscriptionView(DomainAccountingSettings):
             'process_payment_url': reverse(CreditsStripePaymentView.urlname,
                                            args=[self.domain]),
             'stripe_public_key': settings.STRIPE_PUBLIC_KEY,
+            'payment_error_messages': PAYMENT_ERROR_MESSAGES,
             'sms_rate_calc_url': reverse(SMSRatesView.urlname,
                                          args=[self.domain])
         }
@@ -867,8 +877,15 @@ class DomainBillingStatementsView(DomainAccountingSettings, CRUDPaginatedViewMix
         pagination_context = self.pagination_context
         pagination_context.update({
             'stripe_public_key': settings.STRIPE_PUBLIC_KEY,
-            'process_payment_url': reverse(InvoiceStripePaymentView.urlname,
-                                           args=[self.domain]),
+            'payment_error_messages': PAYMENT_ERROR_MESSAGES,
+            'process_invoice_payment_url': reverse(
+                InvoiceStripePaymentView.urlname,
+                args=[self.domain],
+            ),
+            'process_bulk_payment_url': reverse(
+                BulkStripePaymentView.urlname,
+                args=[self.domain],
+            ),
             'stripe_cards': self.stripe_cards,
         })
         return pagination_context
@@ -886,21 +903,21 @@ class DomainBillingStatementsView(DomainAccountingSettings, CRUDPaginatedViewMix
                 last_billing_record = BillingRecord.objects.filter(
                     invoice=invoice
                 ).latest('date_created')
-                if invoice.date_paid is not None:
+                if invoice.is_paid:
                     payment_status = (_("Paid on %s.")
-                                      % invoice.date_paid.strftime("%d %B %Y"))
+                                      % invoice.date_paid.strftime(USER_DATE_FORMAT))
                     payment_class = "label label-inverse"
                 else:
                     payment_status = _("Not Paid")
                     payment_class = "label label-important"
-                date_due = (invoice.date_due.strftime("%d %B %Y")
-                            if invoice.date_paid is None else _("Already Paid"))
+                date_due = (invoice.date_due.strftime(USER_DATE_FORMAT)
+                            if not invoice.is_paid else _("Already Paid"))
                 yield {
                     'itemData': {
                         'id': invoice.id,
                         'invoice_number': invoice.invoice_number,
-                        'start': invoice.date_start.strftime("%d %B %Y"),
-                        'end': invoice.date_end.strftime("%d %B %Y"),
+                        'start': invoice.date_start.strftime(USER_DATE_FORMAT),
+                        'end': invoice.date_end.strftime(USER_DATE_FORMAT),
                         'plan': invoice.subscription.plan_version.user_facing_description,
                         'payment_status': payment_status,
                         'payment_class': payment_class,
@@ -909,7 +926,7 @@ class DomainBillingStatementsView(DomainAccountingSettings, CRUDPaginatedViewMix
                             BillingStatementPdfView.urlname,
                             args=[self.domain, last_billing_record.pdf_data_id]
                         ),
-                        'canMakePayment': (invoice.date_paid is None
+                        'canMakePayment': (not invoice.is_paid
                                            and self.can_pay_invoices),
                         'balance': "%s" % quantize_accounting_decimal(invoice.balance),
                     },
@@ -1009,8 +1026,10 @@ class CreditsStripePaymentView(BaseStripePaymentView):
     @memoized
     def account(self):
         return BillingAccount.get_or_create_account_by_domain(
-            self.domain, created_by=self.request.user.username,
+            self.domain,
+            created_by=self.request.user.username,
             account_type=BillingAccountType.USER_CREATED,
+            entry_point=EntryPoint.SELF_STARTED,
         )[0]
 
     def get_payment_handler(self):
@@ -1048,6 +1067,19 @@ class InvoiceStripePaymentView(BaseStripePaymentView):
     def get_payment_handler(self):
         return InvoiceStripePaymentHandler(
             self.get_or_create_payment_method(), self.invoice
+        )
+
+
+class BulkStripePaymentView(BaseStripePaymentView):
+    urlname = 'domain_bulk_payment'
+
+    @property
+    def account(self):
+        return BillingAccount.get_account_by_domain(self.domain)
+
+    def get_payment_handler(self):
+        return BulkStripePaymentHandler(
+            self.get_or_create_payment_method(), self.domain
         )
 
 
@@ -1110,12 +1142,7 @@ class SelectPlanView(DomainAccountingSettings):
     def is_non_ops_superuser(self):
         if not self.request.couch_user.is_superuser:
             return False
-        try:
-            ensure_request_has_privilege(
-                self.request, privileges.ACCOUNTING_ADMIN)
-            return False
-        except PermissionDenied:
-            return True
+        return not has_privilege(self.request, privileges.ACCOUNTING_ADMIN)
 
     @property
     def parent_pages(self):
@@ -1154,6 +1181,35 @@ class SelectPlanView(DomainAccountingSettings):
                                 else ""),
             'is_non_ops_superuser': self.is_non_ops_superuser,
         }
+
+
+class EditPrivacySecurityView(BaseAdminProjectSettingsView):
+    template_name = "domain/admin/project_privacy.html"
+    urlname = "privacy_info"
+    page_title = ugettext_noop("Privacy and Security")
+
+    @property
+    @memoized
+    def privacy_form(self):
+        initial = {
+            "secure_submissions": self.domain_object.secure_submissions,
+            "restrict_superusers": self.domain_object.restrict_superusers
+        }
+        if self.request.method == 'POST':
+            return PrivacySecurityForm(self.request.POST, initial=initial)
+        return PrivacySecurityForm(initial=initial)
+
+    @property
+    def page_context(self):
+        return {
+            'privacy_form': self.privacy_form
+        }
+
+    def post(self, request, *args, **kwargs):
+        if self.privacy_form.is_valid():
+            self.privacy_form.save(self.domain_object)
+            messages.success(request, _("Your project settings have been saved!"))
+        return self.get(request, *args, **kwargs)
 
 
 class SelectedEnterprisePlanView(SelectPlanView):
@@ -1288,7 +1344,10 @@ class ConfirmBillingAccountInfoView(ConfirmSelectedPlanView, AsyncHandlerMixin):
         if self.current_subscription:
             return self.current_subscription.account
         account, self.is_new = BillingAccount.get_or_create_account_by_domain(
-            self.domain, created_by=self.request.couch_user.username, account_type=BillingAccountType.USER_CREATED,
+            self.domain,
+            created_by=self.request.couch_user.username,
+            account_type=BillingAccountType.USER_CREATED,
+            entry_point=EntryPoint.SELF_STARTED,
         )
         return account
 
@@ -1305,12 +1364,11 @@ class ConfirmBillingAccountInfoView(ConfirmSelectedPlanView, AsyncHandlerMixin):
             initial = {
                 'company_name': "Dimagi",
                 'first_line': "585 Massachusetts Ave",
-                'second_line': "Suite 3",
+                'second_line': "Suite 4",
                 'city': "Cambridge",
                 'state_province_region': "MA",
                 'postal_code': "02139",
                 'country': "US",
-
             }
         if self.request.method == 'POST' and self.is_form_post:
             return ConfirmNewSubscriptionForm(
@@ -1506,7 +1564,6 @@ class CreateNewExchangeSnapshotView(BaseAdminProjectSettingsView):
     def app_forms(self):
         app_forms = []
         for app in self.domain_object.applications():
-            app = app.get_latest_saved() or app
             if self.request.method == 'POST':
                 app_forms.append((app, SnapshotApplicationForm(self.request.POST, prefix=app.id)))
             elif self.published_snapshot and app.copy_of in self.published_apps:
@@ -1557,8 +1614,10 @@ class CreateNewExchangeSnapshotView(BaseAdminProjectSettingsView):
     @memoized
     def snapshot_settings_form(self):
         if self.request.method == 'POST':
-            form = SnapshotSettingsForm(self.request.POST, self.request.FILES)
-            form.dom = self.domain_object
+            # User arg can be removed when toggle in __init__ is gone
+            form = SnapshotSettingsForm(self.request.POST, self.request.FILES,
+                                        domain=self.domain_object,
+                                        user=self.request.user)
             return form
 
         proj = self.published_snapshot if self.published_snapshot else self.domain_object
@@ -1575,13 +1634,13 @@ class CreateNewExchangeSnapshotView(BaseAdminProjectSettingsView):
         for attr in init_attribs:
             initial[attr] = getattr(proj, attr)
 
-        return SnapshotSettingsForm(initial=initial)
+        # User arg can be removed when toggle in __init__ is gone
+        return SnapshotSettingsForm(initial=initial, domain=self.domain_object, user=self.request.user)
 
     @property
     @memoized
     def has_published_apps(self):
         for app in self.domain_object.applications():
-            app = app.get_latest_saved() or app
             if self.request.POST.get("%s-publish" % app.id, False):
                 return True
         messages.error(self.request, _("Cannot publish a project without applications to CommCare Exchange"))
@@ -1654,6 +1713,16 @@ class CreateNewExchangeSnapshotView(BaseAdminProjectSettingsView):
                 new_domain.image_type = old.image_type
             new_domain.save()
 
+            if toggles.DOCUMENTATION_FILE.enabled(request.user.username):
+                documentation_file = self.snapshot_settings_form.cleaned_data['documentation_file']
+                if documentation_file:
+                    new_domain.documentation_file_path = documentation_file.name
+                    new_domain.documentation_file_type = documentation_file.content_type
+                elif request.POST.get('old_documentation_file', False):
+                    new_domain.documentation_file_path = old.documentation_file_path
+                    new_domain.documentation_file_type = old.documentation_file_type
+                new_domain.save()
+
             if publish_on_submit:
                 _publish_snapshot(request, self.domain_object, published_snapshot=new_domain)
             else:
@@ -1669,9 +1738,20 @@ class CreateNewExchangeSnapshotView(BaseAdminProjectSettingsView):
             elif request.POST.get('old_image', False):
                 new_domain.put_attachment(content=old.fetch_attachment(old.image_path), name=new_domain.image_path)
 
+            if toggles.DOCUMENTATION_FILE.enabled(request.user.username):
+                if documentation_file:
+                    new_domain.put_attachment(content=documentation_file, name=documentation_file.name)
+                elif request.POST.get('old_documentation_file', False):
+                    new_domain.put_attachment(content=old.fetch_attachment(old.documentation_file_path),
+                                              name=new_domain.documentation_file_path)
+
             for application in new_domain.full_applications():
                 original_id = application.copied_from._id
-                application.name = request.POST["%s-name" % original_id]
+                name_field = "%s-name" % original_id
+                if name_field not in request.POST:
+                    continue
+
+                application.name = request.POST[name_field]
                 application.description = request.POST["%s-description" % original_id]
                 date_picked = request.POST["%s-deployment_date" % original_id]
                 try:
@@ -1838,6 +1918,9 @@ class AddRepeaterView(BaseAdminProjectSettingsView, RepeaterMixin):
         repeater = self.repeater_class(
             domain=self.domain,
             url=self.add_repeater_form.cleaned_data['url'],
+            use_basic_auth=self.add_repeater_form.cleaned_data['use_basic_auth'],
+            username=self.add_repeater_form.cleaned_data['username'],
+            password=self.add_repeater_form.cleaned_data['password'],
             format=self.add_repeater_form.cleaned_data['format']
         )
         return repeater
@@ -1862,6 +1945,7 @@ class AddFormRepeaterView(AddRepeaterView):
     def make_repeater(self):
         repeater = super(AddFormRepeaterView, self).make_repeater()
         repeater.exclude_device_reports = self.add_repeater_form.cleaned_data['exclude_device_reports']
+        repeater.include_app_id_param = self.add_repeater_form.cleaned_data['include_app_id_param']
         return repeater
 
 
@@ -1927,42 +2011,46 @@ class EditInternalDomainInfoView(BaseInternalDomainSettingsView):
     strict_domain_fetching = True
 
     @property
+    def autocomplete_fields(self):
+        return ['countries']
+
+    @property
     @memoized
     def internal_settings_form(self):
+        can_edit_eula = CAN_EDIT_EULA.enabled(self.request.couch_user.username)
         if self.request.method == 'POST':
-            return DomainInternalForm(self.request.POST)
-        initial = {}
+            return DomainInternalForm(can_edit_eula, self.request.POST)
+        initial = {
+            'deployment_date': self.domain_object.deployment.date.date
+            if self.domain_object.deployment.date else '',
+            'countries': self.domain_object.deployment.countries,
+            'is_test': self.domain_object.is_test,
+        }
         internal_attrs = [
             'sf_contract_id',
             'sf_account_id',
-            'commcare_edition',
             'services',
             'initiative',
             'workshop_region',
-            'project_state',
             'area',
             'sub_area',
             'organization_name',
             'notes',
-            'platform',
             'self_started',
-            'using_adm',
-            'using_call_center',
-            'custom_eula',
-            'can_use_data',
-            'project_manager',
             'phone_model',
-            'goal_time_period',
-            'goal_followup_rate',
-            'commconnect_domain',
             'commtrack_domain',
         ]
+        if can_edit_eula:
+            internal_attrs += [
+                'custom_eula',
+                'can_use_data',
+            ]
         for attr in internal_attrs:
             val = getattr(self.domain_object.internal, attr)
             if isinstance(val, bool):
                 val = 'true' if val else 'false'
             initial[attr] = val
-        return DomainInternalForm(initial=initial)
+        return DomainInternalForm(can_edit_eula, initial=initial)
 
     @property
     def page_context(self):
@@ -1974,11 +2062,34 @@ class EditInternalDomainInfoView(BaseInternalDomainSettingsView):
 
     def post(self, request, *args, **kwargs):
         if self.internal_settings_form.is_valid():
+            old_attrs = copy.copy(self.domain_object.internal)
             self.internal_settings_form.save(self.domain_object)
+            eula_props_changed = (bool(old_attrs.custom_eula) != bool(self.domain_object.internal.custom_eula) or
+                                  bool(old_attrs.can_use_data) != bool(self.domain_object.internal.can_use_data))
+
+            if eula_props_changed and settings.EULA_CHANGE_EMAIL:
+                message = '\n'.join([
+                    '{user} changed either the EULA or data sharing properties for domain {domain}.',
+                    '',
+                    'The properties changed were:',
+                    '- Custom eula: {eula_old} --> {eula_new}',
+                    '- Can use data: {can_use_data_old} --> {can_use_data_new}'
+                ]).format(
+                    user=self.request.couch_user.username,
+                    domain=self.domain,
+                    eula_old=old_attrs.custom_eula,
+                    eula_new=self.domain_object.internal.custom_eula,
+                    can_use_data_old=old_attrs.can_use_data,
+                    can_use_data_new=self.domain_object.internal.can_use_data,
+                )
+                send_mail('Custom EULA or data use flags changed for {}'.format(self.domain),
+                          message, settings.DEFAULT_FROM_EMAIL, [settings.EULA_CHANGE_EMAIL])
+
             messages.success(request, _("The internal information for project %s was successfully updated!")
                                       % self.domain)
         else:
-            messages.error(request, _("There seems to have been an error. Please try again!"))
+            messages.error(request, _(
+                "Your settings are not valid, see below for errors. Correct them and try again!"))
         return self.get(request, *args, **kwargs)
 
 
@@ -2034,19 +2145,25 @@ def _publish_snapshot(request, domain, published_snapshot=None):
         _notification_email_on_publish(domain, published_snapshot, request.couch_user)
     return True
 
+
 def _notification_email_on_publish(domain, snapshot, published_by):
-    url_base = Site.objects.get_current().domain
-    params = {"domain": domain, "snapshot": snapshot, "published_by": published_by, "url_base": url_base}
-    text_content = render_to_string("domain/email/published_app_notification.txt", params)
-    html_content = render_to_string("domain/email/published_app_notification.html", params)
+    params = {"domain": domain, "snapshot": snapshot,
+              "published_by": published_by, "url_base": get_site_domain()}
+    text_content = render_to_string(
+        "domain/email/published_app_notification.txt", params)
+    html_content = render_to_string(
+        "domain/email/published_app_notification.html", params)
     recipients = settings.EXCHANGE_NOTIFICATION_RECIPIENTS
     subject = "New App on Exchange: %s" % snapshot.title
     try:
         for recipient in recipients:
-            send_HTML_email(subject, recipient, html_content, text_content=text_content,
+            send_HTML_email(subject, recipient, html_content,
+                            text_content=text_content,
                             email_from=settings.DEFAULT_FROM_EMAIL)
     except Exception:
-        logging.warning("Can't send notification email, but the message was:\n%s" % text_content)
+        logging.warning("Can't send notification email, "
+                        "but the message was:\n%s" % text_content)
+
 
 @domain_admin_required
 def set_published_snapshot(request, domain, snapshot_name=''):
@@ -2167,17 +2284,7 @@ class FeaturePreviewsView(BaseAdminProjectSettingsView):
 
     def update_feature(self, feature, current_state, new_state):
         if current_state != new_state:
-            slug = feature.slug
-            toggle = self.get_toggle(slug)
-            item = namespaced_item(self.domain, NAMESPACE_DOMAIN)
-            if new_state:
-                if not item in toggle.enabled_users:
-                    toggle.enabled_users.append(item)
-            else:
-                toggle.enabled_users.remove(item)
-            toggle.save()
-            update_toggle_cache(slug, item, new_state)
-
+            feature.set(self.domain, new_state, NAMESPACE_DOMAIN)
             if feature.save_fn is not None:
                 feature.save_fn(self.domain, new_state)
 
@@ -2205,6 +2312,177 @@ class FeatureFlagsView(BaseAdminProjectSettingsView):
         return {
             'flags': self.enabled_flags(),
         }
+
+
+class TransferDomainView(BaseAdminProjectSettingsView):
+    urlname = 'transfer_domain_view'
+    page_title = ugettext_noop("Transfer Project")
+    template_name = 'domain/admin/transfer_domain.html'
+
+    @property
+    @memoized
+    def active_transfer(self):
+        return TransferDomainRequest.get_active_transfer(self.domain,
+                                                         self.request.user.username)
+
+    @property
+    @memoized
+    def transfer_domain_form(self):
+        return TransferDomainForm(self.domain,
+                                  self.request.user.username,
+                                  self.request.POST or None)
+
+    def get(self, request, *args, **kwargs):
+
+        if self.active_transfer:
+            self.template_name = 'domain/admin/transfer_domain_pending.html'
+
+            if request.GET.get('resend', None):
+                self.active_transfer.send_transfer_request()
+                messages.info(request,
+                              _(u"Resent transfer request for project '{domain}'").format(domain=self.domain))
+
+        return super(TransferDomainView, self).get(request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
+        form = self.transfer_domain_form
+        if form.is_valid():
+            # Initiate domain transfer
+            transfer = form.save()
+            transfer.send_transfer_request()
+            return HttpResponseRedirect(self.page_url)
+
+        context = self.get_context_data(**kwargs)
+        return self.render_to_response(context)
+
+    @property
+    def page_context(self):
+        if self.active_transfer:
+            return {'transfer': self.active_transfer.as_dict()}
+        else:
+            return {'form': self.transfer_domain_form}
+
+    @method_decorator(domain_admin_required)
+    @method_decorator(login_required)
+    def dispatch(self, request, *args, **kwargs):
+        if not TRANSFER_DOMAIN.enabled(request.domain):
+            raise Http404()
+        return super(TransferDomainView, self).dispatch(request, *args, **kwargs)
+
+
+class ActivateTransferDomainView(BasePageView):
+    urlname = 'activate_transfer_domain'
+    page_title = 'Activate Domain Transfer'
+    template_name = 'domain/activate_transfer_domain.html'
+
+    @property
+    @memoized
+    def active_transfer(self):
+        return TransferDomainRequest.get_by_guid(self.guid)
+
+    @property
+    def page_context(self):
+        if self.active_transfer:
+            return {'transfer': self.active_transfer.as_dict()}
+        else:
+            return {}
+
+    @property
+    def page_url(self):
+        return self.request.get_full_path()
+
+    def get(self, request, guid, *args, **kwargs):
+        self.guid = guid
+
+        if (self.active_transfer and
+                self.active_transfer.to_username != request.user.username and
+                not request.user.is_superuser):
+            return HttpResponseRedirect(reverse("no_permissions"))
+
+        return super(ActivateTransferDomainView, self).get(request, *args, **kwargs)
+
+    def post(self, request, guid, *args, **kwargs):
+        self.guid = guid
+
+        if not self.active_transfer:
+            raise Http404()
+
+        if self.active_transfer.to_username != request.user.username and not request.user.is_superuser:
+            return HttpResponseRedirect(reverse("no_permissions"))
+
+        self.active_transfer.transfer_domain(ip=get_ip(request))
+        messages.success(request, _(u"Successfully transferred ownership of project '{domain}'")
+                         .format(domain=self.active_transfer.domain))
+
+        return HttpResponseRedirect(reverse('dashboard_default', args=[self.active_transfer.domain]))
+
+    @method_decorator(login_required)
+    def dispatch(self, *args, **kwargs):
+        return super(ActivateTransferDomainView, self).dispatch(*args, **kwargs)
+
+
+class DeactivateTransferDomainView(View):
+
+    def post(self, request, guid, *args, **kwargs):
+
+        transfer = TransferDomainRequest.get_by_guid(guid)
+
+        if not transfer:
+            return HttpResponseRedirect(request.META.get('HTTP_REFERER', '/'))
+
+        if (transfer.to_username != request.user.username and
+                transfer.from_username != request.user.username and
+                not request.user.is_superuser):
+            return HttpResponseRedirect(reverse("no_permissions"))
+
+        transfer.active = False
+        transfer.save()
+
+        referer = request.META.get('HTTP_REFERER', '/')
+
+        # Do not want to send them back to the activate page
+        if referer.endswith(reverse('activate_transfer_domain', args=[guid])):
+            messages.info(request,
+                          _(u"Declined ownership of project '{domain}'").format(domain=transfer.domain))
+            return HttpResponseRedirect('/')
+        else:
+            return HttpResponseRedirect(referer)
+
+    @method_decorator(login_required)
+    def dispatch(self, *args, **kwargs):
+        return super(DeactivateTransferDomainView, self).dispatch(*args, **kwargs)
+
+
+from corehq.apps.smsbillables.forms import PublicSMSRateCalculatorForm
+from corehq.apps.smsbillables.async_handlers import PublicSMSRatesAsyncHandler
+from corehq.apps.domain.decorators import login_required
+
+
+class PublicSMSRatesView(BasePageView, AsyncHandlerMixin):
+    urlname = 'public_sms_rates_view'
+    page_title = ugettext_noop("SMS Rate Calculator")
+    template_name = 'domain/admin/global_sms_rates.html'
+    async_handlers = [PublicSMSRatesAsyncHandler]
+
+    @method_decorator(login_required)
+    def dispatch(self, request, *args, **kwargs):
+        # this will be public latter
+        if not GLOBAL_SMS_RATES.enabled(request.user.username):
+            raise Http404()
+        return super(PublicSMSRatesView, self).dispatch(request, *args, **kwargs)
+
+    @property
+    def page_url(self):
+        return reverse(self.urlname)
+
+    @property
+    def page_context(self):
+        return {
+            'rate_calc_form': PublicSMSRateCalculatorForm()
+        }
+
+    def post(self, request, *args, **kwargs):
+        return self.async_response or self.get(request, *args, **kwargs)
 
 
 class SMSRatesView(BaseAdminProjectSettingsView, AsyncHandlerMixin):
@@ -2256,16 +2534,22 @@ def org_request(request, domain):
         messages.error(request, "The organization '%s' does not exist" % org_name)
     return HttpResponseRedirect(reverse('domain_org_settings', args=[domain]))
 
+
 def _send_request_notification_email(request, org, dom):
-    url_base = Site.objects.get_current().domain
-    params = {"org": org, "dom": dom, "requestee": request.couch_user, "url_base": url_base}
-    text_content = render_to_string("domain/email/org_request_notification.txt", params)
-    html_content = render_to_string("domain/email/org_request_notification.html", params)
-    recipients = [member.email for member in org.get_members() if member.is_org_admin(org.name)]
+    params = {"org": org, "dom": dom, "requestee": request.couch_user,
+              "url_base": get_site_domain()}
+    text_content = render_to_string(
+        "domain/email/org_request_notification.txt", params)
+    html_content = render_to_string(
+        "domain/email/org_request_notification.html", params)
+    recipients = [member.email for member in org.get_members()
+                  if member.is_org_admin(org.name)]
     subject = "New request to add a project to your organization! -- CommcareHQ"
     try:
         for recipient in recipients:
-            send_HTML_email(subject, recipient, html_content, text_content=text_content,
+            send_HTML_email(subject, recipient, html_content,
+                            text_content=text_content,
                             email_from=settings.DEFAULT_FROM_EMAIL)
     except Exception:
-        logging.warning("Can't send notification email, but the message was:\n%s" % text_content)
+        logging.warning("Can't send notification email, "
+                        "but the message was:\n%s" % text_content)

@@ -1,6 +1,6 @@
 import logging
 
-from django.conf.urls.defaults import *
+from django.conf.urls import *
 from django.core.exceptions import ImproperlyConfigured
 from corehq.apps.reports.util import get_installed_custom_modules
 from corehq.apps.reports.dispatcher import (ProjectReportDispatcher, 
@@ -8,7 +8,17 @@ from corehq.apps.reports.dispatcher import (ProjectReportDispatcher,
 
 # from .filters.urls import urlpatterns as filter_urls
 from corehq.apps.example_reports.testreport import TestReport
+from corehq.apps.reports.views import AddSavedReportConfigView
 from corehq.apps.userreports.reports.view import ConfigurableReport
+from corehq.apps.userreports.views import (
+    ConfigureChartReport,
+    ConfigureListReport,
+    ConfigureTableReport,
+    ConfigureWorkerReport,
+    EditReportInBuilder,
+    ReportBuilderDataSourceSelect,
+    ReportBuilderTypeSelect,
+)
 from .filters import urls as filter_urls
 
 
@@ -19,13 +29,25 @@ custom_report_urls = patterns('',
 urlpatterns = patterns('corehq.apps.reports.views',
     TestReport.url_pattern(),
     ConfigurableReport.url_pattern(),
+
+    url(r'^builder/select_type/$', ReportBuilderTypeSelect.as_view(), name='report_builder_select_type'),
+    url(r'^builder/(?P<report_type>list|chart|table|worker)/select_source/$', ReportBuilderDataSourceSelect.as_view(), name='report_builder_select_source'),
+    url(r'^builder/configure/chart/$', ConfigureChartReport.as_view(), name="configure_chart_report"),
+    url(r'^builder/configure/list/$', ConfigureListReport.as_view(), name="configure_list_report"),
+    url(r'^builder/configure/table/$', ConfigureTableReport.as_view(), name="configure_table_report"),
+    url(r'^builder/configure/worker/$', ConfigureWorkerReport.as_view(), name="configure_worker_report"),
+    url(r'^builder/edit/(?P<report_id>[\w\-]+)/$', EditReportInBuilder.as_view(), name='edit_report_in_builder'),
+
     url(r'^$', "default", name="reports_home"),
     url(r'^saved/', "saved_reports", name="saved_reports"),
     url(r'^saved_reports', 'old_saved_reports'),
 
     url(r'^case_data/(?P<case_id>[\w\-]+)/$', 'case_details', name="case_details"),
+    url(r'^case_data/(?P<case_id>[\w\-]+)/forms/$', 'case_forms', name="single_case_forms"),
+    url(r'^case_data/(?P<case_id>[\w\-]+)/attachments/$', 'case_attachments', name="single_case_attachments"),
     url(r'^case_data/(?P<case_id>[\w\-]+)/view/xml/$', 'case_xml', name="single_case_xml"),
     url(r'^case_data/(?P<case_id>[\w\-]+)/rebuild/$', 'rebuild_case_view', name="rebuild_case"),
+    url(r'^case_data/(?P<case_id>[\w\-]+)/resave/$', 'resave_case', name="resave_case"),
     url(r'^case_data/(?P<case_id>[\w\-]+)/close/$', 'close_case_view', name="close_case"),
     url(r'^case_data/(?P<case_id>[\w\-]+)/undo-close/$', 'undo_close_case_view', name="undo_close_case"),
     url(r'^case_data/(?P<case_id>[\w\-]+)/export_transactions/$',
@@ -35,12 +57,13 @@ urlpatterns = patterns('corehq.apps.reports.views',
     # Download and view form data
     url(r'^form_data/(?P<instance_id>[\w\-:]+)/$', 'form_data', name='render_form_data'),
     url(r'^form_data/(?P<instance_id>[\w\-:]+)/download/$', 'download_form', name='download_form'),
-    url(r'^form_data/(?P<app_id>[\w\-:]+)/download/media/$',
+    url(r'^form_data/download/media/$',
         'form_multimedia_export', name='form_multimedia_export'),
     url(r'^form_data/(?P<instance_id>[\w\-:]+)/download-attachment/$',
         'download_attachment', name='download_attachment'),
     url(r'^form_data/(?P<instance_id>[\w\-:]+)/archive/$', 'archive_form', name='archive_form'),
     url(r'^form_data/(?P<instance_id>[\w\-:]+)/unarchive/$', 'unarchive_form', name='unarchive_form'),
+    url(r'^form_data/(?P<instance_id>[\w\-:]+)/rebuild/$', 'resave_form', name='resave_form'),
 
     # export API
     url(r"^export/$", 'export_data'),
@@ -66,7 +89,7 @@ urlpatterns = patterns('corehq.apps.reports.views',
         kwargs=dict(report_type=CustomProjectReportDispatcher.prefix)),
 
     # Saved reports
-    url(r"^configs$", 'add_config', name='add_report_config'),
+    url(r"^configs$", AddSavedReportConfigView.as_view(), name=AddSavedReportConfigView.name),
     url(r"^configs/(?P<config_id>[\w-]+)$", 'delete_config',
         name='delete_report_config'),
 

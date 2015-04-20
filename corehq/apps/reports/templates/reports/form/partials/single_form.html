@@ -20,11 +20,12 @@ requires imports/proptable.html to be included in the main template
 </style>
 
 <style>
-.form-data-readable, .form-data-raw {
+.form-data-raw {
     display: none;
 }
 .form-data-table, .form-data-group-table {
     overflow: scroll;
+    width: 800px;
 }
 </style>
 <script src="{% static 'cloudcare/js/util.js' %}"></script>
@@ -32,7 +33,8 @@ requires imports/proptable.html to be included in the main template
     $(function () {
         var help_text = {
             "{% trans "Archiving Forms" %}": "{% trans "Archived forms will no longer show up in reports and they will be removed from any relevant case histories. " %}",
-            "{% trans "Restoring Forms" %}": "{% trans "Restoring this form will cause it to show up in reports again." %}"
+            "{% trans "Restoring Forms" %}": "{% trans "Restoring this form will cause it to show up in reports again." %}",
+            "{% trans "Resaving Forms" %}": "{% trans "Resaving a form can manually cause it to be reincluded in reports if something went wrong during initial processing." %}"
         };
         $('.help_popover').popover({
             placement: 'left',
@@ -55,13 +57,15 @@ requires imports/proptable.html to be included in the main template
             $('.form-data-readable').hide();
             $('.form-data-raw').show();
         }
-        showReadable();
         $('.showReadable').click(showReadable);
         $('.showRaw').click(showRaw);
         $('.formDisplayToggle a').click(function () {
             $(this).tab('show');
             return false;
         });
+
+        // On page load, initially set show readable
+        showReadable();
 
         function showSkipped(show) {
             if (show) {
@@ -96,6 +100,8 @@ requires imports/proptable.html to be included in the main template
         showSkipped(false);
 
         {% if form_meta %}
+        GMAPS_API_KEY = '{{ maps_api_key|safe }}'; // maps api is a global variable depended on by touchforms
+
         // unfortunately since cloudcare doesn't have reversible urls, this has to be done in javascript
         // todo: this probably needs better error handling
         var cloudCareUrl = getCloudCareUrl(
@@ -110,21 +116,28 @@ requires imports/proptable.html to be included in the main template
         $("#archive-form").submit(function() {
             document.getElementById('archive-form-btn').disabled=true;
             document.getElementById('archive-spinner').style.display='inline-block';
-            return ! ga_track_event('Reports', 'Case History', 'Archive this form', {
+            ga_track_event('Reports', 'Case History', 'Archive this form', {
                 'hitCallback': function () {
                     document.getElementById('archive-form').submit();
                 }
             });
+            return false;
         });
         $("#unarchive-form").submit(function() {
             document.getElementById('unarchive-form-btn').disabled=true;
             document.getElementById('unarchive-spinner').style.display='inline-block';
-            return ! ga_track_event('Reports', 'Case History', 'Restore this form', {
+            ga_track_event('Reports', 'Case History', 'Restore this form', {
                 'hitCallback': function () {
                     document.getElementById('unarchive-form').submit();
                 }
             });
+            return false;
         });
+        $("#resave-form").submit(function() {
+            document.getElementById('resave-form-btn').disabled=true;
+            document.getElementById('resave-spinner').style.display='inline-block';
+        });
+
     });
 </script>
 <style>
@@ -217,7 +230,7 @@ requires imports/proptable.html to be included in the main template
             {% trans "Raw XML" %}
         </a>
     </li>
-{% if request|toggle_enabled:"EDIT_SUBMISSIONS" %}
+{% if show_edit_submission %}
     <li>
         <a href="#edit-submission" data-toggle="tab">
             {% trans "Edit Submission" %}
@@ -262,6 +275,18 @@ requires imports/proptable.html to be included in the main template
                    </button>
                 </form>
                 {% endif %}
+                {% if show_resave %}
+                <form action="{% url "resave_form" domain instance.get_id %}" method="POST"
+                      id="resave-form">
+                    <span class="help_popover" data-help-key="{% trans "Resaving Forms" %}">
+                        <i class="icon icon-question-sign"></i>
+                    </span>
+                    <button type="submit" class="btn" id="resave-form-btn">
+                        {% trans "Resave this form" %}
+                        <i class="icon-refresh icon-spin" id="resave-spinner" style="display:none"></i>
+                    </button>
+                </form>
+                {% endif %}
             </p>
             {% endif %}
         </div>
@@ -290,18 +315,16 @@ requires imports/proptable.html to be included in the main template
             </a>
         </label>
         {% endif %}
-        <div{% if not side_pane %} class="row-fluid"{% endif %}>
-            <table class="table table-bordered form-data-table {% if not side_pane %}span6{% endif %}">
-                <tr>
-                    <th class="span6">
-                        <span class="form-data-readable">{% trans "Question" %}</span>
-                        <span class="form-data-raw">{% trans "Question ID" %}</span>
-                    </th>
-                    <th class="span6">{% trans "Response" %}</th>
-                </tr>
-                {% include 'reports/form/partials/single_form_tree.html' with questions=form_data %}
-            </table>
-        </div>
+        <table class="table table-bordered form-data-table">
+            <tr>
+                <th class="span6">
+                    <span class="form-data-readable">{% trans "Question" %}</span>
+                    <span class="form-data-raw">{% trans "Question ID" %}</span>
+                </th>
+                <th class="span6">{% trans "Response" %}</th>
+            </tr>
+            {% include 'reports/form/partials/single_form_tree.html' with questions=form_data %}
+        </table>
     </div>
 
     {% if cases %}
@@ -375,7 +398,7 @@ requires imports/proptable.html to be included in the main template
         <p>{% trans "Double-click code below to select all:" %}</p>
         {% render_form_xml instance %}
     </div>
-{% if request|toggle_enabled:"EDIT_SUBMISSIONS" %}
+{% if show_edit_submission %}
     <div class="tab-pane" id="edit-submission">
         <p>
             <a href="#" class="btn btn-primary touchforms-link"

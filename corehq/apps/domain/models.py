@@ -1,35 +1,45 @@
 from datetime import datetime, timedelta
 from itertools import imap
-import hashlib
 import json
 import logging
+import uuid
 from couchdbkit.exceptions import ResourceConflict
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
+from django.template.loader import render_to_string
 from couchdbkit.ext.django.schema import (
     Document, StringProperty, BooleanProperty, DateTimeProperty, IntegerProperty,
     DocumentSchema, SchemaProperty, DictProperty,
     StringListProperty, SchemaListProperty, TimeProperty, DecimalProperty
 )
-from django.core.cache import cache
+from django.core.urlresolvers import reverse
+from django.db import models
+from django.utils.translation import ugettext_lazy as _
 from corehq.apps.appstore.models import SnapshotMixin
+from corehq.util.quickcache import skippable_quickcache
 from dimagi.utils.couch.cache import cache_core
-from dimagi.utils.couch.database import iter_docs
+from dimagi.utils.couch.database import (
+    iter_docs, get_db, get_safe_write_kwargs, apply_update, iter_bulk_delete
+)
 from dimagi.utils.decorators.memoized import memoized
+from dimagi.utils.django.email import send_HTML_email
 from dimagi.utils.html import format_html
 from dimagi.utils.logging import notify_exception
-from dimagi.utils.couch.database import get_db, get_safe_write_kwargs, apply_update, iter_bulk_delete
+from dimagi.utils.web import get_url_base
 from itertools import chain
 from langcodes import langs as all_langs
 from collections import defaultdict
 from django.utils.importlib import import_module
+from corehq import toggles
 
+from .exceptions import InactiveTransferDomainException
 
 lang_lookup = defaultdict(str)
 
 DATA_DICT = settings.INTERNAL_DATA
 AREA_CHOICES = [a["name"] for a in DATA_DICT["area"]]
 SUB_AREA_CHOICES = reduce(list.__add__, [a["sub_areas"] for a in DATA_DICT["area"]], [])
+DATE_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 
 
 for lang in all_langs:
@@ -57,13 +67,13 @@ class DomainMigrations(DocumentSchema):
             domain.save()
 
 LICENSES = {
-    'cc': 'Creative Commons Attribution',
-    'cc-sa': 'Creative Commons Attribution, Share Alike',
-    'cc-nd': 'Creative Commons Attribution, No Derivatives',
-    'cc-nc': 'Creative Commons Attribution, Non-Commercial',
-    'cc-nc-sa': 'Creative Commons Attribution, Non-Commercial, and Share Alike',
-    'cc-nc-nd': 'Creative Commons Attribution, Non-Commercial, and No Derivatives',
-    }
+    'cc': 'Creative Commons Attribution (CC BY)',
+    'cc-sa': 'Creative Commons Attribution, Share Alike (CC BY-SA)',
+    'cc-nd': 'Creative Commons Attribution, No Derivatives (CC BY-ND)',
+    'cc-nc': 'Creative Commons Attribution, Non-Commercial (CC BY-NC)',
+    'cc-nc-sa': 'Creative Commons Attribution, Non-Commercial, and Share Alike (CC BY-NC-SA)',
+    'cc-nc-nd': 'Creative Commons Attribution, Non-Commercial, and No Derivatives (CC BY-NC-ND)'
+}
 
 LICENSE_LINKS = {
     'cc': 'http://creativecommons.org/licenses/by/4.0',
@@ -131,7 +141,7 @@ class InternalProperties(DocumentSchema, UpdatableSchema):
     using_adm = BooleanProperty()
     using_call_center = BooleanProperty()
     custom_eula = BooleanProperty()
-    can_use_data = BooleanProperty()
+    can_use_data = BooleanProperty(default=True)
     notes = StringProperty()
     organization_name = StringProperty()
     platform = StringListProperty()
@@ -139,9 +149,7 @@ class InternalProperties(DocumentSchema, UpdatableSchema):
     phone_model = StringProperty()
     goal_time_period = IntegerProperty()
     goal_followup_rate = DecimalProperty()
-    # intentionally different from commconnect_enabled and commtrack_enabled so
-    # that FMs can change
-    commconnect_domain = BooleanProperty()
+    # intentionally different from and commtrack_enabled so that FMs can change
     commtrack_domain = BooleanProperty()
 
 
@@ -208,10 +216,12 @@ class Domain(Document, SnapshotMixin):
     short_description = StringProperty()
     is_shared = BooleanProperty(default=False)
     commtrack_enabled = BooleanProperty(default=False)
+    locations_enabled = BooleanProperty(default=False)
     call_center_config = SchemaProperty(CallCenterProperties)
     has_careplan = BooleanProperty(default=False)
     restrict_superusers = BooleanProperty(default=False)
     location_restriction_for_users = BooleanProperty(default=True)
+    usercase_enabled = BooleanProperty(default=False)
 
     case_display = SchemaProperty(CaseDisplaySettings)
 
@@ -299,6 +309,7 @@ class Domain(Document, SnapshotMixin):
     _dirty_fields = ('admin_password', 'admin_password_charset', 'city', 'countries', 'region', 'customer_type')
 
     default_mobile_worker_redirect = StringProperty(default=None)
+    last_modified = DateTimeProperty(default=datetime(2015, 1, 1))
 
     @property
     def domain_type(self):
@@ -340,6 +351,11 @@ class Domain(Document, SnapshotMixin):
         if 'cloudcare_releases' not in data:
             data['cloudcare_releases'] = 'nostars'  # legacy default setting
 
+        # Don't actually remove location_types yet.  We can migrate fully and
+        # remove this after everything's hunky-dory in production.  2015-03-06
+        if 'location_types' in data:
+            data['obsolete_location_types'] = data.pop('location_types')
+
         self = super(Domain, cls).wrap(data)
         if self.deployment is None:
             self.deployment = Deployment()
@@ -348,6 +364,11 @@ class Domain(Document, SnapshotMixin):
         if should_save:
             self.save()
         return self
+
+    def get_default_timezone(self):
+        """return a timezone object from self.default_timezone"""
+        import pytz
+        return pytz.timezone(self.default_timezone)
 
     @staticmethod
     def active_for_user(user, is_active=True):
@@ -480,7 +501,7 @@ class Domain(Document, SnapshotMixin):
             include_docs=False,
             limit=1).all()
         if len(res) > 0: # if there have been any submissions in the past 30 days
-            return (datetime.now() <=
+            return (datetime.utcnow() <=
                     datetime.strptime(res[0]['key'][2], "%Y-%m-%dT%H:%M:%SZ")
                     + timedelta(days=30))
         else:
@@ -498,6 +519,7 @@ class Domain(Document, SnapshotMixin):
         return self.name
 
     @classmethod
+    @skippable_quickcache(['name'], skip_arg='strict', timeout=30*60)
     def get_by_name(cls, name, strict=False):
         if not name:
             # get_by_name should never be called with name as None (or '', etc)
@@ -515,37 +537,21 @@ class Domain(Document, SnapshotMixin):
                     notify_exception(None, '%r is not a valid domain name' % name)
                     return None
 
-        cache_key = _domain_cache_key(name)
-        if not strict:
-            MISSING = object()
-            res = cache.get(cache_key, MISSING)
-            if res != MISSING:
-                return res
+        def _get_by_name(stale=False):
+            extra_args = {'stale': settings.COUCH_STALE_QUERY} if stale else {}
+            result = cls.view("domain/domains", key=name, reduce=False, include_docs=True, **extra_args).first()
+            if not isinstance(result, Domain):
+                # A stale view may return a result with no doc if the doc has just been deleted.
+                # In this case couchdbkit just returns the raw view result as a dict
+                return None
+            else:
+                return result
 
-        domain = cls._get_by_name(name, strict)
-        # 30 mins, so any unforeseen invalidation bugs aren't too bad.
-        cache.set(cache_key, domain, 30*60)
-        return domain
-
-    @classmethod
-    def _get_by_name(cls, name, strict=False):
-        extra_args = {'stale': settings.COUCH_STALE_QUERY} if not strict else {}
-
-        db = cls.get_db()
-        res = cache_core.cached_view(db, "domain/domains", key=name, reduce=False,
-                                     include_docs=True, wrapper=cls.wrap, force_invalidate=strict,
-                                     **extra_args)
-
-        if len(res) > 0:
-            result = res[0]
-        else:
-            result = None
-
-        if result is None and not strict:
+        domain = _get_by_name(stale=(not strict))
+        if domain is None and not strict:
             # on the off chance this is a brand new domain, try with strict
-            return cls.get_by_name(name, strict=True)
-
-        return result
+            domain = _get_by_name(stale=False)
+        return domain
 
     @classmethod
     def get_by_organization(cls, organization):
@@ -603,7 +609,7 @@ class Domain(Document, SnapshotMixin):
         if not include_docs:
             return domains
         else:
-            return imap(cls, iter_docs(cls.get_db(), [d['id'] for d in domains]))
+            return imap(cls.wrap, iter_docs(cls.get_db(), [d['id'] for d in domains]))
 
     @classmethod
     def get_all_names(cls):
@@ -613,8 +619,9 @@ class Domain(Document, SnapshotMixin):
         return self.case_sharing or reduce(lambda x, y: x or y, [getattr(app, 'case_sharing', False) for app in self.applications()], False)
 
     def save(self, **params):
+        self.last_modified = datetime.utcnow()
         super(Domain, self).save(**params)
-        cache.delete(_domain_cache_key(self.name))
+        Domain.get_by_name.clear(Domain, self.name)  # clear the domain cache
 
         from corehq.apps.domain.signals import commcare_domain_post_save
         results = commcare_domain_post_save.send_robust(sender='domain', domain=self)
@@ -636,7 +643,8 @@ class Domain(Document, SnapshotMixin):
         ignore = ignore if ignore is not None else []
         if new_domain_name is not None and Domain.get_by_name(new_domain_name):
             return None
-        db = get_db()
+
+        db = Domain.get_db()
 
         new_id = db.copy_doc(self.get_id)['id']
         if new_domain_name is None:
@@ -744,6 +752,9 @@ class Domain(Document, SnapshotMixin):
         if doc_type in ('Application', 'RemoteApp'):
             new_doc = import_app(id, new_domain_name)
             new_doc.copy_history.append(id)
+            # when copying from app-docs that don't have
+            # unique_id attribute on Modules
+            new_doc.ensure_module_unique_ids(should_save=False)
         else:
             cls = str_to_cls[doc_type]
 
@@ -784,7 +795,7 @@ class Domain(Document, SnapshotMixin):
             if copy is None:
                 return None
             copy.is_snapshot = True
-            copy.snapshot_time = datetime.now()
+            copy.snapshot_time = datetime.utcnow()
             del copy.deployment
             copy.save()
             return copy
@@ -885,6 +896,9 @@ class Domain(Document, SnapshotMixin):
     def get_license_display(self):
         return LICENSES.get(self.license)
 
+    def get_license_url(self):
+        return LICENSE_LINKS.get(self.license)
+
     def copies(self):
         return Domain.view('domain/copied_from_snapshot', key=self._id, include_docs=True)
 
@@ -901,6 +915,7 @@ class Domain(Document, SnapshotMixin):
         )]
         iter_bulk_delete(db, related_doc_ids, chunksize=500)
         super(Domain, self).delete()
+        Domain.get_by_name.clear(Domain, self.name)  # clear the domain cache
 
     def all_media(self, from_apps=None): #todo add documentation or refactor
         from corehq.apps.hqmedia.models import CommCareMultimedia
@@ -1022,11 +1037,36 @@ class Domain(Document, SnapshotMixin):
     def name_of_publisher(self):
         return self.published_by.human_friendly_name if self.published_by else ""
 
+    @property
+    def location_types(self):
+        from corehq.apps.locations.models import LocationType
+        return LocationType.objects.filter(domain=self.name).all()
+
+    @property
+    @memoized
+    def uses_locations(self):
+        if self.commtrack_enabled:
+            return True
+        from corehq.apps.locations.models import LocationType
+        return LocationType.objects.filter(domain=self.name).exists()
+
+    @property
+    def supports_multiple_locations_per_user(self):
+        """
+        This method is a wrapper around the toggle that
+        enables multiple location functionality. Callers of this
+        method should know that this is special functionality
+        left around for special applications, and not a feature
+        flag that should be set normally.
+        """
+        return toggles.MULTIPLE_LOCATIONS_PER_USER.enabled(self)
+
+
 class DomainCounter(Document):
     domain = StringProperty()
     name = StringProperty()
     count = IntegerProperty()
-    
+
     @classmethod
     def get_or_create(cls, domain, name):
         #TODO: Need to make this atomic
@@ -1042,7 +1082,7 @@ class DomainCounter(Document):
             )
             counter.save()
         return counter
-    
+
     @classmethod
     def increment(cls, domain, name, amount=1):
         num_tries = 0
@@ -1061,5 +1101,147 @@ class DomainCounter(Document):
         return (range_start, range_end)
 
 
-def _domain_cache_key(name):
-    return hashlib.md5(u'cchq:domain:{name}'.format(name=name).encode('utf-8')).hexdigest()
+class TransferDomainRequest(models.Model):
+    active = models.BooleanField(default=True, blank=True)
+    request_time = models.DateTimeField(null=True, blank=True)
+    request_ip = models.CharField(max_length=80, null=True, blank=True)
+    confirm_time = models.DateTimeField(null=True, blank=True)
+    confirm_ip = models.CharField(max_length=80, null=True, blank=True)
+    transfer_guid = models.CharField(max_length=32, null=True, blank=True)
+
+    domain = models.CharField(max_length=256)
+    from_username = models.CharField(max_length=80)
+    to_username = models.CharField(max_length=80)
+
+    TRANSFER_TO_EMAIL = 'domain/email/domain_transfer_to_request'
+    TRANSFER_FROM_EMAIL = 'domain/email/domain_transfer_from_request'
+    DIMAGI_CONFIRM_EMAIL = 'domain/email/domain_transfer_confirm'
+    DIMAGI_CONFIRM_ADDRESS = 'commcarehq-support@dimagi.com'
+
+    @property
+    @memoized
+    def to_user(self):
+        from corehq.apps.users.models import WebUser
+        return WebUser.get_by_username(self.to_username)
+
+    @property
+    @memoized
+    def from_user(self):
+        from corehq.apps.users.models import WebUser
+        return WebUser.get_by_username(self.from_username)
+
+    @classmethod
+    def get_by_guid(cls, guid):
+        try:
+            return cls.objects.get(transfer_guid=guid, active=True)
+        except TransferDomainRequest.DoesNotExist:
+            return None
+
+    @classmethod
+    def get_active_transfer(cls, domain, from_username):
+        try:
+            return cls.objects.get(domain=domain, from_username=from_username, active=True)
+        except TransferDomainRequest.DoesNotExist:
+            return None
+        except TransferDomainRequest.MultipleObjectsReturned:
+            # Deactivate all active transfer except for most recent
+            latest = cls.objects \
+                .filter(domain=domain, from_username=from_username, active=True, request_time__isnull=False) \
+                .latest('request_time')
+            cls.objects \
+                .filter(domain=domain, from_username=from_username) \
+                .exclude(pk=latest.pk) \
+                .update(active=False)
+
+            return latest
+
+    def requires_active_transfer(fn):
+        def decorate(self, *args, **kwargs):
+            if not self.active:
+                raise InactiveTransferDomainException(_("Transfer domain request is no longer active"))
+            return fn(self, *args, **kwargs)
+        return decorate
+
+    @requires_active_transfer
+    def send_transfer_request(self):
+        self.transfer_guid = uuid.uuid4().hex
+        self.request_time = datetime.utcnow()
+        self.save()
+
+        self.email_to_request()
+        self.email_from_request()
+
+    def activate_url(self):
+        return u"{url_base}/domain/transfer/{guid}/activate".format(
+            url_base=get_url_base(),
+            guid=self.transfer_guid
+        )
+
+    def deactivate_url(self):
+        return u"{url_base}/domain/transfer/{guid}/deactivate".format(
+            url_base=get_url_base(),
+            guid=self.transfer_guid
+        )
+
+    def email_to_request(self):
+        context = self.as_dict()
+
+        html_content = render_to_string("{template}.html".format(template=self.TRANSFER_TO_EMAIL), context)
+        text_content = render_to_string("{template}.txt".format(template=self.TRANSFER_TO_EMAIL), context)
+
+        send_HTML_email(
+            _(u'Transfer of ownership for CommCare project space.'),
+            self.to_user.email,
+            html_content,
+            text_content=text_content)
+
+    def email_from_request(self):
+        context = self.as_dict()
+        context['settings_url'] = u"{url_base}{path}".format(
+            url_base=get_url_base(),
+            path=reverse('transfer_domain_view', args=[self.domain]))
+
+        html_content = render_to_string("{template}.html".format(template=self.TRANSFER_FROM_EMAIL), context)
+        text_content = render_to_string("{template}.txt".format(template=self.TRANSFER_FROM_EMAIL), context)
+
+        send_HTML_email(
+            _(u'Transfer of ownership for CommCare project space.'),
+            self.from_user.email,
+            html_content,
+            text_content=text_content)
+
+    @requires_active_transfer
+    def transfer_domain(self, *args, **kwargs):
+
+        self.confirm_time = datetime.utcnow()
+        if 'ip' in kwargs:
+            self.confirm_ip = kwargs['ip']
+
+        self.from_user.transfer_domain_membership(self.domain, self.to_user, is_admin=True)
+        self.from_user.save()
+        self.to_user.save()
+        self.active = False
+        self.save()
+
+        html_content = render_to_string(
+            "{template}.html".format(template=self.DIMAGI_CONFIRM_EMAIL),
+            self.as_dict())
+        text_content = render_to_string(
+            "{template}.txt".format(template=self.DIMAGI_CONFIRM_EMAIL),
+            self.as_dict())
+
+        send_HTML_email(_(u'There has been a transfer of ownership of {domain}').format(domain=self.domain),
+                        self.DIMAGI_CONFIRM_ADDRESS,
+                        html_content,
+                        text_content=text_content)
+
+    def as_dict(self):
+        return {
+            'domain': self.domain,
+            'from_username': self.from_username,
+            'to_username': self.to_username,
+            'guid': self.transfer_guid,
+            'request_time': self.request_time,
+            'deactivate_url': self.deactivate_url(),
+            'activate_url': self.activate_url(),
+        }

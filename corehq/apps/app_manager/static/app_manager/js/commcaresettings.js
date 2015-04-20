@@ -2,9 +2,16 @@ function CommcareSettings(options) {
     var self = this;
     var initialValues = options.values;
     self.sections = options.sections;
-    self.edit = ko.observable(options.edit);
     self.user = options.user;
     self.permissions = options.permissions;
+
+    self.customPropertyType = 'custom_properties';
+    self.customProperties = ko.observableArray(_.map(options.customProperties, function(d) {
+        return ko.mapping.fromJS(d);
+    }));
+    self.customProperties.sort(function(left, right) {
+        return left.key() == right.key() ? 0 : (left.key() < right.key() ? -1 : 1);
+    });
 
     self.settings = [];
     self.settingsIndex = {};
@@ -260,6 +267,13 @@ function CommcareSettings(options) {
                 blob[setting.type][setting.id] = setting.valueToSave();
             }
         });
+
+        blob[self.customPropertyType] = {};
+        _(self.customProperties()).each(function (customProperty) {
+            if (customProperty.key() && customProperty.value()) {
+                blob[self.customPropertyType][customProperty.key()] = customProperty.value();
+            }
+        });
         return blob;
     });
 
@@ -280,6 +294,14 @@ function CommcareSettings(options) {
             }
         };
     });
+
+    self.onAddCustomProperty = function() {
+        self.customProperties.push({ key: ko.observable(), value: ko.observable() });
+    };
+
+    self.onDestroyCustomProperty = function(customProperty) {
+        self.customProperties.remove(customProperty);
+    };
 
 }
 CommcareSettings.widgets = {};
@@ -376,6 +398,27 @@ CommcareSettings.widgets.build_spec = function (self, settingsIndex) {
         self.updateOptions();
         self.selectedOption(self["default"]);
     });
+};
+
+CommcareSettings.widgets.image_uploader = function (self) {
+    self.slug = "hq_" + self.id;
+    self.href = "#" + self.slug;
+    self.path = getPathFromSlug(self.slug);
+    self.url = urlFromLogo(self.slug);
+    self.thumb_url = thumbUrlFromLogo(self.slug);
+
+    self.is_uploader = function(slug) {
+        return slug == self.slug;
+    };
+    self.uploadComplete = function(widget, event, response) {
+        uploadCompleteForLogo(self.slug, response);
+    };
+    self.triggerUpload = function() {
+        triggerUploadForLogo(self.slug);
+    };
+    self.removeLogo = function() {
+        removeLogo(self.slug);
+    };
 };
 
 $(function () {

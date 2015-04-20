@@ -6,7 +6,7 @@ $(function() {
     });
 
     model.load(settings);
-    ko.applyBindings(model);
+    ko.applyBindings(model, $('#settings').get(0));
 });
 
 function LocationSettingsViewModel() {
@@ -81,8 +81,9 @@ function LocationSettingsViewModel() {
 }
 
 function LocationTypeModel(data, root) {
-    var name = data.name || '\u2014';
+    var name = data.name || '';
     var self = this;
+    this.pk = data.pk || null;
     this.name = ko.observable(name);
     this.code = ko.observable(data.code || name);
     var code_autoset = this.name() == this.code();
@@ -112,6 +113,8 @@ function LocationTypeModel(data, root) {
     }
     this.allowed_parents = ko.observableArray(allowed_parents);
     this.tracks_stock = ko.observable(!data.administrative);
+    this.shares_cases = ko.observable(data.shares_cases);
+    this.view_descendants = ko.observable(data.view_descendants);
 
     this.name_error = ko.observable();
     this.code_error = ko.observable();
@@ -141,10 +144,13 @@ function LocationTypeModel(data, root) {
 
     this.to_json = function() {
         return {
+            pk: this.pk,
             name: this.name(),
             code: this.code(),
             allowed_parents: this.allowed_parents(),
-            administrative: !this.tracks_stock()
+            administrative: !this.tracks_stock(),
+            shares_cases: this.shares_cases() === true,
+            view_descendants: this.view_descendants() === true
         };
     };
 }

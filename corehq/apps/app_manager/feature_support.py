@@ -60,3 +60,25 @@ class CommCareFeatureSupportMixin(object):
     @property
     def enable_auto_gps(self):
         return self._require_minimum_version('2.14')
+
+    @property
+    def enable_group_in_field_list(self):
+        """
+        Groups and repeat groups inside of a field list supported by apps
+        version 2.16 or higher
+        """
+        return self._require_minimum_version('2.16')
+
+    @property
+    def enable_post_form_workflow(self):
+        """
+        Post form workflow is supported by apps version 2.9 or higher
+        """
+        return self._require_minimum_version('2.9')
+
+    @property
+    def enable_module_filtering(self):
+        """
+        Filtering modules is supported by apps version 2.20 or higher
+        """
+        return self._require_minimum_version('2.20')

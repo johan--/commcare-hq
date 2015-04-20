@@ -1,12 +1,16 @@
 from StringIO import StringIO
+from copy import copy
 import os
 import json
 import tempfile
 import re
 import zipfile
 import cStringIO
+import itertools
 from datetime import datetime, timedelta, date
 from urllib2 import URLError
+from corehq.util.timezones.utils import get_timezone_for_user
+from dimagi.utils.decorators.memoized import memoized
 from unidecode import unidecode
 from dateutil.parser import parse
 
@@ -19,6 +23,7 @@ from django.core.urlresolvers import reverse
 from django.http import (HttpResponseRedirect,
     HttpResponseBadRequest, Http404, HttpResponseForbidden)
 from django.shortcuts import render
+from django.utils.decorators import method_decorator
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext as _
 from django.views.decorators.http import (require_http_methods,
@@ -27,6 +32,7 @@ from couchdbkit.exceptions import ResourceNotFound
 from django.core.files.base import ContentFile
 from django.http.response import HttpResponse, HttpResponseNotFound
 from django.views.decorators.http import require_GET
+from django.views.generic import View
 import pytz
 from casexml.apps.stock.models import StockTransaction
 from corehq import toggles, Domain
@@ -34,7 +40,9 @@ from casexml.apps.case.cleanup import rebuild_case, close_case
 from corehq.apps.products.models import SQLProduct
 from corehq.apps.data_interfaces.dispatcher import DataInterfaceDispatcher
 from corehq.apps.reports.display import FormType
+from corehq.apps.reports.forms import SavedReportConfigForm
 from corehq.util.couch import get_document_or_404
+from corehq.util.view_utils import absolute_reverse
 
 import couchexport
 from couchexport import views as couchexport_views
@@ -42,11 +50,10 @@ from couchexport.exceptions import (
     CouchExportException,
     SchemaMismatchException
 )
-from couchexport.groupexports import rebuild_export
 from couchexport.models import FakeSavedExportSchema, SavedBasicExport
 from couchexport.shortcuts import (export_data_shared, export_raw_data,
     export_response)
-from couchexport.tasks import rebuild_schemas
+from couchexport.tasks import rebuild_schemas, rebuild_export_task
 from couchexport.util import SerializableFunction
 from dimagi.utils.chunked import chunked
 from dimagi.utils.couch.bulk import wrapped_docs
@@ -54,7 +61,8 @@ from dimagi.utils.couch.database import iter_docs
 from dimagi.utils.couch.loosechange import parse_date
 from dimagi.utils.decorators.datespan import datespan_in_request
 from dimagi.utils.export import WorkBook
-from dimagi.utils.parsing import json_format_datetime, string_to_boolean
+from dimagi.utils.logging import notify_exception
+from dimagi.utils.parsing import json_format_datetime, string_to_boolean, string_to_datetime, json_format_date
 from dimagi.utils.web import json_request, json_response
 from soil import DownloadBase
 from soil.tasks import prepare_download
@@ -64,6 +72,7 @@ from casexml.apps.case.models import CommCareCase
 from casexml.apps.case.templatetags.case_tags import case_inline_display
 from casexml.apps.case.xml import V2
 from corehq.apps.export.exceptions import BadExportConfiguration
+from corehq.apps.hqwebapp.models import ReportsTab
 from corehq.apps.reports.exportfilters import default_form_filter
 import couchforms.views as couchforms_views
 from couchforms.filters import instances
@@ -73,12 +82,17 @@ from filters.users import UserTypeFilter
 from corehq.apps.domain.decorators import (login_or_digest)
 from corehq.apps.export.custom_export_helpers import CustomExportHelper
 from corehq.apps.groups.models import Group
-from corehq.apps.hqcase.export import export_cases_and_referrals
+from corehq.apps.hqcase.export import export_cases
 from corehq.apps.reports.dispatcher import ProjectReportDispatcher
-from corehq.apps.reports.models import ReportConfig, ReportNotification, FakeFormExportSchema, \
+from corehq.apps.reports.models import (
+    ReportConfig,
+    ReportNotification,
+    FakeFormExportSchema,
+    FormExportSchema,
     HQGroupExportConfiguration
+)
 from corehq.apps.reports.standard.cases.basic import CaseListReport
-from corehq.apps.reports.tasks import create_metadata_export
+from corehq.apps.reports.tasks import create_metadata_export, rebuild_export_async, send_delayed_report
 from corehq.apps.reports import util
 from corehq.apps.reports.util import (
     get_all_users_by_domain,
@@ -93,8 +107,7 @@ from corehq.apps.users.models import CommCareUser
 from corehq.apps.users.models import Permissions
 from corehq.apps.domain.decorators import login_and_domain_required
 
-
-DATE_FORMAT = "%Y-%m-%d"
+from casexml.apps.case.xform import extract_case_blocks
 
 datespan_default = datespan_in_request(
     from_param="startdate",
@@ -109,6 +122,18 @@ require_form_view_permission = require_permission(Permissions.view_report, 'core
 require_case_view_permission = require_permission(Permissions.view_report, 'corehq.apps.reports.standard.cases.basic.CaseListReport', login_decorator=None)
 
 require_can_view_all_reports = require_permission(Permissions.view_reports)
+
+
+def can_view_attachments(request):
+    return (
+        request.couch_user.has_permission(
+            request.domain, 'view_report',
+            data='corehq.apps.reports.standard.cases.basic.CaseListReport'
+        )
+        or toggles.ALLOW_CASE_ATTACHMENTS_VIEW.enabled(request.user.username)
+        or toggles.ALLOW_CASE_ATTACHMENTS_VIEW.enabled(request.domain)
+    )
+
 
 @login_and_domain_required
 def default(request, domain):
@@ -285,6 +310,9 @@ def _export_default_or_custom_data(request, domain, export_id=None, bulk_export=
             safe_only=safe_only
         )
 
+        if export_type == 'form':
+            filter &= SerializableFunction(instances)
+
         return export_helper.prepare_export(export_tags, filter)
 
     elif export_id:
@@ -364,6 +392,24 @@ def hq_download_saved_export(req, domain, export_id):
     # quasi-security hack: the first key of the index is always assumed
     # to be the domain
     assert domain == export.configuration.index[0]
+    cutoff = datetime.utcnow() - timedelta(days=settings.SAVED_EXPORT_ACCESS_CUTOFF)
+    if not export.last_accessed or export.last_accessed < cutoff:
+        group_id = req.GET.get('group_export_id')
+        if group_id:
+            try:
+                group_config = HQGroupExportConfiguration.get(group_id)
+                assert domain == group_config.domain
+                all_config_indices = [schema.index for schema in group_config.all_configs]
+                list_index = all_config_indices.index(export.configuration.index)
+                schema = next(itertools.islice(group_config.all_export_schemas,
+                                               list_index,
+                                               list_index+1))
+                rebuild_export_async.delay(export.configuration, schema, 'couch')
+            except Exception:
+                notify_exception(req, 'Failed to rebuild export during download')
+
+    export.last_accessed = datetime.utcnow()
+    export.save()
     return couchexport_views.download_saved_export(req, export_id)
 
 
@@ -373,11 +419,14 @@ def hq_download_saved_export(req, domain, export_id):
 def hq_update_saved_export(req, domain):
     group_id = req.POST['group_export_id']
     index = int(req.POST['index'])
-    group_config = HQGroupExportConfiguration.get(group_id)
-    assert domain == group_config.domain
+    group_config = get_document_or_404(HQGroupExportConfiguration, domain, group_id)
     config, schema = group_config.all_exports[index]
-    rebuild_export(config, schema, 'couch')
-    messages.success(req, _('The data for {} has been refreshed!').format(config.name))
+    rebuild_export_task.delay(group_id, index)
+    messages.success(
+        req,
+        _('Data update for {} has started and the saved export will be automatically updated soon. '
+          'Please refresh the page periodically to check the status.').format(config.name)
+    )
     return HttpResponseRedirect(reverse(DataInterfaceDispatcher.name(),
                                         args=[domain, req.POST['report_slug']]))
 
@@ -436,65 +485,80 @@ def touch_saved_reports_views(user, domain):
     ReportNotification.by_domain_and_owner(domain, user._id, limit=1, stale=False)
 
 
-@login_and_domain_required
-@require_POST
-def add_config(request, domain=None):
-    # todo: refactor this into a django form
-    from datetime import datetime
-    user_id = request.couch_user._id
+class AddSavedReportConfigView(View):
+    name = 'add_report_config'
 
-    POST = json.loads(request.raw_post_data)
-    if 'name' not in POST or not POST['name']:
-        return HttpResponseBadRequest()
+    @method_decorator(login_and_domain_required)
+    def post(self, request, domain, *args, **kwargs):
+        self.domain = domain
 
-    user_configs = ReportConfig.by_domain_and_owner(domain, user_id)
-    if not POST.get('_id') and POST['name'] in [c.name for c in user_configs]:
-        return HttpResponseBadRequest()
+        if not self.saved_report_config_form.is_valid():
+            return HttpResponseBadRequest()
 
-    to_date = lambda s: datetime.strptime(s, '%Y-%m-%d').date() if s else s
-    try:
-        POST['start_date'] = to_date(POST['start_date'])
-        POST['end_date'] = to_date(POST['end_date'])
-    except ValueError:
-        # invalidly formatted date input
-        return HttpResponseBadRequest()
+        update_config_data = copy(self.saved_report_config_form.cleaned_data)
+        del update_config_data['_id']
+        update_config_data.update({
+            'filters': self.filters,
+        })
+        for field in self.config.properties().keys():
+            if field in update_config_data:
+                setattr(self.config, field, update_config_data[field])
 
-    date_range = POST.get('date_range')
-    if date_range == 'last7':
-        POST['days'] = 7
-    elif date_range == 'last30':
-        POST['days'] = 30
-    elif POST.get('days'):
-        POST['days'] = int(POST['days'])
+        # remove start and end date if the date range is "last xx days"
+        if (
+            self.saved_report_config_form.cleaned_data['days']
+            or self.saved_report_config_form.cleaned_data['date_range'] == 'lastmonth'
+        ):
+            if "start_date" in self.config:
+                delattr(self.config, "start_date")
+            if "end_date" in self.config:
+                delattr(self.config, "end_date")
 
-    exclude_filters = ['startdate', 'enddate']
-    for field in exclude_filters:
-        POST['filters'].pop(field, None)
+        self.config.save()
+        ReportsTab.clear_dropdown_cache(request, self.domain)
+        touch_saved_reports_views(request.couch_user, self.domain)
 
-    config = ReportConfig.get_or_create(POST.get('_id', None))
+        return json_response(self.config)
 
-    if config.owner_id:
-        # in case a user maliciously tries to edit another user's config
-        assert config.owner_id == user_id
-    else:
-        config.domain = domain
-        config.owner_id = user_id
+    @property
+    @memoized
+    def config(self):
+        config = ReportConfig.get_or_create(
+            self.saved_report_config_form.cleaned_data['_id']
+        )
+        if config.owner_id:
+            # in case a user maliciously tries to edit another user's config
+            assert config.owner_id == self.user_id
+        else:
+            config.domain = self.domain
+            config.owner_id = self.user_id
+        return config
 
-    for field in config.properties().keys():
-        if field in POST:
-            setattr(config, field, POST[field])
+    @property
+    @memoized
+    def saved_report_config_form(self):
+        return SavedReportConfigForm(
+            self.domain,
+            self.user_id,
+            self.post_data
+        )
 
-    if POST.get('days') or date_range == 'lastmonth':  # remove start and end date if the date range is "last xx days"
-        if "start_date" in config:
-            delattr(config, "start_date")
-        if "end_date" in config:
-            delattr(config, "end_date")
+    @property
+    def filters(self):
+        filters = copy(self.post_data.get('filters', {}))
+        for field in ['startdate', 'enddate']:
+            if field in filters:
+                del filters[field]
+        return filters
 
-    config.save()
+    @property
+    def post_data(self):
+        return json.loads(self.request.body)
 
-    touch_saved_reports_views(request.couch_user, domain)
+    @property
+    def user_id(self):
+        return self.request.couch_user._id
 
-    return json_response(config)
 
 @login_and_domain_required
 @datespan_default
@@ -557,6 +621,7 @@ def delete_config(request, domain, config_id):
         raise Http404()
 
     config.delete()
+    ReportsTab.clear_dropdown_cache(request, domain)
 
     touch_saved_reports_views(request.couch_user, domain)
     return HttpResponse()
@@ -574,21 +639,21 @@ def normalize_hour(hour):
     return (hour, day_change)
 
 def calculate_hour(hour, hour_difference, minute_difference):
-    hour += hour_difference
-    if hour_difference < 0 and minute_difference != 0:
+    hour -= hour_difference
+    if hour_difference > 0 and minute_difference != 0:
         hour -= 1
     return normalize_hour(hour)
 
 
 def recalculate_hour(hour, hour_difference, minute_difference):
-    hour -= hour_difference
-    if hour_difference < 0 and minute_difference != 0:
+    hour += hour_difference
+    if hour_difference > 0 and minute_difference != 0:
         hour += 1
     return normalize_hour(hour)
 
 
 def get_timezone_difference(domain):
-    return datetime.now(pytz.timezone(Domain._get_by_name(domain)['default_timezone'])).strftime('%z')
+    return datetime.now(pytz.timezone(Domain.get_by_name(domain)['default_timezone'])).strftime('%z')
 
 
 def calculate_day(interval, day, day_change):
@@ -619,11 +684,17 @@ def edit_scheduled_report(request, domain, scheduled_report_id=None,
 
     user_id = request.couch_user._id
 
-    configs = ReportConfig.by_domain_and_owner(domain, user_id)
-    config_choices = [(c._id, c.full_name) for c in configs if c.report and c.report.emailable]
+    configs = [
+        c for c in ReportConfig.by_domain_and_owner(domain, user_id)
+        if c.report and c.report.emailable
+    ]
 
-    if not config_choices:
+    if not configs:
         return render(request, template, context)
+
+    display_privacy_disclaimer = any(c.is_configurable_report for c in configs)
+
+    config_choices = [(c._id, c.full_name) for c in configs]
 
     web_users = WebUser.view('users/web_users_by_domain', reduce=False,
                                key=domain, include_docs=True).all()
@@ -649,14 +720,18 @@ def edit_scheduled_report(request, domain, scheduled_report_id=None,
     initial['recipient_emails'] = ', '.join(initial['recipient_emails'])
 
     kwargs = {'initial': initial}
-    args = (request.POST,) if request.method == "POST" else ()
+    args = (
+        (display_privacy_disclaimer, request.POST)
+        if request.method == "POST"
+        else (display_privacy_disclaimer,)
+    )
     form = ScheduledReportForm(*args, **kwargs)
 
     form.fields['config_ids'].choices = config_choices
     form.fields['recipient_emails'].choices = web_user_emails
 
     form.fields['hour'].help_text = "This scheduled report's timezone is %s (%s GMT)"  % \
-                                    (Domain._get_by_name(domain)['default_timezone'],
+                                    (Domain.get_by_name(domain)['default_timezone'],
                                     get_timezone_difference(domain)[:3] + ':' + get_timezone_difference(domain)[3:])
 
 
@@ -671,6 +746,7 @@ def edit_scheduled_report(request, domain, scheduled_report_id=None,
             instance.day = calculate_day(instance.interval, instance.day, day_change)
 
         instance.save()
+        ReportsTab.clear_dropdown_cache(request, domain)
         if is_new:
             messages.success(request, "Scheduled report added!")
         else:
@@ -711,7 +787,6 @@ def delete_scheduled_report(request, domain, scheduled_report_id):
 
 @login_and_domain_required
 def send_test_scheduled_report(request, domain, scheduled_report_id):
-    from corehq.apps.reports.tasks import send_report
     from corehq.apps.users.models import CouchUser, CommCareUser, WebUser
 
     user_id = request.couch_user._id
@@ -723,7 +798,7 @@ def send_test_scheduled_report(request, domain, scheduled_report_id):
         user = CommCareUser.get_by_user_id(user_id, domain)
 
     try:
-        send_report.delay(notification._id)
+        send_delayed_report(notification)
     except Exception, e:
         import logging
         logging.exception(e)
@@ -802,7 +877,7 @@ def view_scheduled_report(request, domain, scheduled_report_id):
 @login_and_domain_required
 @require_GET
 def case_details(request, domain, case_id):
-    timezone = util.get_timezone(request.couch_user, domain)
+    timezone = get_timezone_for_user(request.couch_user, domain)
 
     try:
         case = get_document_or_404(CommCareCase, domain, case_id)
@@ -841,11 +916,51 @@ def case_details(request, domain, case_id):
         "case_display_options": {
             "display": request.project.get_case_display(case),
             "timezone": timezone,
-            "get_case_url": lambda case_id: reverse(case_details, args=[domain, case_id]),
+            "get_case_url": lambda case_id: absolute_reverse(case_details, args=[domain, case_id]),
             "show_transaction_export": toggles.STOCK_TRANSACTION_EXPORT.enabled(request.user.username),
         },
         "show_case_rebuild": toggles.CASE_REBUILD.enabled(request.user.username),
     })
+
+
+@require_case_view_permission
+@login_and_domain_required
+@require_GET
+def case_forms(request, domain, case_id):
+    case = get_document_or_404(CommCareCase, domain, case_id)
+    try:
+        start_range = int(request.GET['start_range'])
+        end_range = int(request.GET['end_range'])
+    except (KeyError, ValueError):
+        raise HttpResponseBadRequest()
+
+    def form_to_json(form):
+        return {
+            'id': form._id,
+            'received_on': json_format_datetime(form.received_on),
+            'user': {
+                "id": form.metadata.userID,
+                "username": form.metadata.username,
+            },
+            'readable_name': form.form.get('@name') or _('unknown'),
+        }
+
+    slice = list(reversed(case.xform_ids))[start_range:end_range]
+    return json_response([
+        form_to_json(XFormInstance.get(form_id)) for form_id in slice
+    ])
+
+
+@login_and_domain_required
+@require_GET
+def case_attachments(request, domain, case_id):
+    if not can_view_attachments(request):
+        return HttpResponseForbidden(_("You don't have permission to access this page."))
+
+    case = get_document_or_404(CommCareCase, domain, case_id)
+    return render(request, 'reports/reportdata/case_attachments.html',
+                  {'domain': domain, 'case': case})
+
 
 @require_case_view_permission
 @login_and_domain_required
@@ -863,6 +978,19 @@ def rebuild_case_view(request, domain, case_id):
     case = get_document_or_404(CommCareCase, domain, case_id)
     rebuild_case(case_id)
     messages.success(request, _(u'Case %s was rebuilt from its forms.' % case.name))
+    return HttpResponseRedirect(reverse('case_details', args=[domain, case_id]))
+
+
+@require_case_view_permission
+@require_permission(Permissions.edit_data)
+@require_POST
+def resave_case(request, domain, case_id):
+    case = get_document_or_404(CommCareCase, domain, case_id)
+    CommCareCase.get_db().save_doc(case._doc)  # don't just call save to avoid signals
+    messages.success(
+        request,
+        _(u'Case %s was successfully saved. Hopefully it will show up in all reports momentarily.' % case.name),
+    )
     return HttpResponseRedirect(reverse('case_details', args=[domain, case_id]))
 
 
@@ -986,7 +1114,7 @@ def generate_case_export_payload(domain, include_closed, format, group, user_fil
     fd, path = tempfile.mkstemp()
     with os.fdopen(fd, 'wb') as file:
         workbook = WorkBook(file, format)
-        export_cases_and_referrals(
+        export_cases(
             domain,
             stream_cases(case_ids),
             workbook,
@@ -1042,7 +1170,7 @@ def download_cases(request, domain):
 
 
 def _get_form_context(request, domain, instance_id):
-    timezone = util.get_timezone(request.couch_user, domain)
+    timezone = get_timezone_for_user(request.couch_user, domain)
     instance = _get_form_or_404(instance_id)
     try:
         assert domain == instance.domain
@@ -1126,6 +1254,7 @@ def download_attachment(request, domain, instance_id):
     assert(domain == instance.domain)
     return couchforms_views.download_attachment(request, instance_id, attachment)
 
+
 @require_form_view_permission
 @require_permission(Permissions.edit_data)
 @require_POST
@@ -1171,6 +1300,7 @@ def archive_form(request, domain, instance_id):
 
     return HttpResponseRedirect(redirect)
 
+
 @require_form_view_permission
 @require_permission(Permissions.edit_data)
 def unarchive_form(request, domain, instance_id):
@@ -1186,6 +1316,17 @@ def unarchive_form(request, domain, instance_id):
     if not redirect:
         redirect = reverse('render_form_data', args=[domain, instance_id])
     return HttpResponseRedirect(redirect)
+
+
+@require_form_view_permission
+@require_permission(Permissions.edit_data)
+@require_POST
+def resave_form(request, domain, instance_id):
+    instance = _get_form_or_404(instance_id)
+    assert instance.domain == domain
+    XFormInstance.get_db().save_doc(instance.to_json())
+    messages.success(request, _("Form was successfully resaved. It should reappear in reports shortly."))
+    return HttpResponseRedirect(reverse('render_form_data', args=[domain, instance_id]))
 
 
 # Weekly submissions by xmlns
@@ -1249,52 +1390,107 @@ def find_question_id(form, value):
     return None
 
 
-@toggles.MULTIMEDIA_EXPORT.required_decorator()
 @require_form_view_permission
 @login_and_domain_required
 @require_GET
-def form_multimedia_export(request, domain, app_id):
+def form_multimedia_export(request, domain):
     try:
         xmlns = request.GET["xmlns"]
         startdate = request.GET["startdate"]
         enddate = request.GET["enddate"]
+        enddate = json_format_date(string_to_datetime(enddate) + timedelta(days=1))
+        app_id = request.GET.get("app_id", None)
+        export_id = request.GET.get("export_id", None)
         zip_name = request.GET.get("name", None)
-    except KeyError:
+    except (KeyError, ValueError):
         return HttpResponseBadRequest()
 
-    def filename(form, question_id, extension):
-        return "%s-%s-%s-%s.%s" % (form['form']['@name'],
-                                   unidecode(question_id),
-                                   form['form']['meta']['username'],
-                                   form['_id'], extension)
+    def filename(form_info, question_id, extension):
+        fname = u"%s-%s-%s-%s%s"
+        if form_info['cases']:
+            fname = u'-'.join(form_info['cases']) + u'-' + fname
+        return fname % (form_info['name'],
+                        unidecode(question_id),
+                        form_info['user'],
+                        form_info['id'], extension)
+
+    case_ids = set()
+
+    def extract_form_info(form, properties=None, case_ids=case_ids):
+        unknown_number = 0
+        meta = form['form'].get('meta', dict())
+        # get case ids
+        case_blocks = extract_case_blocks(form)
+        cases = {c['@case_id'] for c in case_blocks}
+        case_ids |= cases
+
+        form_info = {
+            'form': form,
+            'attachments': list(),
+            'name': form['form'].get('@name', 'unknown form'),
+            'user': meta.get('username', 'unknown_user'),
+            'cases': cases,
+            'id': form['_id']
+        }
+        for k, v in form['_attachments'].iteritems():
+            if v['content_type'] == 'text/xml':
+                continue
+            try:
+                question_id = unicode(u'-'.join(find_question_id(form['form'], k)))
+            except TypeError:
+                question_id = unicode(u'unknown' + unicode(unknown_number))
+                unknown_number += 1
+
+            if not properties or question_id in properties:
+                extension = unicode(os.path.splitext(k)[1])
+                form_info['attachments'].append({
+                    'size': v['length'],
+                    'name': k,
+                    'question_id': question_id,
+                    'extension': extension,
+                    'timestamp': parse(form['received_on']).timetuple(),
+                })
+
+        return form_info
 
     key = [domain, app_id, xmlns]
-    stream_file = cStringIO.StringIO()
-    zf = zipfile.ZipFile(stream_file, mode='w', compression=zipfile.ZIP_STORED)
-    size = 22  # overhead for a zipfile
-    unknown_number = 0
     form_ids = {f['id'] for f in XFormInstance.get_db().view("attachments/attachments",
                                          start_key=key + [startdate],
                                          end_key=key + [enddate, {}],
                                          reduce=False)}
+
+    properties = set()
+    if export_id:
+        schema = FormExportSchema.get(export_id)
+        for table in schema.tables:
+            # - in question id is replaced by . in excel exports
+            properties |= {c.display.replace('.', '-') for c in table.columns}
+
+    if not app_id:
+        zip_name = 'Unrelated Form'
+    forms_info = list()
     for form in iter_docs(XFormInstance.get_db(), form_ids):
-        f = XFormInstance.wrap(form)
         if not zip_name:
-            zip_name = unidecode(form['form']['@name'])
-        for key in form['_attachments'].keys():
-            if form['_attachments'][key]['content_type'] == 'text/xml':
-                continue
-            extension = unicode(os.path.splitext(key)[1])
-            try:
-                question_id = unicode('-'.join(find_question_id(form['form'], key)))
-            except TypeError:
-                question_id = unicode('unknown' + str(unknown_number))
-                unknown_number += 1
-            fname = filename(form, question_id, extension)
-            zi = zipfile.ZipInfo(fname, parse(form['received_on']).timetuple())
-            zf.writestr(zi, f.fetch_attachment(key, stream=True).read())
-            # includes overhead for file in zipfile
-            size += f['_attachments'][key]['length'] + 88 + 2 * len(fname)
+            zip_name = unidecode(form['form'].get('@name', 'unknown form'))
+        forms_info.append(extract_form_info(form, properties))
+
+    # get case names
+    case_id_to_name = {c: c for c in case_ids}
+    for case in iter_docs(CommCareCase.get_db(), case_ids):
+        if case['name']:
+            case_id_to_name[case['_id']] = case['name']
+
+    stream_file = cStringIO.StringIO()
+    size = 22  # overhead for a zipfile
+    zf = zipfile.ZipFile(stream_file, mode='w', compression=zipfile.ZIP_STORED)
+    for form_info in forms_info:
+        f = XFormInstance.wrap(form_info['form'])
+        form_info['cases'] = {case_id_to_name[case_id] for case_id in form_info['cases']}
+        for a in form_info['attachments']:
+            fname = filename(form_info, a['question_id'], a['extension'])
+            zi = zipfile.ZipInfo(fname, a['timestamp'])
+            zf.writestr(zi, f.fetch_attachment(a['name'], stream=True).read())
+            size += a['size'] + 88 + 2 * len(fname)  # zip file overhead
 
     zf.close()
 

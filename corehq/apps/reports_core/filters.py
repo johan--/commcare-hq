@@ -1,9 +1,12 @@
 from collections import namedtuple
-from datetime import datetime
+from datetime import datetime, time
+from corehq.apps.userreports.expressions.getters import transform_from_datatype
 from corehq.apps.userreports.reports.filters import SHOW_ALL_CHOICE
+from corehq.util.dates import iso_string_to_date
 
 from dimagi.utils.dates import DateSpan
 from dimagi.utils.decorators.memoized import memoized
+from django.utils.translation import ugettext_lazy as _
 
 
 class FilterException(Exception):
@@ -91,7 +94,6 @@ class DatespanFilter(BaseFilter):
 
     def __init__(self, name, required=True, label='Datespan Filter',
                  css_id=None):
-        # todo: should these be in the constructor as well?
         self.label = label
         self.css_id = css_id or name
         params = [
@@ -117,8 +119,10 @@ class DatespanFilter(BaseFilter):
         date_range_inclusive = kwargs.get('date_range_inclusive', True)
 
         def date_or_nothing(param):
-            return datetime.strptime(param, "%Y-%m-%d") \
-                if param else None
+            if param:
+                return datetime.combine(iso_string_to_date(param), time())
+            else:
+                return None
         try:
             startdate = date_or_nothing(startdate)
             enddate = date_or_nothing(enddate)
@@ -136,6 +140,44 @@ class DatespanFilter(BaseFilter):
         return {
             'timezone': None
         }
+
+
+class NumericFilter(BaseFilter):
+    template = "reports_core/filters/numeric_filter.html"
+
+    def __init__(self, name, required=True, label=_('Numeric Filter'), css_id=None):
+        self.label = label
+        self.css_id = css_id or name
+        params = [
+            FilterParam(self.operator_param_name, True),
+            FilterParam(self.operand_param_name, True),
+        ]
+        super(NumericFilter, self).__init__(required=required, name=name, params=params)
+
+    @property
+    def operator_param_name(self):
+        return "{}-operator".format(self.css_id)
+
+    @property
+    def operand_param_name(self):
+        return "{}-operand".format(self.css_id)
+
+    @memoized
+    def value(self, **kwargs):
+        operator = kwargs[self.operator_param_name]
+        operand = kwargs[self.operand_param_name]
+        if operand == "":
+            return None
+        try:
+            assert operator in ["=", "!=", "<", "<=", ">", ">="]
+            assert isinstance(operand, float) or isinstance(operand, int)
+        except AssertionError as e:
+            raise FilterValueException('Error parsing numeric filter parameters: {}'.format(e.message))
+
+        return {"operator": operator, "operand": operand}
+
+    def default_value(self):
+        return None
 
 
 Choice = namedtuple('Choice', ['value', 'display'])
@@ -159,7 +201,12 @@ class ChoiceListFilter(BaseFilter):
         self.choices = choices or []
 
     def value(self, **kwargs):
-        choice = kwargs[self.name]
+        choice = unicode(kwargs[self.name])
+        choice_values = map(lambda c: c.value, self.choices)
+        if choice not in choice_values:
+            raise FilterValueException(_(u'Choice "{choice}" not found in choices: {choices}')
+                                       .format(choice=choice,
+                                               choices=choice_values))
         return next(choice_obj for choice_obj in self.choices if choice_obj.value == choice)
 
     def default_value(self):
@@ -175,7 +222,7 @@ class DynamicChoiceListFilter(BaseFilter):
     template = 'reports_core/filters/dynamic_choice_list_filter/dynamic_choice_list.html'
     javascript_template = 'reports_core/filters/dynamic_choice_list_filter/dynamic_choice_list.js'
 
-    def __init__(self, name, required, label, show_all, url_generator, css_id=None):
+    def __init__(self, name, field, required, datatype, label, show_all, url_generator, css_id=None):
         """
         url_generator should be a callable that takes a domain, report, and filter and returns a url.
         see userreports.reports.filters.dynamic_choice_list_url for an example.
@@ -184,6 +231,8 @@ class DynamicChoiceListFilter(BaseFilter):
             FilterParam(name, True),
         ]
         super(DynamicChoiceListFilter, self).__init__(required=required, name=name, params=params)
+        self.datatype = datatype
+        self.field = field
         self.label = label
         self.show_all = show_all
         self.css_id = css_id or self.name
@@ -192,7 +241,8 @@ class DynamicChoiceListFilter(BaseFilter):
     def value(self, **kwargs):
         choice = kwargs[self.name]
         if choice:
-            return Choice(choice, choice)
+            typed_choice = transform_from_datatype(self.datatype)(choice)
+            return Choice(typed_choice, choice)
         return Choice(SHOW_ALL_CHOICE, '')
 
     def default_value(self):

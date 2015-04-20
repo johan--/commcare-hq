@@ -6,8 +6,8 @@ from django.utils.translation import ugettext as _
 from jsonobject import DateTimeProperty
 
 from corehq.apps.locations.models import Location
-from corehq.apps.reports.cache import request_cache
 from corehq.apps.reports.filters.fixtures import AsyncLocationFilter
+from corehq.const import SERVER_DATETIME_FORMAT_NO_SEC
 from corehq.elastic import ES_URLS
 from corehq.apps.reports.standard import CustomProjectReport
 from corehq.apps.reports.standard import ProjectReport, ProjectReportParametersMixin, DatespanMixin
@@ -16,13 +16,14 @@ from corehq.apps.reports.dont_use.fields import StrongFilterUsersField
 from corehq.apps.reports.generic import ElasticProjectInspectionReport
 from corehq.apps.reports.standard.monitoring import MultiFormDrilldownMixin
 from corehq.elastic import es_query
+from corehq.util.dates import iso_string_to_datetime
 from custom.m4change.constants import REJECTION_REASON_DISPLAY_NAMES, MCCT_SERVICE_TYPES
 from custom.m4change.filters import ServiceTypeFilter
 from custom.m4change.models import McctStatus
 from custom.m4change.reports import get_location_hierarchy_by_id
 from custom.m4change.utils import get_case_by_id, get_property, get_form_ids_by_status
 from custom.m4change.constants import EMPTY_FIELD
-from corehq.apps.reports.tasks import export_all_rows_task
+from dimagi.utils.parsing import json_format_date
 
 
 def _get_date_range(range):
@@ -248,7 +249,7 @@ class McctProjectReview(BaseReport):
         for form in submissions:
             data = calculate_form_data(self, form)
             row = [
-                DateTimeProperty().wrap(form["form"]["meta"]["timeEnd"]).strftime("%Y-%m-%d"),
+                json_format_date(iso_string_to_datetime(form["form"]["meta"]["timeEnd"])),
                 self._get_case_name_html(data.get('case'), with_checkbox),
                 self._get_service_type_html(form, data.get('service_type'), with_checkbox),
                 data.get('location_name'),
@@ -277,14 +278,6 @@ class McctProjectReview(BaseReport):
         export_rows = self.get_all_rows
         table.extend(export_rows)
         return [[self.export_sheet_name, table]]
-
-    @property
-    @request_cache("export")
-    def export_response(self):
-        self.request.datespan = None
-        export_all_rows_task.delay(self.__class__, self.__getstate__())
-
-        return HttpResponse()
 
 
 class McctClientApprovalPage(McctProjectReview):
@@ -359,7 +352,7 @@ class McctRejectedClientPage(McctClientApprovalPage):
             except McctStatus.DoesNotExist:
                 reason = None
             row = [
-                DateTimeProperty().wrap(form["form"]["meta"]["timeEnd"]).strftime("%Y-%m-%d %H:%M"),
+                iso_string_to_datetime(form["form"]["meta"]["timeEnd"]).strftime(SERVER_DATETIME_FORMAT_NO_SEC),
                 self._get_case_name_html(data.get('case'), with_checkbox),
                 self._get_service_type_html(form, data.get('service_type'), with_checkbox),
                 data.get('location_name'),
@@ -447,7 +440,7 @@ class McctClientLogPage(McctProjectReview):
             except:
                 status, reason, status_date, username = ('eligible', None, None, None)
             row = [
-                status_date.strftime("%Y-%m-%d %H:%M") if status_date is not None else EMPTY_FIELD,
+                status_date.strftime(SERVER_DATETIME_FORMAT_NO_SEC) if status_date is not None else EMPTY_FIELD,
                 self._get_case_name_html(data.get('case'), with_checkbox),
                 self._get_service_type_html(form, data.get('service_type'), with_checkbox),
                 data.get('location_name'),

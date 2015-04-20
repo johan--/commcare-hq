@@ -1,6 +1,8 @@
 CommCare HQ
 ===========
 
+[![Join the chat at https://gitter.im/dimagi/commcare-hq](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/dimagi/commcare-hq?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+
 https://github.com/dimagi/commcare-hq
 
 [![Build Status](https://travis-ci.org/dimagi/commcare-hq.png)](https://travis-ci.org/dimagi/commcare-hq)
@@ -45,11 +47,11 @@ individual project sites when necessary.
 + Python 2.6 or 2.7 (use 32 bit if you're on Windows see `Alternate steps for Windows` section below)
 + pip
 + CouchDB >= 1.0 (1.2 recommended) ([installation instructions][couchdb])
+  - Mac users: note that when installing erlang, you do NOT need to check out an older version of erlang.rb
 + PostgreSQL >= 8.4 - (install from OS package manager or [here][postgres])
 + [elasticsearch][elasticsearch] (including Java 7).
   - The version we run is `Version: 0.90.5, JVM: 1.7.0_05`.
   - `brew install homebrew/versions/elasticsearch090` works well on mac
-+ memcached
 + redis >= 2.2.12 ([installation notes](https://gist.github.com/mwhite/c0381c5236855993572c))
 + [Jython][jython] 2.5.2 (optional, only needed for CloudCare)
 + For additional requirements necessary only if you want to modify the default
@@ -77,7 +79,7 @@ To set up CouchDB from the command line
 
 Create the database:
 
-    curl -X PUT "http://localhost:5984/commcarehq
+    curl -X PUT "http://localhost:5984/commcarehq"
 
 Add the required user:
 
@@ -88,6 +90,8 @@ Add the required user:
     createuser -U postgres commcarehq
     createdb -U postgres commcarehq
     createdb -U postgres commcarehq_reporting
+
+If these commands give you difficulty, particularly for Mac users running Postgres.app, verify that the default postgres role has been created. If not, `createuser -s -r postgres` will create it.
 
 
 ### Setting up a virtualenv
@@ -163,6 +167,7 @@ that you have a 32bit version of Python installed.
     # This will do some basic setup, create a superuser, and create a project.
     # The project-name, email, and password given here are specific to your
     # local development environment.
+    # Ignore warnings related to Raven.
     ./manage.py bootstrap <project-name> <email> <password>
 
     # To set up elasticsearch indexes, first run (and then kill once you see the
@@ -209,6 +214,10 @@ the following contents:
 + On Mac OS X, libevent may not be installed already, which the Python `gevent` library requires. The error message
   will be a clang error that file `event.h` is not found. To fix this using Homebrew, run `brew install libevent`.
 
++ On Mac OS X, if lxml fails to install, ensure that your command line tools are up to date by running `xcode-select --install`.
+
++ On Mac OS X, if Pillow complains that it can't find freetype, make sure freetype is installed with `brew install freetype`. Then create a symlink with: `ln -s /usr/local/include/freetype2 /usr/local/include/freetype`.
+
 + If you have an authentication error running `./manage.py syncdb` the first
   time, open `pg_hba.conf` (`/etc/postgresql/9.1/main/pg_hba.conf` on Ubuntu)
   and change the line "local all all peer" to "local all all md5".
@@ -237,7 +246,6 @@ If your installation didn't set up the helper processes required by CommCare HQ
 to automatically run on system startup, you need to run them manually:
 
     redis-server /path/to/redis.conf
-    memcached -d &
     /path/to/unzipped/elasticsearch/bin/elasticsearch &
     /path/to/couchdb/bin/couchdb &
 
@@ -265,9 +273,15 @@ If you want to use CloudCare you will also need to run the Touchforms server and
     # on Windows use CherryPy
     > manage.py runcpserver port=8000
 
-If you run a development server on a port other than 8000, you need to go into
-the Django Admin and change the Site object to reflect this, otherwise certain
-features like links in emails and CloudCare may behave incorrectly.
+Running Formdesigner in Development mode
+----------------------------------------
+By default, HQ uses vellum minified build files to render form-designer. To use files from Vellum directly, do following
+
+    # in localsettings
+    VELLUM_DEBUG = "dev"
+
+    # simlink your Vellum code to submodules/formdesigner
+    ln -s absolute/path/to/Vellum absolute/path/to/submodules/formdesigner/
 
 Building CommCare Mobile Apps
 -----------------------------

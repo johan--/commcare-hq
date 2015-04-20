@@ -13,7 +13,7 @@
             margin-bottom: 1em;
         }
 
-        .video-container iframe {
+        #video-container iframe {
             position: absolute;
             top: 0;
             left: 0;
@@ -50,6 +50,12 @@
                 $('#agree-button').attr('data-form', new_form);
             });
             $('#agree-button').click(function() {
+                $('#agree-button').unbind()
+                                  .addClass('disabled');
+                $('#download-new-project').removeAttr('data-toggle');
+                $('#download-new-project').removeAttr('href');
+                $('#import-into-button').removeAttr('data-toggle');
+                $('#import-into-button').removeAttr('href');
                 var form = $("#" + $(this).attr('data-form'));
                 form.submit();
             });
@@ -170,7 +176,7 @@
         {% endif %}
     </dd>
     <dt>{% trans 'License' %}</dt>
-    <dd>{{ project.get_license_display }}</dd>
+    <dd><a href="{{ project.get_license_url }}">{{ project.get_license_display }}</a> </dd>
     <dt>{% trans 'Downloads' %}</dt>
     <dd>
         <!-- This version: -->
@@ -206,6 +212,18 @@
             {{ project.copied_from.total_downloads }}
         {% endif %}
     </dd>
+
+    {% if request|toggle_enabled:"DOCUMENTATION_FILE" %}
+        {% if project.documentation_file_path %}
+            <dt>{% trans 'Project Documentation' %}</dt>
+            <dd>
+                <a href="{% url "appstore_project_documentation_file" project.get_id %}" 
+                    download="{{ project.documentation_file_path }}">
+                    {{ project.documentation_file_path }}
+                </a>
+            </dd>
+        {% endif %}
+    {% endif %}
     {% if project.multimedia_included and project.has_media %}
         <dd>
             <a class="btn" style="margin-top: .4em" href="{% url "media_files" project %}">{% trans "Browse Multimedia" %}</a>
@@ -249,7 +267,6 @@
                         <dt>{% trans 'Attribution notes' %}</dt>
                         <dd>{{ app.attribution_notes }}</dd>
                     {% endif %}
-{#                    <dd><a class="btn" style="margin: .4em 0" href="{% url "exchange_app_summary" project app.id %}">{% trans "Application Summary" %}</a></dd>#}
                 </dl>
             </div>
         {% endfor %}
@@ -282,6 +299,7 @@
         {% endif %}
     </div>
     <div>
+    {% if applications %}
         <form id="new-project-form" method="post" class="form-inline" action="{% url "domain_copy_snapshot" project %}">
             <fieldset>
                 <legend>{% trans "Download" %}</legend>
@@ -295,7 +313,7 @@
                         {% if error_message %}
                             <span class="help-inline">{{ error_message }}</span>
                         {% endif %}
-                        <a class="btn btn-primary"
+                        <a class="btn btn-primary disable-on-submit"
                            data-form="new-project-form"
                            data-toggle="modal"
                            data-target="#licenseAgreement"
@@ -335,7 +353,9 @@
                 <a class="btn btn-primary" id="import-into-button" data-form="import-form" data-toggle="modal" data-target="#licenseAgreement" href="#licenseAgreement">Import into</a>
             </div>
         </form>
-
+    {% else %}
+        <p>{% trans "No applications available." %}</p>
+    {% endif %}
     </div>
 
     <hr/>

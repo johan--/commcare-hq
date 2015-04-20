@@ -6,3 +6,6 @@ $(filter_id).on('apply', function(ev, picker) {
     $('#{{ filter.css_id }}-start').val(dates[0]);
     $('#{{ filter.css_id }}-end').val(dates[1]);
 });
+if(!$(filter_id).val()) {
+    $(filter_id).val("Show All Dates");
+}

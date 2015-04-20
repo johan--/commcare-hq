@@ -1,4 +1,7 @@
-from .models import XFormsSession, XFORMS_SESSION_SMS
+import uuid
+from corehq.apps.app_manager.suite_xml import SuiteGenerator
+from corehq.apps.app_manager.util import is_usercase_enabled, get_cloudcare_session_data
+from .models import XFORMS_SESSION_SMS, SQLXFormsSession
 from datetime import datetime
 from corehq.apps.cloudcare.touchforms_api import get_session_data
 from touchforms.formplayer.api import (
@@ -20,7 +23,9 @@ COMMCONNECT_DEVICE_ID = "commconnect"
 AUTH = DigestAuth(settings.TOUCHFORMS_API_USER, 
                   settings.TOUCHFORMS_API_PASSWORD)
 
-def start_session(domain, contact, app, module, form, case_id=None, yield_responses=False, session_type=XFORMS_SESSION_SMS, case_for_case_submission=False):
+
+def start_session(domain, contact, app, module, form, case_id=None, yield_responses=False,
+                  session_type=XFORMS_SESSION_SMS, case_for_case_submission=False):
     """
     Starts a session in touchforms and saves the record in the database.
     
@@ -42,8 +47,8 @@ def start_session(domain, contact, app, module, form, case_id=None, yield_respon
     if contact.doc_type == "CommCareCase":
         session_data["additional_filters"] = {
             "case_id": contact.get_id,
-            "footprint" : "True",
-            "include_children" : "True" if case_for_case_submission else "False",
+            "footprint": "True",
+            "include_children": "True" if case_for_case_submission else "False",
         }
     else:
         session_data["additional_filters"] = {
@@ -51,36 +56,47 @@ def start_session(domain, contact, app, module, form, case_id=None, yield_respon
             "footprint": "True"
         }
     
+    if app and form:
+        suite_gen = SuiteGenerator(app, is_usercase_enabled(domain))
+        session_data.update(get_cloudcare_session_data(suite_gen, domain, form, contact))
+
     language = contact.get_language_code()
     config = XFormsConfig(form_content=form.render_xform(),
                           language=language,
                           session_data=session_data,
                           auth=AUTH)
     
-    
     now = datetime.utcnow()
-    # just use the contact id as the connection id. may need to revisit this
+
+    # just use the contact id as the connection id
     connection_id = contact.get_id
+
     session_start_info = tfsms.start_session(config)
-    session = XFormsSession(connection_id=connection_id,
-                            session_id = session_start_info.session_id,
-                            start_time=now, modified_time=now, 
-                            form_xmlns=form.xmlns,
-                            completed=False, domain=domain,
-                            app_id=app.get_id, user_id=contact.get_id,
-                            session_type=session_type)
+    session = SQLXFormsSession(
+        couch_id=uuid.uuid4().hex,  # for legacy reasons we just generate a couch_id for now
+        connection_id=connection_id,
+        session_id=session_start_info.session_id,
+        start_time=now, modified_time=now,
+        form_xmlns=form.xmlns,
+        completed=False, domain=domain,
+        app_id=app.get_id, user_id=contact.get_id,
+        session_type=session_type,
+    )
     session.save()
     responses = session_start_info.first_responses
-    # Prevent future resource conflicts by getting the session again from the db
+
+    # Prevent future update conflicts by getting the session again from the db
     # since the session could have been updated separately in the first_responses call
-    session = XFormsSession.get(session._id)
+    session = SQLXFormsSession.objects.get(pk=session.pk)
     if yield_responses:
         return (session, responses)
     else:
         return (session, _responses_to_text(responses))
 
+
 def get_responses(msg):
     return _get_responses(msg.domain, msg.couch_recipient, msg.text)
+
 
 def _get_responses(domain, recipient, text, yield_responses=False, session_id=None, update_timestamp=True):
     """
@@ -93,10 +109,10 @@ def _get_responses(domain, recipient, text, yield_responses=False, session_id=No
     if session_id is not None:
         if update_timestamp:
             # The IVR workflow passes the session id
-            session = XFormsSession.by_session_id(session_id)
+            session = SQLXFormsSession.by_session_id(session_id)
     else:
         # The SMS workflow grabs the open sms session
-        session = XFormsSession.get_open_sms_session(domain, recipient)
+        session = SQLXFormsSession.get_open_sms_session(domain, recipient)
         if session is not None:
             session_id = session.session_id
 
@@ -111,21 +127,23 @@ def _get_responses(domain, recipient, text, yield_responses=False, session_id=No
         else:
             return _responses_to_text(tfsms.next_responses(session_id, text, auth=None))
 
+
 def _responses_to_text(responses):
     return [r.text_prompt for r in responses if r.text_prompt]
 
-"""
-Gets the raw instance of the session's form and submits it. This is used with
-sms and ivr surveys to save all questions answered so far in a session that 
-needs to close.
 
-If include_case_side_effects is False, no case create / update / close actions
-will be performed, but the form will still be submitted.
-
-The form is only submitted if the smsforms session has not yet completed.
-"""
 def submit_unfinished_form(session_id, include_case_side_effects=False):
-    session = XFormsSession.by_session_id(session_id)
+    """
+    Gets the raw instance of the session's form and submits it. This is used with
+    sms and ivr surveys to save all questions answered so far in a session that
+    needs to close.
+
+    If include_case_side_effects is False, no case create / update / close actions
+    will be performed, but the form will still be submitted.
+
+    The form is only submitted if the smsforms session has not yet completed.
+    """
+    session = SQLXFormsSession.by_session_id(session_id)
     if session is not None and session.end_time is None:
         # Get and clean the raw xml
         try:
@@ -169,5 +187,3 @@ def submit_unfinished_form(session_id, include_case_side_effects=False):
         xform.partial_submission = True
         xform.survey_incentive = session.survey_incentive
         xform.save()
-
-

@@ -17,7 +17,6 @@ var AdvancedCase = (function () {
 
         self.home = params.home;
         self.questions = params.questions;
-        self.edit = params.edit;
         self.save_url = params.save_url;
         self.caseType = params.caseType;
         self.module_id = params.module_id;
@@ -190,7 +189,6 @@ var AdvancedCase = (function () {
         var self = this;
 
         self.config = config;
-        self.edit = ko.observable(self.config.edit);
 
         self.getCaseTags = function (type, action) {
             var tags = [];
@@ -241,8 +239,8 @@ var AdvancedCase = (function () {
         };
 
         self.load_update_cases = ko.observableArray(_(params.actions.load_update_cases).map(function (a) {
-            var preload = propertyDictToArray([], a.preload, config);
-            var case_properties = propertyDictToArray([], a.case_properties, config);
+            var preload = CC_UTILS.propertyDictToArray([], a.preload, config, true);
+            var case_properties = CC_UTILS.propertyDictToArray([], a.case_properties, config);
             a.preload = [];
             a.case_properties = [];
             var action = LoadUpdateAction.wrap(a, config);
@@ -263,7 +261,7 @@ var AdvancedCase = (function () {
                 path: a.name_path,
                 required: true
             }];
-            var case_properties = propertyDictToArray(required_properties, a.case_properties, config);
+            var case_properties = CC_UTILS.propertyDictToArray(required_properties, a.case_properties, config);
             a.case_properties = [];
             var action = OpenCaseAction.wrap(a, config);
             // add these after to avoid errors caused by 'action.suggestedProperties' being accessed
@@ -346,7 +344,7 @@ var AdvancedCase = (function () {
                     details_module: null,
                     case_tag: tag_prefix + 'load_' + config.caseType + index,
                     parent_tag: '',
-                    parent_reference_id: '',
+                    parent_reference_id: 'parent',
                     preload: [],
                     case_properties: [],
                     close_condition: DEFAULT_CONDITION('never'),
@@ -379,7 +377,7 @@ var AdvancedCase = (function () {
                         }],
                     repeat_context: '',
                     parent_tag: '',
-                    parent_reference_id: '',
+                    parent_reference_id: 'parent',
                     open_condition: DEFAULT_CONDITION('always'),
                     close_condition: DEFAULT_CONDITION('never')
                 }, self.config));
@@ -434,6 +432,29 @@ var AdvancedCase = (function () {
                 return "Case Tag already in use";
             }
             return null;
+        },
+        validate_subcase: function (self) {
+            if (!self.config.caseConfigViewModel) {
+                return;
+            }
+            if (!self.parent_tag()) {
+                return null;
+            }
+            var parent = self.config.caseConfigViewModel.getActionFromTag(self.parent_tag());
+            if (!parent) {
+                return "Subcase parent reference is missing";
+            } else if (!self.parent_reference_id()) {
+                return "Parent reference ID required for subcases";
+            } else if (parent.actionType === 'open') {
+                if (!parent.repeat_context()) {
+                    return null;
+                } else if (!self.repeat_context() ||
+                    // manual string startsWith
+                    self.repeat_context().lastIndexOf(parent.repeat_context(), 0) === 0) {
+                    return "Subcase must be in same repeat context as parent.";
+                }
+            }
+                    return null;
         },
         close_case: function (self) {
             return {
@@ -708,6 +729,9 @@ var AdvancedCase = (function () {
                 self.auto_select_modes = ko.computed(function () {
                     return config.getAutoSelectModes(self);
                 });
+                self.validate_subcase = ko.computed(function () {
+                    return ActionBase.validate_subcase(self);
+                });
             };
 
             if (!self.config.caseConfigViewModel) {
@@ -728,8 +752,8 @@ var AdvancedCase = (function () {
             self.show_product_stock(self.disable_tag());
             var action = ko.mapping.toJS(self, LoadUpdateAction.mapping(self));
 
-            action.preload = propertyArrayToDict([], action.preload)[0];
-            action.case_properties = propertyArrayToDict([], action.case_properties)[0];
+            action.preload = CC_UTILS.propertyArrayToDict([], action.preload, true)[0];
+            action.case_properties = CC_UTILS.propertyArrayToDict([], action.case_properties)[0];
             return action;
         }
     };
@@ -847,23 +871,7 @@ var AdvancedCase = (function () {
                     return self.parent_tag() || self.config.caseConfigViewModel.getCaseTags('subcase', self).length > 0;
                 });
                 self.validate_subcase = ko.computed(function () {
-                    if (!self.parent_tag()) {
-                        return null;
-                    }
-
-                    var parent = self.config.caseConfigViewModel.getActionFromTag(self.parent_tag());
-                    if (!parent) {
-                        return "Subcase parent reference is missing";
-                    } else if (parent.actionType === 'open') {
-                        if (!parent.repeat_context()) {
-                            return null;
-                        } else if (!self.repeat_context() ||
-                            // manual string startsWith
-                            self.repeat_context().lastIndexOf(parent.repeat_context(), 0) === 0) {
-                            return "Subcase must be in same repeat context as parent.";
-                        }
-                    }
-                    return null;
+                    return ActionBase.validate_subcase(self);
                 });
             };
             // hacky way to prevent trying to access caseConfigViewModel before it is defined
@@ -885,7 +893,7 @@ var AdvancedCase = (function () {
             ActionBase.clean_condition(self.open_condition);
             ActionBase.clean_condition(self.close_condition);
             var action = ko.mapping.toJS(self, OpenCaseAction.mapping(self));
-            var x = propertyArrayToDict(['name'], action.case_properties);
+            var x = CC_UTILS.propertyArrayToDict(['name'], action.case_properties);
             action.case_properties = x[0];
             action.name_path = x[1].name;
             action.repeat_context = self.repeat_context();
@@ -1020,37 +1028,6 @@ var AdvancedCase = (function () {
 
             return self;
         }
-    };
-
-    var propertyDictToArray = function (required, property_dict, config) {
-        var property_array = _(property_dict).map(function (value, key) {
-            return {
-                path: value,
-                key: key,
-                required: false
-            };
-        });
-        property_array = _(property_array).sortBy(function (property) {
-            return config.questionScores[property.path] * 2 + (property.required ? 0 : 1);
-        });
-        return required.concat(property_array);
-    };
-
-    var propertyArrayToDict = function (required, property_array) {
-        var property_dict = {},
-            extra_dict = {};
-        _(property_array).each(function (case_property) {
-            var key = case_property.key;
-            var path = case_property.path;
-            if (key || path) {
-                if (_(required).contains(key) && case_property.required) {
-                    extra_dict[key] = path;
-                } else {
-                    property_dict[key] = path;
-                }
-            }
-        });
-        return [property_dict, extra_dict];
     };
 
     return {

@@ -10,20 +10,19 @@ from touchforms.formplayer.api import current_question
 from corehq.apps.smsforms.app import (
     _get_responses,
     _responses_to_text,
-    start_session,
 )
 from dateutil.parser import parse
-from corehq.apps.smsforms.models import XFormsSession
-import logging
+from corehq.apps.smsforms.models import SQLXFormsSession
+
 
 def form_session_handler(v, text, msg):
     """
     The form session handler will use the inbound text to answer the next question
-    in the open XformsSession for the associated contact. If no session is open,
+    in the open SQLXformsSession for the associated contact. If no session is open,
     the handler passes. If multiple sessions are open, they are all closed and an
     error message is displayed to the user.
     """
-    multiple, session = get_single_open_session(v.domain, v.owner_id)
+    multiple, session = get_single_open_session_or_close_multiple(v.domain, v.owner_id)
     if multiple:
         send_sms_to_verified_number(v, get_message(MSG_MULTIPLE_SESSIONS, v))
         return True
@@ -47,24 +46,28 @@ def form_session_handler(v, text, msg):
     else:
         return False
 
-def get_single_open_session(domain, contact_id):
+
+def get_single_open_session_or_close_multiple(domain, contact_id):
     """
-      Retrieves the current open XFormsSession for the given contact.
-      If multiple sessions are open, it closes all of them and returns
+    Retrieves the current open SQLXFormsSession for the given contact.
+    If multiple sessions are open, it closes all of them and returns
     None for the session.
-      The return value is a tuple of (multiple, session), where multiple
+
+    The return value is a tuple of (multiple, session), where multiple
     is True if there were multiple sessions, and session is the session if
     there was a single open session available.
     """
-    sessions = XFormsSession.get_all_open_sms_sessions(domain, contact_id)
-    if len(sessions) > 1:
+    sessions = SQLXFormsSession.get_all_open_sms_sessions(domain, contact_id)
+    count = sessions.count()
+    if count > 1:
         for session in sessions:
             session.end(False)
             session.save()
         return (True, None)
 
-    session = sessions[0] if len(sessions) == 1 else None
+    session = sessions[0] if count == 1 else None
     return (False, session)
+
 
 def answer_next_question(v, text, msg, session):
     resp = current_question(session.session_id)
@@ -95,6 +98,7 @@ def answer_next_question(v, text, msg, session):
         response_text = "%s %s" % (error_msg, event.text_prompt)
         send_sms_to_verified_number(v, response_text, 
             metadata=outbound_metadata)
+
 
 def validate_answer(event, text, v):
     text = text.strip()
@@ -196,11 +200,13 @@ def validate_answer(event, text, v):
 
     return (valid, text, error_msg)
 
+
 def format_choices(choices_list):
     choices = {}
     for idx, choice in enumerate(choices_list):
         choices[choice.strip().upper()] = idx + 1
     return choices
+
 
 def has_invalid_response(responses):
     for r in responses:
@@ -208,7 +214,7 @@ def has_invalid_response(responses):
             return True
     return False
 
+
 def mark_as_invalid_response(msg):
     msg.invalid_survey_response = True
     msg.save()
-

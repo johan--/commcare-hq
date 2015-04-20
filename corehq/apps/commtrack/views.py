@@ -1,23 +1,26 @@
-from django.http import HttpResponse, HttpResponseRedirect, Http404, HttpResponseNotFound
+import json
+import copy
+
+from django.contrib import messages
+from django.core.urlresolvers import reverse
+from django.http import HttpResponseRedirect, Http404
 from django.utils.decorators import method_decorator
 from django.utils.translation import ugettext as _, ugettext_noop
-from corehq.apps.commtrack.util import all_sms_codes
+
+from dimagi.utils.decorators.memoized import memoized
+from dimagi.utils.web import json_response
+
 from corehq.apps.domain.decorators import (
     domain_admin_required,
     login_and_domain_required,
 )
-from corehq.apps.domain.models import Domain
-from corehq.apps.commtrack.forms import ConsumptionForm
 from corehq.apps.domain.views import BaseDomainView
-from corehq.apps.locations.models import Location
-from dimagi.utils.decorators.memoized import memoized
-from django.core.urlresolvers import reverse
-from django.contrib import messages
-from corehq.apps.commtrack.tasks import recalculate_domain_consumption_task
-import json
-from couchdbkit import ResourceNotFound
-import itertools
-import copy
+from corehq.apps.locations.models import SQLLocation, LocationType
+
+from .forms import ConsumptionForm, StockLevelsForm, CommTrackSettingsForm
+from .models import CommtrackActionConfig, StockRestoreConfig
+from .tasks import recalculate_domain_consumption_task
+from .util import all_sms_codes
 
 
 @domain_admin_required
@@ -60,7 +63,6 @@ class CommTrackSettingsView(BaseCommTrackManageView):
     @property
     @memoized
     def commtrack_settings_form(self):
-        from corehq.apps.commtrack.forms import CommTrackSettingsForm
         initial = self.commtrack_settings.to_json()
         initial.update(dict(('consumption_' + k, v) for k, v in
             self.commtrack_settings.consumption_config.to_json().items()))
@@ -81,7 +83,6 @@ class CommTrackSettingsView(BaseCommTrackManageView):
         be done differently.
         """
 
-        from corehq.apps.commtrack.models import StockRestoreConfig
         if self.commtrack_settings.sync_consumption_fixtures:
             self.domain_object.commtrack_settings.ota_restore_config = StockRestoreConfig(
                 section_to_consumption_types={
@@ -100,7 +101,6 @@ class CommTrackSettingsView(BaseCommTrackManageView):
             data = self.commtrack_settings_form.cleaned_data
             previous_config = copy.copy(self.commtrack_settings)
             self.commtrack_settings.use_auto_consumption = bool(data.get('use_auto_consumption'))
-            self.commtrack_settings.sync_location_fixtures = bool(data.get('sync_location_fixtures'))
             self.commtrack_settings.sync_consumption_fixtures = bool(data.get('sync_consumption_fixtures'))
             self.commtrack_settings.individual_consumption_defaults = bool(data.get('individual_consumption_defaults'))
 
@@ -120,6 +120,9 @@ class CommTrackSettingsView(BaseCommTrackManageView):
 
             self.commtrack_settings.save()
 
+            for loc_type in LocationType.objects.filter(domain=self.domain).all():
+                # This will update stock levels based on commtrack config
+                loc_type.save()
 
             if (previous_config.use_auto_consumption != self.commtrack_settings.use_auto_consumption
                 or previous_config.consumption_config.to_json() != self.commtrack_settings.consumption_config.to_json()
@@ -165,42 +168,26 @@ class DefaultConsumptionView(BaseCommTrackManageView):
 @login_and_domain_required
 def api_query_supply_point(request, domain):
     id = request.GET.get('id')
-    query = request.GET.get('name', '')
-    
+    query = request.GET.get('name', '').lower()
+
     def loc_to_payload(loc):
-        return {'id': loc._id, 'name': loc.name}
+        return {'id': loc.location_id, 'name': loc.display_name}
 
     if id:
         try:
-            loc = Location.get(id)
-            return HttpResponse(json.dumps(loc_to_payload(loc)), 'text/json')
-
-        except ResourceNotFound:
-            return HttpResponseNotFound(json.dumps({'message': 'no location with id %s found' % id}, 'text/json'))
-
+            loc = SQLLocation.objects.get(location_id=id)
+        except SQLLocation.DoesNotExist:
+            return json_response(
+                {'message': 'no location with id %s found' % id},
+                status_code=404,
+            )
+        else:
+            return json_response(loc_to_payload(loc))
     else:
-        LIMIT = 100
-        loc_types = [loc_type.name for loc_type in Domain.get_by_name(domain).commtrack_settings.location_types if not loc_type.administrative]
-
-        def get_locs(type):
-            # TODO use ES instead?
-            q = query.lower()
-            startkey = [domain, type, q]
-            endkey = [domain, type, q + 'zzzzzz']
-            return [loc for loc in Location.view(
-                'locations/by_name',
-                startkey=startkey,
-                endkey=endkey,
-                limit=LIMIT,
-                reduce=False,
-                include_docs=True,
-            ) if not loc.is_archived]
-
-        locs = sorted(
-            itertools.chain(*(get_locs(loc_type) for loc_type in loc_types)),
-            key=lambda e: e.name
-        )[:LIMIT]
-        return HttpResponse(json.dumps(map(loc_to_payload, locs)), 'text/json')
+        locs = SQLLocation.objects.filter(domain=domain)
+        if query:
+            locs = locs.filter(name__icontains=query)
+        return json_response(map(loc_to_payload, locs[:10]))
 
 
 class SMSSettingsView(BaseCommTrackManageView):
@@ -241,8 +228,6 @@ class SMSSettingsView(BaseCommTrackManageView):
                 yield (k, (v[0], v[1].name))
 
     def post(self, request, *args, **kwargs):
-        from corehq.apps.commtrack.models import CommtrackActionConfig
-
         payload = json.loads(request.POST.get('json'))
 
         self.domain_object.commtrack_settings.multiaction_keyword = payload['keyword']
@@ -263,4 +248,64 @@ class SMSSettingsView(BaseCommTrackManageView):
 
         self.domain_object.commtrack_settings.save()
 
+        return self.get(request, *args, **kwargs)
+
+
+class StockLevelsView(BaseCommTrackManageView):
+    urlname = 'stock_levels'
+    page_title = ugettext_noop("Stock Levels")
+    template_name = 'commtrack/manage/stock_levels.html'
+
+    def get_existing_stock_levels(self):
+        loc_types = LocationType.objects.by_domain(self.domain)
+        return [{
+            'loc_type': loc_type.name,
+            'emergency_level': loc_type.emergency_level,
+            'understock_threshold': loc_type.understock_threshold,
+            'overstock_threshold': loc_type.overstock_threshold,
+        } for loc_type in loc_types]
+
+    def save_stock_levels(self, levels):
+        """
+        Accepts a list of dicts of the form returned by
+        get_existing_stock_levels and writes to the appropriate LocationType
+        """
+        levels = {level['loc_type']: level for level in levels}
+        for loc_type in LocationType.objects.filter(domain=self.domain).all():
+            if loc_type.name not in levels:
+                continue
+
+            stock_levels = levels[loc_type.name]
+            changed = False
+            for threshold in [
+                'emergency_level',
+                'understock_threshold',
+                'overstock_threshold'
+            ]:
+                if getattr(loc_type, threshold) != stock_levels[threshold]:
+                    setattr(loc_type, threshold, stock_levels[threshold])
+                    changed = True
+            if changed:
+                loc_type.save()
+
+    @property
+    def page_context(self):
+        return {
+            'stock_levels_form': self.stock_levels_form
+        }
+
+    @property
+    @memoized
+    def stock_levels_form(self):
+        if self.request.method == "POST":
+            data = self.request.POST
+        else:
+            data = self.get_existing_stock_levels()
+        return StockLevelsForm(data)
+
+    def post(self, request, *args, **kwargs):
+        if self.stock_levels_form.is_valid():
+            self.save_stock_levels(self.stock_levels_form.cleaned_data)
+            return HttpResponseRedirect(self.page_url)
+        # TODO display error messages to the user...
         return self.get(request, *args, **kwargs)

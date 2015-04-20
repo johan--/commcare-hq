@@ -1,24 +1,29 @@
 from functools import partial
+from django.conf import settings
 
 from django.template.loader import render_to_string
 from django.core.urlresolvers import reverse
 from django import template
 import pytz
-from django.utils.html import escape, escapejs
+from django.utils.html import escape
 from django.utils.translation import ugettext as _
 from couchdbkit.exceptions import ResourceNotFound
+from corehq import privileges
+from corehq.apps.hqwebapp.templatetags.hq_shared_tags import toggle_enabled
 
 from corehq.apps.receiverwrapper.auth import AuthContext
 from corehq.apps.hqwebapp.doc_info import get_doc_info_by_id, DocInfo
 from corehq.apps.reports.formdetails.readable import get_readable_data_for_submission
+from corehq import toggles
+from corehq.util.timezones.conversions import ServerTime
 from couchforms.models import XFormInstance
-from dimagi.utils.timezones import utils as tz_utils
 from casexml.apps.case.xform import extract_case_blocks
 from casexml.apps.case import const
 from casexml.apps.case.models import CommCareCase
 from casexml.apps.case.templatetags.case_tags import case_inline_display
 from corehq.apps.hqwebapp.templatetags.proptable_tags import (
     get_tables_as_columns, get_definition)
+from django_prbac.utils import has_privilege
 
 
 register = template.Library()
@@ -36,9 +41,7 @@ def form_inline_display(form_id, timezone=pytz.utc):
         try:
             form = XFormInstance.get(form_id)
             if form:
-                return "%s: %s" % (tz_utils.adjust_datetime_to_timezone\
-                                   (form.received_on, pytz.utc.zone, timezone.zone).date(), 
-                                   form.xmlns)
+                return "%s: %s" % (ServerTime(form.received_on).user_time(timezone).done().date(), form.xmlns)
         except ResourceNotFound:
             pass
         return "%s: %s" % (_("missing form"), form_id)
@@ -155,10 +158,25 @@ def render_form(form, domain, options):
     if len(case_blocks) == 1 and case_blocks[0].get(case_id_attr):
         edit_session_data["case_id"] = case_blocks[0].get(case_id_attr)
 
+    request = options.get('request', None)
+    user_can_edit = (
+        request and user and request.domain
+        and (user.can_edit_data() or user.is_commcare_user())
+    )
+    show_edit_submission = (
+        user_can_edit
+        and has_privilege(request, privileges.CLOUDCARE)
+        and toggle_enabled(request, toggles.EDIT_SUBMISSIONS)
+    )
+    # stuffing this in the same flag as case rebuild
+    show_resave = (
+        user_can_edit and toggle_enabled(request, toggles.CASE_REBUILD)
+    )
     return render_to_string("reports/form/partials/single_form.html", {
         "context_case_id": case_id,
         "instance": form,
         "form_meta": options.get('form_meta', {}),
+        "maps_api_key": settings.GMAPS_API_KEY,
         "is_archived": form.doc_type == "XFormArchived",
         "domain": domain,
         'question_list_not_found': question_list_not_found,
@@ -175,5 +193,6 @@ def render_form(form, domain, options):
         "side_pane": side_pane,
         "user": user,
         "edit_session_data": edit_session_data,
-        "request": options.get('request', None),  # needed for toggles
+        "show_edit_submission": show_edit_submission,
+        "show_resave": show_resave,
     })

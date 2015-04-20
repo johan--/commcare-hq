@@ -1,0 +1,119 @@
+{% extends "userreports/base_report_builder.html" %}
+{% load i18n %}
+{% load hq_shared_tags %}
+
+{% block head %}{{ block.super }}
+    {# needed for the sortable knockout of binding #}
+    {% include "imports/hq-oldstyle-js.html" %}
+    {# needed for the knockout typeahead binding #}
+    <link rel="stylesheet" href="{% static 'hqwebapp/js/lib/jquery-ui/jquery-ui-redmond-1.8.16.css' %}"/>
+    <style>
+        {% comment %}
+            This style gets applied to elements in this template:
+                apps/userreports/templates/userreports/partials/report_filter_configuration.html
+            This might not be imediately obvious because that snippet is injected into the page
+            through crispy forms.
+        {% endcomment %}
+        .table tbody + tbody.add-prop,
+        tbody.add-prop td
+        {
+            border-top-width: 0px;
+        }
+    </style>
+{% endblock %}
+
+{% block js %}{{ block.super }}
+    {# needed for the sortable and typeahead knockout of binding #}
+    <script src="{% static 'style/ko/knockout_bindings.ko.js' %}"></script>
+{% endblock %}
+
+{% block js-inline %}{{ block.super }}
+    <script type="text/javascript">
+        /**
+         * Knockout view model representing a row in the filter property list
+         * @constructor
+         */
+        var PropertyListItem = function() {
+            var that = this;
+            this.property = ko.observable("");
+            this.displayText = ko.observable("");
+            this.format = ko.observable("");
+
+            /**
+             * Return a "plain" javascript object representing this view model
+             * suitable for sending to the server.
+             */
+            this.toJS = function(){
+                return {
+                    property: this.property(),
+                    display_text: this.displayText(),
+                    format: this.format()
+                };
+            };
+            this.isValid= ko.computed(function(){
+                return that.property() != "";
+            });
+        };
+        PropertyListItem.wrap = function(o){
+            var i = new PropertyListItem();
+            i.property(o.property);
+            i.displayText(o.display_text);
+            i.format(o.format);
+            return i;
+        };
+
+        /**
+         * Knockout view model controlling the filter property list.
+         */
+        var propertyList = function(options) {
+            var that = this;
+            options = options || {};
+            this.buttonText = options.buttonText !== undefined ? options.buttonText : "Add property";
+            this.hasFormatCol = ko.observable(options.hasFormatCol !== undefined ? options.hasFormatCol : true);
+            this.formatOptions = ko.observableArray(["Choice", "Date", "Numeric"]);
+            this.propertyOptions = ko.observableArray({{ property_options|JSON }});
+            this.columns = ko.observableArray(options.initialCols !== undefined ? options.initialCols : []);
+            this.serializedProperties = ko.computed(function(){
+                return JSON.stringify(
+                    _.map(that.columns(), function(c){return c.toJS()})
+                );
+            });
+            this.showWarnings = ko.observable(false);
+            this.validate = function(){
+                that.showWarnings(true);
+                return !_.contains(_.map(that.columns(), function(c){return c.isValid()}), false);
+            };
+        };
+
+        var configForm = function(){
+            var that = this;
+            var initialFilters = _.map({{ initial_filters|JSON }}, function(i){
+                return PropertyListItem.wrap(i);
+            });
+            var initialColumns = _.map({{ initial_columns|JSON }}, function(i){
+                return PropertyListItem.wrap(i);
+            });
+            this.filtersList = new propertyList({
+                hasFormatCol: true,
+                initialCols: initialFilters,
+                buttonText: 'Add Filter'
+            });
+            this.columnsList = new propertyList({
+                hasFormatCol: false,
+                initialCols: initialColumns,
+                buttonText: 'Add Column'
+            });
+            this.submitHandler = function(){
+                var isValid = true;
+                isValid = that.filtersList.validate() && isValid;
+                isValid = that.columnsList.validate() && isValid;
+                if (!isValid){
+                    alert('Invalid report configuration. Please fix the issues and try again.');
+                }
+                return isValid;
+            }
+        };
+        var formViewModel = new configForm();
+        ko.applyBindings(formViewModel, $("#report-config-form").get(0));
+    </script>
+{% endblock %}

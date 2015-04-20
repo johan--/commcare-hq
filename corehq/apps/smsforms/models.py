@@ -1,47 +1,49 @@
 from datetime import datetime
-from couchdbkit.ext.django.schema import StringProperty, Document,\
-    DateTimeProperty, BooleanProperty, IntegerProperty
-from dimagi.utils.couch.database import is_bigcouch, bigcouch_quorum_count
+from couchdbkit import MultipleResultsFound
+from django.db import models
+from django.db.models import Q
+
 
 XFORMS_SESSION_SMS = "SMS"
 XFORMS_SESSION_IVR = "IVR"
 XFORMS_SESSION_TYPES = [XFORMS_SESSION_SMS, XFORMS_SESSION_IVR]
 
-class XFormsSession(Document):
+
+class SQLXFormsSession(models.Model):
     """
-    Keeps information about an SMS XForm session. 
+    Keeps information about an SMS XForm session.
     """
     # generic properties
-    connection_id = StringProperty()
-    session_id = StringProperty()
-    form_xmlns = StringProperty()
-    start_time = DateTimeProperty()
-    modified_time = DateTimeProperty()
-    end_time = DateTimeProperty()
-    completed = BooleanProperty()
-    
+    couch_id = models.CharField(db_index=True, max_length=50)
+    connection_id = models.CharField(null=True, blank=True, db_index=True, max_length=50)
+    session_id = models.CharField(null=True, blank=True, db_index=True, max_length=50)
+    form_xmlns = models.CharField(null=True, blank=True, max_length=100)
+    start_time = models.DateTimeField()
+    modified_time = models.DateTimeField()
+    end_time = models.DateTimeField(null=True)
+    completed = models.BooleanField(default=False)
+
     # HQ specific properties
-    domain = StringProperty()
-    user_id = StringProperty()
-    app_id = StringProperty()
-    submission_id = StringProperty()
-    survey_incentive = StringProperty()
-    session_type = StringProperty(choices=XFORMS_SESSION_TYPES, default=XFORMS_SESSION_SMS)
-    workflow = StringProperty() # One of the corehq.apps.sms.models.WORKFLOW_* constants describing what kind of workflow this session was a part of
-    reminder_id = StringProperty() # Points to the _id of an instance of corehq.apps.reminders.models.CaseReminder that this session is tied to
-    
-    def save(self, *args, **kwargs):
-        if is_bigcouch() and "w" not in kwargs:
-            # Force a write to all nodes before returning
-            kwargs["w"] = bigcouch_quorum_count()
-        return super(XFormsSession, self).save(*args, **kwargs)
-    
+    domain = models.CharField(null=True, blank=True, db_index=True, max_length=100)
+    user_id = models.CharField(null=True, blank=True, max_length=50)
+    app_id = models.CharField(null=True, blank=True, max_length=50)
+    submission_id = models.CharField(null=True, blank=True, max_length=50)
+    survey_incentive = models.CharField(null=True, blank=True, max_length=100)
+    session_type = models.CharField(max_length=10, choices=zip(XFORMS_SESSION_TYPES, XFORMS_SESSION_TYPES),
+                                    default=XFORMS_SESSION_SMS)
+    workflow = models.CharField(null=True, blank=True, max_length=20)
+    reminder_id = models.CharField(null=True, blank=True, max_length=50)
+
     def __unicode__(self):
         return 'Form %(form)s in domain %(domain)s. Last modified: %(mod)s' % \
-            {"form": self.form_xmlns, 
-             "domain": self.domain, 
+            {"form": self.form_xmlns,
+             "domain": self.domain,
              "mod": self.modified_time}
-    
+
+    @property
+    def _id(self):
+        return self.couch_id
+
     def end(self, completed):
         """
         Marks this as ended (by setting end time).
@@ -58,10 +60,12 @@ class XFormsSession(Document):
 
     @classmethod
     def get_all_open_sms_sessions(cls, domain, contact_id):
-        sessions = cls.view("smsforms/open_sms_sessions_by_connection",
-                            key=[domain, contact_id],
-                            include_docs=True).all()
-        return sessions
+        return cls.objects.filter(
+            Q(session_type__isnull=True) | Q(session_type=XFORMS_SESSION_SMS),
+            domain=domain,
+            connection_id=contact_id,
+            end_time__isnull=True,
+        )
 
     @classmethod
     def close_all_open_sms_sessions(cls, domain, contact_id):
@@ -72,8 +76,10 @@ class XFormsSession(Document):
 
     @classmethod
     def by_session_id(cls, id):
-        return XFormsSession.view("smsforms/sessions_by_touchforms_id",
-                                  key=id, include_docs=True).one()
+        try:
+            return cls.objects.get(session_id=id)
+        except SQLXFormsSession.DoesNotExist:
+            return None
 
     @classmethod
     def get_open_sms_session(cls, domain, contact_id):
@@ -82,9 +88,18 @@ class XFormsSession(Document):
         Only one session is expected to be open at a time.
         Raises MultipleResultsFound if more than one session is open.
         """
-        session = cls.view("smsforms/open_sms_sessions_by_connection",
-                           key=[domain, contact_id],
-                           include_docs=True).one()
-        return session
+        objs = cls.get_all_open_sms_sessions(domain, contact_id).all()
+        if len(objs) > 1:
+            raise MultipleResultsFound('more than 1 ({}) session found for domain {} and contact {}'.format(
+                len(objs), domain, contact_id
+            ))
+        elif len(objs) == 0:
+            return None
+        return objs[0]
+
+
+def get_session_by_session_id(id):
+    return SQLXFormsSession.by_session_id(id)
+
 
 from . import signals

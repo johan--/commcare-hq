@@ -1,7 +1,8 @@
-from casexml.apps.case.xml import V1, V2, check_version, V2_NAMESPACE
+from casexml.apps.case.xml import V1, V2, V3, check_version, V2_NAMESPACE
 from xml.etree import ElementTree
 import logging
-from dimagi.utils.parsing import json_format_datetime
+from dimagi.utils.parsing import json_format_datetime, json_format_date
+
 
 def safe_element(tag, text=None):
     # shortcut for commonly used functionality
@@ -13,9 +14,9 @@ def safe_element(tag, text=None):
     else:
         return ElementTree.Element(tag)
 
+
 def date_to_xml_string(date):
-    if date: return date.strftime("%Y-%m-%d")
-    return ""
+    return json_format_date(date) if date else ''
 
 
 def get_dynamic_element(key, val):
@@ -58,25 +59,6 @@ class CaseXMLGeneratorBase(object):
     def get_close_element(self):
         return safe_element("close")
 
-    def get_referral_element(self, referral):
-        elem = safe_element("referral")
-        elem.append(safe_element("referral_id", referral.referral_id))
-        elem.append(safe_element("followup_date", date_to_xml_string(referral.followup_on)))
-
-        # TODO: support referrals not always opening, this will
-        # break with sync
-        open_block = safe_element("open")
-        open_block.append(safe_element("referral_types", referral.type))
-        elem.append(open_block)
-
-        if referral.closed:
-            update = safe_element("update")
-            update.append(safe_element("referral_type", referral.type))
-            update.append(safe_element("date_closed", date_to_xml_string(referral.closed_on)))
-            elem.append(update)
-
-        return elem
-
     def get_index_element(self, index):
         elem = safe_element(index.identifier, index.referenced_id)
         elem.attrib = {"case_type": index.referenced_type}
@@ -101,9 +83,6 @@ class CaseXMLGeneratorBase(object):
     def add_custom_properties(self, element):
         for k, v, in self.case.dynamic_case_properties():
             element.append(get_dynamic_element(k, v))
-
-    def add_referrals(self, element):
-        self._ni()
 
     def add_indices(self, element):
         self._ni()
@@ -133,10 +112,6 @@ class V1CaseXMLGenerator(CaseXMLGeneratorBase):
         if self.case.owner_id:
             element.append(safe_element('owner_id', self.case.owner_id))
         super(V1CaseXMLGenerator, self).add_custom_properties(element)
-
-    def add_referrals(self, element):
-        for ref in self.case.referrals:
-            element.append(self.get_referral_element(ref))
 
     def add_indices(self, element):
         # intentionally a no-op
@@ -173,12 +148,6 @@ class V2CaseXMLGenerator(CaseXMLGeneratorBase):
             element.append(safe_element('external_id', self.case.external_id))
         super(V2CaseXMLGenerator, self).add_custom_properties(element)
 
-    def add_referrals(self, element):
-        # intentionally a no-op
-        if self.case.referrals:
-            logging.info("Tried to add referrals to version 2 CaseXML restore. This is not supported. "
-                         "The case id is %s, domain %s." % (self.case.get_id, self.case.domain))
-
     def add_indices(self, element):
         if self.case.indices:
             indices = []
@@ -210,5 +179,6 @@ def get_generator(version, case):
 
 GENERATOR_MAP = {
     V1: V1CaseXMLGenerator,
-    V2: V2CaseXMLGenerator
+    V2: V2CaseXMLGenerator,
+    V3: V2CaseXMLGenerator
 }

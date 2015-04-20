@@ -1,14 +1,19 @@
+from functools import wraps
 import json
-import inspect
 import logging
 import traceback
+from django.core.urlresolvers import reverse as _reverse
+from django.utils.http import urlencode
+from dimagi.utils.web import get_url_base
 
 from django import http
 from django.conf import settings
 from django.core.exceptions import PermissionDenied
+from corehq.util import global_request
 
 JSON = 'application/json'
 logger = logging.getLogger('django.request')
+
 
 def set_file_download(response, filename):
     response["Content-Disposition"] = 'attachment; filename="%s"' % filename
@@ -39,6 +44,7 @@ def json_error(f):
     Inspired by (and some parts shamelessly copied from)
     https://github.com/jsocol/django-jsonview
     """
+    @wraps(f)
     def inner(request, *args, **kwargs):
         try:
             response = f(request, *args, **kwargs)
@@ -98,17 +104,21 @@ def json_error(f):
 
 
 def get_request():
-    """
-    Walk up the stack, return the nearest first argument named "request".
+    return global_request.get_request()
 
-    taken from http://nedbatchelder.com/blog/201008/global_django_requests.html
+
+def reverse(viewname, params=None, absolute=False, **kwargs):
     """
-    frame = None
-    try:
-        for f in inspect.stack()[1:]:
-            frame = f[0]
-            code = frame.f_code
-            if code.co_varnames and code.co_varnames[0] in ("request", "req"):
-                return frame.f_locals[code.co_varnames[0]]
-    finally:
-        del frame
+    >>> reverse('create_location', args=["test"], params={"selected": "foo"})
+    '/a/test/settings/locations/new/?selected=foo'
+    """
+    url = _reverse(viewname, **kwargs)
+    if absolute:
+        url = "{}{}".format(get_url_base(), url)
+    if params:
+        url = "{}?{}".format(url, urlencode(params))
+    return url
+
+
+def absolute_reverse(*args, **kwargs):
+    return reverse(*args, absolute=True, **kwargs)

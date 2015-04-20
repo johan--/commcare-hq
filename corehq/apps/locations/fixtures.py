@@ -1,6 +1,5 @@
 from collections import defaultdict
-from xml.etree import ElementTree
-from corehq.apps.commtrack.models import CommTrackUser
+from xml.etree.ElementTree import Element
 from corehq.apps.commtrack.util import unicode_slug
 from corehq.apps.locations.models import Location
 from corehq import toggles
@@ -13,14 +12,14 @@ class LocationSet(object):
 
     def __init__(self, locations=None):
         self.by_id = {}
-        self.by_parent = defaultdict(lambda: [])
+        self.by_parent = defaultdict(set)
         if locations is not None:
             for loc in locations:
                 self.add_location(loc)
 
     def add_location(self, location):
         self.by_id[location._id] = location
-        self.by_parent[location.parent_id].append(location)
+        self.by_parent[location.parent_id].add(location)
 
     def __contains__(self, item):
         return item in self.by_id
@@ -41,7 +40,7 @@ def should_sync_locations(last_sync, location_db):
     return False
 
 
-def location_fixture_generator(user, version, case_sync_op=None, last_sync=None):
+def location_fixture_generator(user, version, last_sync=None):
     """
     By default this will generate a fixture for the users
     location and it's "footprint", meaning the path
@@ -50,26 +49,34 @@ def location_fixture_generator(user, version, case_sync_op=None, last_sync=None)
     There is an admin feature flag that will make this generate
     a fixture with ALL locations for the domain.
     """
-    project = user.project
-    if (not project or not project.commtrack_enabled
-        or not project.commtrack_settings
-        or not project.commtrack_settings.sync_location_fixtures):
-            return []
+    if not user.project.uses_locations:
+        return []
 
-    rewrapped_user = CommTrackUser.wrap(user.to_json())
     if toggles.SYNC_ALL_LOCATIONS.enabled(user.domain):
         location_db = _location_footprint(Location.by_domain(user.domain))
     else:
-        location_db = _location_footprint(rewrapped_user.locations)
+        locations = []
+        if user.location:
+            # add users location (and ancestors) to fixture
+            locations.append(user.location)
+
+            # optionally add all descendants as well
+            if user.location.location_type_object.view_descendants:
+                locations += user.location.descendants
+
+        if user.project.supports_multiple_locations_per_user:
+            # this might add duplicate locations but we filter that out later
+            locations += user.locations
+        location_db = _location_footprint(locations)
 
     if not should_sync_locations(last_sync, location_db):
         return []
 
-    root = ElementTree.Element('fixture',
-                               {'id': 'commtrack:locations',
-                                'user_id': user.user_id})
+    root = Element('fixture',
+                   {'id': 'commtrack:locations',
+                    'user_id': user.user_id})
 
-    loc_types = project.commtrack_settings.location_types
+    loc_types = user.project.location_types
     type_to_slug_mapping = dict((ltype.name, ltype.code) for ltype in loc_types)
 
     def location_type_lookup(location_type):
@@ -80,8 +87,11 @@ def location_fixture_generator(user, version, case_sync_op=None, last_sync=None)
     else:
         root_locations = filter(lambda loc: loc.parent_id is None, location_db.by_id.values())
 
-    _append_children(root, location_db, root_locations, location_type_lookup)
-    return [root]
+    if not root_locations:
+        return []
+    else:
+        _append_children(root, location_db, root_locations, location_type_lookup)
+        return [root]
 
 
 def _location_footprint(locations):
@@ -117,14 +127,23 @@ def _group_by_type(locations):
 
 
 def _types_to_fixture(location_db, type, locs, type_lookup_function):
-    type_node = ElementTree.Element('%ss' % type_lookup_function(type))  # ghetto pluralization
+    type_node = Element('%ss' % type_lookup_function(type))  # ghetto pluralization
     for loc in locs:
         type_node.append(_location_to_fixture(location_db, loc, type_lookup_function))
     return type_node
 
 
+def _get_metadata_node(location):
+    node = Element('location_data')
+    for key, value in location.metadata.items():
+        element = Element(key)
+        element.text = value
+        node.append(element)
+    return node
+
+
 def _location_to_fixture(location_db, location, type_lookup_function):
-    root = ElementTree.Element(type_lookup_function(location.location_type), {'id': location._id})
+    root = Element(type_lookup_function(location.location_type), {'id': location._id})
     fixture_fields = [
         'name',
         'site_code',
@@ -134,10 +153,11 @@ def _location_to_fixture(location_db, location, type_lookup_function):
         'location_type',
     ]
     for field in fixture_fields:
-        field_node = ElementTree.Element(field)
+        field_node = Element(field)
         val = getattr(location, field)
         field_node.text = unicode(val if val is not None else '')
         root.append(field_node)
 
+    root.append(_get_metadata_node(location))
     _append_children(root, location_db, location_db.by_parent[location._id], type_lookup_function)
     return root

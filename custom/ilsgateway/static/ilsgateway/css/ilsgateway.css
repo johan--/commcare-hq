@@ -41,12 +41,27 @@ tr:nth-child(n+2) {
 
 .module li div.meta,
 .module li div.caption {
+    font-size: 1.5em;
 }
 
 .module li div.report {
-    font-size: 2em;
+    font-size: 3em;
     line-height: 1.2;
     border-bottom: 1px dotted #eee;
     margin-bottom: 0.25em;
     padding-bottom: 0.25em;
+}
+
+#report_table_product_selection_pane tr {
+    width: 50%;
+    display: inline-block;
+    font-size: 10px;
+}
+
+#report_table_product_selection_pane tr:last-child {
+    width: 100%;
+}
+
+#report_table_product_selection_pane td {
+    padding: 0;
 }

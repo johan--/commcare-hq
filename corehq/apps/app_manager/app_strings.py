@@ -50,7 +50,7 @@ def _create_custom_app_strings(app, lang):
 
                 if column.format in ('enum', 'enum-image'):
                     for item in column.enum:
-                        yield id_strings.detail_column_enum_variable(module, detail_type, column, item.key), trans(item.value)
+                        yield id_strings.detail_column_enum_variable(module, detail_type, column, item.key_as_variable), trans(item.value)
                 elif column.format == "graph":
                     for index, item in enumerate(column.graph_configuration.annotations):
                         yield id_strings.graph_annotation(module, detail_type, column, index), trans(item.values)
@@ -70,6 +70,12 @@ def _create_custom_app_strings(app, lang):
         for form in module.get_forms():
             form_name = trans(form.name) + ('${0}' if form.show_count else '')
             yield id_strings.form_locale(form), maybe_add_index(form_name)
+
+        if hasattr(module, 'case_list_form') and module.case_list_form.form_id:
+            yield (
+                id_strings.case_list_form_locale(module),
+                trans(module.case_list_form.label) or "Create a new Case"
+            )
 
 
 class AppStringsBase(object):

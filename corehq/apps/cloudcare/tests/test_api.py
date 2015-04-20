@@ -7,7 +7,7 @@ from casexml.apps.phone.xml import date_to_xml_string
 from corehq.apps.domain.shortcuts import create_domain
 from corehq.apps.users.models import CommCareUser
 from corehq.apps.users.util import format_username
-from corehq.apps.cloudcare.api import get_filtered_cases, CASE_STATUS_OPEN, CASE_STATUS_ALL,\
+from corehq.apps.cloudcare.api import get_filtered_cases, CaseAPIResult, CASE_STATUS_OPEN, CASE_STATUS_ALL,\
     CASE_STATUS_CLOSED
 import uuid
 
@@ -111,6 +111,10 @@ class CaseAPITest(TestCase):
     def expectedClosed(self):
         return self.expectedClosedByUser * len(self.user_ids)
 
+    @property
+    def expectedAll(self):
+        return len(self.user_ids) * len(self.case_types) * 3
+
     def testGetAllOpen(self):
         list = get_filtered_cases(self.domain, status=CASE_STATUS_OPEN)
         self.assertEqual(self.expectedOpen, len(list))
@@ -160,6 +164,29 @@ class CaseAPITest(TestCase):
         self.assertEqual(self.expectedOpenByUserWithFootprint + self.expectedClosedByUserWithFootprint, len(list))
         # I don't think we can say anything super useful about this base set
 
+    def testGetAllStripHistory(self):
+        list = get_filtered_cases(self.domain, status=CASE_STATUS_ALL, footprint=True, include_children=True,
+                                  strip_history=True)
+        self.assertEqual(self.expectedAll, len(list))
+        self.assertListMatches(list, lambda c: len(c._couch_doc.actions) == 0)
+        self.assertListMatches(list, lambda c: len(c._couch_doc.xform_ids) == 0)
+
+    def testGetAllIdsOnly(self):
+        list = get_filtered_cases(self.domain, status=CASE_STATUS_ALL, footprint=True, include_children=True,
+                                  ids_only=True)
+        self.assertEqual(self.expectedAll, len(list))
+        self.assertListMatches(list, lambda c: isinstance(c._couch_doc, dict))
+        self.assertListMatches(list, lambda c: isinstance(c.to_json(), basestring))
+
+    def testGetAllIdsOnlyStripHistory(self):
+        list = get_filtered_cases(self.domain, status=CASE_STATUS_ALL, footprint=True, include_children=True,
+                                  ids_only=True, strip_history=True)
+        self.assertEqual(self.expectedAll, len(list))
+        self.assertListMatches(list, lambda c: isinstance(c._couch_doc, dict))
+        self.assertListMatches(list, lambda c: 'actions' not in c._couch_doc)
+        self.assertListMatches(list, lambda c: 'xform_ids' not in c._couch_doc)
+        self.assertListMatches(list, lambda c: isinstance(c.to_json(), basestring))
+
     def testFiltersOnAll(self):
         list = get_filtered_cases(self.domain, status=CASE_STATUS_ALL,
                                   filters={"properties/case_name": _type_to_name(self.test_type)})
@@ -188,6 +215,24 @@ class CaseAPITest(TestCase):
         # when filtering with footprint, the filters get intentionally ignored
         # so just ensure the whole footprint including open and closed is available
         self.assertEqual(self.expectedOpenByUserWithFootprint + self.expectedClosedByUserWithFootprint, len(list))
+
+    def testCaseAPIResultJSON(self):
+        try:
+            case = CommCareCase()
+            # because of how setattr is overridden you have to set it to None in this wacky way
+            case._doc['type'] = None
+            case.save()
+            self.assertEqual(None, CommCareCase.get(case._id).type)
+            res_sanitized = CaseAPIResult(id=case._id, couch_doc=case, sanitize=True)
+            res_unsanitized = CaseAPIResult(id=case._id, couch_doc=case, sanitize=False)
+
+            json = res_sanitized.case_json
+            self.assertEqual(json['properties']['case_type'], '')
+
+            json = res_unsanitized.case_json
+            self.assertEqual(json['properties']['case_type'], None)
+        finally:
+            case.delete()
 
 
 def _child_case_type(type):

@@ -3,7 +3,8 @@ from django.utils.translation import ugettext_lazy as _
 from corehq.apps.commtrack.const import RequisitionActions
 from corehq.apps.domain.models import Domain
 from corehq.apps.commtrack import const
-from corehq.apps.sms.api import send_sms_to_verified_number
+from corehq.apps.sms.api import send_sms_to_verified_number, MessageMetadata
+from corehq import toggles
 from lxml import etree
 import logging
 from dimagi.utils.couch.loosechange import map_reduce
@@ -11,7 +12,7 @@ from dimagi.utils.parsing import json_format_datetime
 from datetime import datetime
 from corehq.apps.commtrack.util import get_supply_point
 from corehq.apps.commtrack.xmlutil import XML
-from corehq.apps.commtrack.models import CommtrackConfig, StockTransaction, CommTrackUser, RequisitionTransaction, RequisitionCase
+from corehq.apps.commtrack.models import CommtrackConfig, StockTransaction, RequisitionTransaction, RequisitionCase
 from corehq.apps.products.models import Product
 from corehq.apps.users.models import CouchUser
 from corehq.apps.receiverwrapper import submit_form_locally
@@ -23,13 +24,15 @@ from corehq.apps.commtrack.exceptions import (
     NoDefaultLocationException,
     NotAUserClassError,
 )
-
 import uuid
+import re
 
 logger = logging.getLogger('commtrack.sms')
 
+
 class SMSError(RuntimeError):
     pass
+
 
 def handle(verified_contact, text, msg=None):
     """top-level handler for incoming stock report messages"""
@@ -38,7 +41,12 @@ def handle(verified_contact, text, msg=None):
         return False
 
     try:
-        data = StockReportParser(domain, verified_contact).parse(text.lower())
+        if toggles.STOCK_AND_RECEIPT_SMS_HANDLER.enabled(domain):
+            # handle special stock parser for custom domain logic
+            data = StockAndReceiptParser(domain, verified_contact).parse(text.lower())
+        else:
+            # default report parser
+            data = StockReportParser(domain, verified_contact).parse(text.lower())
         if not data:
             return False
     except NotAUserClassError:
@@ -84,7 +92,7 @@ class StockReportParser(object):
                 raise NotAUserClassError
 
             # currently only support one location on the UI
-            linked_loc = CommTrackUser.wrap(u.to_json()).location
+            linked_loc = u.location
             if linked_loc:
                 self.location = get_supply_point(self.domain.name, loc=linked_loc)
 
@@ -125,11 +133,7 @@ class StockReportParser(object):
         action = self.C.action_by_keyword(action_keyword)
         if action and action.type == 'stock':
             # TODO: support single-action by product, as well as by action?
-            if not self.location.get('case'):
-                raise NoDefaultLocationException(
-                    _("You have not been registered with a default location yet."
-                      "  Please register a default location for this user.")
-                )
+            self.verify_location_registration()
             self.case_id = self.location['case']._id
             _tx = self.single_action_transactions(action, args, self.transaction_factory(StockTransaction))
         elif action and action.action in [
@@ -150,22 +154,19 @@ class StockReportParser(object):
             # initial keyword not recognized; delegate to another handler
             return None
 
-        tx = list(_tx)
-        if not tx:
-            raise SMSError("stock report doesn't have any transactions")
+        return self.unpack_transactions(_tx)
 
-        return {
-            'timestamp': datetime.utcnow(),
-            'user': self.v.owner,
-            'phone': self.v.phone_number,
-            'location': self.location['location'],
-            'transactions': tx,
-        }
+    def verify_location_registration(self):
+        if not self.location.get('case'):
+            raise NoDefaultLocationException(
+                _("You have not been registered with a default location yet."
+                  "  Please register a default location for this user.")
+            )
 
     def single_action_transactions(self, action, args, make_tx):
         # special case to handle immediate stock-out reports
         if action.action == const.StockActions.STOCKOUT:
-            if all(looks_like_prod_code(arg) for arg in args):
+            if all(self.looks_like_prod_code(arg) for arg in args):
                 for prod_code in args:
                     yield make_tx(
                         product=self.product_from_code(prod_code),
@@ -179,7 +180,7 @@ class StockReportParser(object):
 
         products = []
         for arg in args:
-            if looks_like_prod_code(arg):
+            if self.looks_like_prod_code(arg):
                 products.append(self.product_from_code(arg))
             else:
                 if not products:
@@ -270,13 +271,116 @@ class StockReportParser(object):
             raise SMSError('invalid product code "%s"' % prod_code)
         return p
 
+    def looks_like_prod_code(self, code):
+        try:
+            int(code)
+            return False
+        except ValueError:
+            return True
 
-def looks_like_prod_code(code):
-    try:
-        int(code)
-        return False
-    except:
-        return True
+    def unpack_transactions(self, txs):
+        tx = list(txs)
+        if not tx:
+            raise SMSError("stock report doesn't have any transactions")
+
+        return {
+            'timestamp': datetime.utcnow(),
+            'user': self.v.owner,
+            'phone': self.v.phone_number,
+            'location': self.location['location'],
+            'transactions': tx,
+        }
+
+
+class StockAndReceiptParser(StockReportParser):
+    """
+    This parser (originally written for EWS) allows
+    a slightly different requirement for SMS formats,
+    this class exists to break that functionality
+    out of the default SMS handler to live in the ewsghana
+
+    They send messages of the format:
+
+        'nets 100.22'
+
+    In this example, the data reflects:
+
+        nets = product sms code
+        100 = the facility stating that they have 100 nets
+        20 = the facility stating that they received 20 in this period
+
+    There is some duplication here, but it felt better to
+    add duplication instead of complexity. The goal is to
+    override only the couple methods that required modifications.
+    """
+
+    ALLOWED_KEYWORDS = ['join', 'help']
+
+    def looks_like_prod_code(self, code):
+        """
+        Special for EWS, this version doesn't consider "10.20"
+        as an invalid quantity.
+        """
+        try:
+            float(code)
+            return False
+        except ValueError:
+            return True
+
+    def parse(self, text):
+        args = text.split()
+
+        if len(args) == 0:
+            return None
+
+        if args[0].lower() in self.ALLOWED_KEYWORDS:
+            return None
+
+        if not self.location:
+            self.location = self.location_from_code(args[0])
+            args = args[1:]
+
+        self.verify_location_registration()
+        self.case_id = self.location['case']._id
+        action = self.C.action_by_keyword('soh')
+        _tx = self.single_action_transactions(action, args, self.transaction_factory(StockTransaction))
+
+        return self.unpack_transactions(_tx)
+
+    def single_action_transactions(self, action, args, make_tx):
+        products = []
+        for arg in args:
+            if self.looks_like_prod_code(arg):
+                products.append(self.product_from_code(arg))
+            else:
+                if not products:
+                    raise SMSError('quantity "%s" doesn\'t have a product' % arg)
+                if len(products) > 1:
+                    raise SMSError('missing quantity for product "%s"' % products[-1].code)
+
+                # NOTE also custom code here, must be formatted like 11.22
+                if re.compile("^\d+\.\d+$").match(arg):
+                    value = arg
+                else:
+                    raise SMSError('could not understand product quantity "%s"' % arg)
+
+                for p in products:
+                    # for EWS we have to do two transactions, one being a receipt
+                    # and second being a transaction (that's reverse of the order
+                    # the user provides them)
+                    yield make_tx(
+                        product=p,
+                        action=const.StockActions.RECEIPTS,
+                        quantity=value.split('.')[1]
+                    )
+                    yield make_tx(
+                        product=p,
+                        action=const.StockActions.STOCKONHAND,
+                        quantity=value.split('.')[0]
+                    )
+                products = []
+        if products:
+            raise SMSError('missing quantity for product "%s"' % products[-1].code)
 
 
 def verify_transaction_cases(transactions):
@@ -373,10 +477,10 @@ def convert_transactions_to_blocks(E, transactions):
     balances, transfers = process_transactions(E, transactions)
 
     stock_blocks = []
-    if balances:
-        stock_blocks.append(balances)
     if transfers:
         stock_blocks.append(transfers)
+    if balances:
+        stock_blocks.append(balances)
 
     return stock_blocks
 
@@ -432,7 +536,7 @@ def requisition_case_xml(data, stock_blocks):
         update={'requisition_status': status},
     ).as_xml())
 
-    timestamp = data['transactions'][0].timestamp or datetime.now()
+    timestamp = data['transactions'][0].timestamp or datetime.utcnow()
     device_id = get_device_id(data)
 
     return """
@@ -495,7 +599,7 @@ def send_confirmation(v, data):
 
     static_loc = data['location']
     location_name = static_loc.name
-
+    metadata = MessageMetadata(location_id=static_loc.get_id)
     tx_by_action = map_reduce(lambda tx: [(tx.action_config(C).name,)], data=data['transactions'], include_docs=True)
     def summarize_action(action, txs):
         return '%s %s' % (txs[0].action_config(C).keyword.upper(), ' '.join(sorted(tx.fragment() for tx in txs)))
@@ -506,4 +610,4 @@ def send_confirmation(v, data):
         ' '.join(sorted(summarize_action(a, txs) for a, txs in tx_by_action.iteritems()))
     )
 
-    send_sms_to_verified_number(v, msg)
+    send_sms_to_verified_number(v, msg, metadata=metadata)

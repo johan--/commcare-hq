@@ -37,6 +37,14 @@ class GrapevineBackend(SMSBackend):
     authentication_code = StringProperty()
 
     @classmethod
+    def get_opt_in_keywords(cls):
+        return ["START"]
+
+    @classmethod
+    def get_opt_out_keywords(cls):
+        return ["STOP", "END", "CANCEL", "UNSUBSCRIBE", "QUIT"]
+
+    @classmethod
     def get_api_id(cls):
         return "GVI"
 
@@ -178,7 +186,10 @@ class GrapevineResource(Resource):
         if not bundle.data or not bundle.data.get('XML'):
             return bundle
 
-        root = ElementTree.fromstring(bundle.data['XML'])
+        # http://bugs.python.org/issue11033
+        xml = bundle.data['XML'].encode('utf-8')
+
+        root = ElementTree.fromstring(xml)
         if root.tag == 'gviSms':
             date_string = root.find('smsDateTime').text
             phone_number = root.find('cellNumber').text

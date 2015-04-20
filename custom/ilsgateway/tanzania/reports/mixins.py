@@ -1,3 +1,4 @@
+from django.db.models.aggregates import Avg, Max
 from custom.ilsgateway.tanzania import ILSData
 
 from corehq.apps.commtrack.models import SQLProduct
@@ -14,8 +15,21 @@ class RandRSubmissionData(ILSData):
     def rows(self):
         rr_data = []
         if self.config['org_summary']:
-            rr_data = GroupSummary.objects.get(title=SupplyPointStatusTypes.R_AND_R_FACILITY,
-                                               org_summary=self.config['org_summary'])
+            try:
+                rr = GroupSummary.objects.filter(title=SupplyPointStatusTypes.R_AND_R_FACILITY,
+                                                 org_summary__in=self.config['org_summary'])\
+                    .aggregate(Avg('responded'), Avg('on_time'), Avg('complete'), Max('total'))
+
+                rr_data.append(GroupSummary(
+                    title=SupplyPointStatusTypes.R_AND_R_FACILITY,
+                    responded=rr['responded__avg'],
+                    on_time=rr['on_time__avg'],
+                    complete=rr['complete__avg'],
+                    total=rr['total__max']
+                ))
+
+            except GroupSummary.DoesNotExist:
+                return rr_data
         return rr_data
 
 
@@ -32,11 +46,11 @@ class DistrictSummaryData(ILSData):
 
             def prepare_processing_info(data):
                 return {
-                    'total': data[0] - (data[1].total + data[2].total),
+                    'total': data[0] - (data[1] + data[2]),
                     'complete': 0
                 }
 
-            org_summary = self.config['org_summary']
+            org_summary = self.config['org_summary'][0]
             total = org_summary.total_orgs
             avg_lead_time = org_summary.average_lead_time_in_days
             if avg_lead_time:
@@ -45,22 +59,25 @@ class DistrictSummaryData(ILSData):
             endmonth = self.config['enddate'].month
             dg = DeliveryGroups(month=endmonth)
 
-            rr_data = RandRSubmissionData(config=self.config).rows
-            delivery_data = DeliverySubmissionData(config=self.config).rows
+            rr_data = RandRSubmissionData(config=self.config).rows[0]
+            delivery_data = DeliverySubmissionData(config=self.config).rows[0]
 
             submitting_group = dg.current_submitting_group(month=endmonth)
             processing_group = dg.current_processing_group(month=endmonth)
             delivery_group = dg.current_delivering_group(month=endmonth)
 
-            processing_numbers = prepare_processing_info([total, rr_data, delivery_data])
+            (rr_complete, rr_total) = (rr_data.complete, rr_data.total) if rr_data else (0, 0)
+            (delivery_complete, delivery_total) = (delivery_data.complete, delivery_data.total)\
+                if delivery_data else (0, 0)
+            processing_numbers = prepare_processing_info([total, rr_total, delivery_total])
 
             return {
                 "processing_total": processing_numbers['total'],
                 "processing_complete": processing_numbers['complete'],
-                "submitting_total": rr_data.total,
-                "submitting_complete": rr_data.complete,
-                "delivery_total": delivery_data.total,
-                "delivery_complete": delivery_data.complete,
+                "submitting_total": rr_total,
+                "submitting_complete": rr_complete,
+                "delivery_total": delivery_total,
+                "delivery_complete": delivery_complete,
                 "delivery_group": delivery_group,
                 "submitting_group": submitting_group,
                 "processing_group": processing_group,
@@ -79,8 +96,20 @@ class SohSubmissionData(ILSData):
     def rows(self):
         soh_data = []
         if self.config['org_summary']:
-            soh_data = GroupSummary.objects.get(title=SupplyPointStatusTypes.SOH_FACILITY,
-                                                org_summary=self.config['org_summary'])
+            try:
+                sohs = GroupSummary.objects.filter(title=SupplyPointStatusTypes.SOH_FACILITY,
+                                                   org_summary__in=self.config['org_summary'])\
+                    .aggregate(Avg('responded'), Avg('on_time'), Avg('complete'), Max('total'))
+
+                soh_data.append(GroupSummary(
+                    title=SupplyPointStatusTypes.SOH_FACILITY,
+                    responded=sohs['responded__avg'],
+                    on_time=sohs['on_time__avg'],
+                    complete=sohs['complete__avg'],
+                    total=sohs['total__max']
+                ))
+            except GroupSummary.DoesNotExist:
+                return soh_data
         return soh_data
 
 
@@ -92,9 +121,25 @@ class DeliverySubmissionData(ILSData):
     def rows(self):
         del_data = []
         if self.config['org_summary']:
-            del_data = GroupSummary.objects.get(title=SupplyPointStatusTypes.DELIVERY_FACILITY,
-                                                org_summary=self.config['org_summary'])
+            try:
+                data = GroupSummary.objects.filter(title=SupplyPointStatusTypes.DELIVERY_FACILITY,
+                                                org_summary__in=self.config['org_summary'])\
+                    .aggregate(Avg('responded'), Avg('on_time'), Avg('complete'), Max('total'))
+
+                del_data.append(GroupSummary(
+                    title=SupplyPointStatusTypes.DELIVERY_FACILITY,
+                    responded=data['responded__avg'],
+                    on_time=data['on_time__avg'],
+                    complete=data['complete__avg'],
+                    total=data['total__max']
+                ))
+            except GroupSummary.DoesNotExist:
+                return del_data
         return del_data
+
+
+class ILSMultiBarChart(MultiBarChart):
+    template_partial = 'ilsgateway/partials/ils_multibar_chart.html'
 
 
 class ProductAvailabilitySummary(ILSData):
@@ -111,7 +156,14 @@ class ProductAvailabilitySummary(ILSData):
         if self.config['org_summary']:
             product_availability = ProductAvailabilityData.objects.filter(
                 date__range=(self.config['startdate'], self.config['enddate']),
-                supply_point=self.config['org_summary'].supply_point)
+                supply_point=self.config['org_summary'][0].supply_point,
+                product__in=self.config['products']).values('product')\
+                .annotate(
+                    with_stock=Avg('with_stock'),
+                    without_data=Avg('without_data'),
+                    without_stock=Avg('without_stock'),
+                    total=Max('total')
+            )
         return product_availability
 
     @property
@@ -124,19 +176,21 @@ class ProductAvailabilitySummary(ILSData):
             for k in ['Stocked out', 'Not Stocked out', 'No Stock Data']:
                 datalist = []
                 for product in rows:
-                    prd_code = SQLProduct.objects.get(product_id=product.product).code
+                    prd_code = SQLProduct.objects.get(product_id=product['product']).code
                     if k == 'No Stock Data':
-                        datalist.append([prd_code, product.without_data])
+                        datalist.append([prd_code, product['without_data']])
                     elif k == 'Stocked out':
-                        datalist.append([prd_code, product.without_stock])
+                        datalist.append([prd_code, product['without_stock']])
                     elif k == 'Not Stocked out':
-                        datalist.append([prd_code, product.with_stock])
+                        datalist.append([prd_code, product['with_stock']])
                 ret_data.append({'color': chart_config.label_color[k], 'label': k, 'data': datalist})
             return ret_data
 
-        chart = MultiBarChart('', x_axis=Axis('Products'), y_axis=Axis(''))
+        chart = ILSMultiBarChart('', x_axis=Axis('Products'), y_axis=Axis(''))
         chart.rotateLabels = -45
         chart.marginBottom = 120
+        chart.marginRight = 10
+        chart.height = 350
         chart.stacked = self.chart_stacked
         for row in convert_product_data_to_stack_chart(product_availability, product_dashboard):
             chart.add_dataset(row['label'], [

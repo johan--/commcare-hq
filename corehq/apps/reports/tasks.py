@@ -4,9 +4,11 @@ import uuid
 
 from celery.schedules import crontab
 from celery.task import periodic_task
+from corehq.apps.indicators.utils import get_mvp_domains
 from corehq.apps.reports.scheduled import get_scheduled_reports
+from corehq.util.view_utils import absolute_reverse
 from couchexport.files import Temp
-from couchexport.groupexports import export_for_group
+from couchexport.groupexports import export_for_group, rebuild_export
 from dimagi.utils.couch.database import get_db
 from dimagi.utils.logging import notify_exception
 from couchexport.tasks import cache_file_to_be_served
@@ -14,18 +16,25 @@ from celery.task import task
 from celery.utils.log import get_task_logger
 from dimagi.utils.couch import get_redis_client
 from dimagi.utils.django.email import send_HTML_email
-from django.contrib.sites.models import Site
-from django.core.urlresolvers import reverse
 
 from corehq.apps.domain.calculations import CALC_FNS, _all_domain_stats, total_distinct_users
-from corehq.apps.hqadmin.escheck import check_es_cluster_health, CLUSTER_HEALTH, check_case_es_index, check_xform_es_index, check_reportcase_es_index, check_reportxform_es_index
+from corehq.apps.hqadmin.escheck import (
+    CLUSTER_HEALTH,
+    check_case_es_index,
+    check_es_cluster_health,
+    check_reportcase_es_index,
+    check_reportxform_es_index,
+    check_xform_es_index,
+)
 from corehq.apps.reports.export import save_metadata_export_to_tempfile
-from corehq.apps.reports.models import (ReportNotification,
-    UnsupportedScheduledReportError, HQGroupExportConfiguration)
+from corehq.apps.reports.models import (
+    HQGroupExportConfiguration,
+    ReportNotification,
+    UnsupportedScheduledReportError,
+)
 from corehq.elastic import get_es, ES_URLS, stream_es_query
 from corehq.pillows.mappings.app_mapping import APP_INDEX
 from corehq.pillows.mappings.domain_mapping import DOMAIN_INDEX
-from corehq.apps.users.models import WebUser
 import settings
 
 
@@ -65,11 +74,32 @@ def check_es_index():
                 "Elasticsearch %s Index Issue: %s" % (index, es_status[index]['message']))
 
     if do_notify:
-        message.append("This alert can give false alarms due to timing lag, so please double check https://www.commcarehq.org/hq/admin/system/ and the Elasticsarch Status section to make sure.")
+        message.append(
+            "This alert can give false alarms due to timing lag, so please double check "
+            + absolute_reverse("system_info")
+            + " and the Elasticsearch Status section to make sure."
+        )
         notify_exception(None, message='\n'.join(message))
 
 
-@task
+def send_delayed_report(report):
+    """
+    Sends a scheduled report, via  celery background task.
+    """
+    send_report.apply_async(args=[report._id], queue=get_report_queue(report))
+
+
+def get_report_queue(report):
+    # This is a super-duper hacky, hard coded way to deal with the fact that MVP reports
+    # consistently crush the celery queue for everyone else.
+    # Just send them to their own longrunning background queue
+    if report.domain in get_mvp_domains():
+        return 'background_queue'
+    else:
+        return 'celery'
+
+
+@task(ignore_result=True)
 def send_report(notification_id):
     notification = ReportNotification.get(notification_id)
     try:
@@ -98,19 +128,19 @@ def create_metadata_export(download_id, domain, format, filename, datespan=None,
 @periodic_task(run_every=crontab(hour="*", minute="*/30", day_of_week="*"), queue=getattr(settings, 'CELERY_PERIODIC_QUEUE','celery'))
 def daily_reports():
     for rep in get_scheduled_reports('daily'):
-        send_report.delay(rep._id)
+        send_delayed_report(rep)
 
 
 @periodic_task(run_every=crontab(hour="*", minute="*/30", day_of_week="*"), queue=getattr(settings, 'CELERY_PERIODIC_QUEUE','celery'))
 def weekly_reports():
     for rep in get_scheduled_reports('weekly'):
-        send_report.delay(rep._id)
+        send_delayed_report(rep)
 
 
 @periodic_task(run_every=crontab(hour="*", minute="*/30", day_of_week="*"), queue=getattr(settings, 'CELERY_PERIODIC_QUEUE','celery'))
 def monthly_reports():
     for rep in get_scheduled_reports('monthly'):
-        send_report.delay(rep._id)
+        send_delayed_report(rep)
 
 
 @periodic_task(run_every=crontab(hour=[22], minute="0", day_of_week="*"), queue=getattr(settings, 'CELERY_PERIODIC_QUEUE','celery'))
@@ -122,7 +152,14 @@ def saved_exports():
 
 @task(queue='saved_exports_queue')
 def export_for_group_async(group_config, output_dir):
-    export_for_group(group_config, output_dir)
+    # exclude exports not accessed within the last 7 days
+    last_access_cutoff = datetime.utcnow() - timedelta(days=settings.SAVED_EXPORT_ACCESS_CUTOFF)
+    export_for_group(group_config, output_dir, last_access_cutoff=last_access_cutoff)
+
+
+@task(queue='saved_exports_queue')
+def rebuild_export_async(config, schema, output_dir):
+    rebuild_export(config, schema, output_dir)
 
 
 @periodic_task(run_every=crontab(hour="12, 22", minute="0", day_of_week="*"), queue=getattr(settings, 'CELERY_PERIODIC_QUEUE','celery'))
@@ -151,7 +188,7 @@ def update_calculated_properties():
             "cp_last_form": CALC_FNS["last_form_submission"](dom, False),
             "cp_is_active": CALC_FNS["active"](dom),
             "cp_has_app": CALC_FNS["has_app"](dom),
-            "cp_last_updated": datetime.now().strftime(DATE_FORMAT),
+            "cp_last_updated": datetime.utcnow().strftime(DATE_FORMAT),
             "cp_n_in_sms": int(CALC_FNS["sms"](dom, "I")),
             "cp_n_out_sms": int(CALC_FNS["sms"](dom, "O")),
             "cp_n_sms_ever": int(CALC_FNS["sms_in_last"](dom)),
@@ -166,7 +203,7 @@ def update_calculated_properties():
 
 DATE_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 def is_app_active(app_id, domain):
-    now = datetime.now()
+    now = datetime.utcnow()
     then = (now - timedelta(days=30)).strftime(DATE_FORMAT)
     now = now.strftime(DATE_FORMAT)
 
@@ -186,33 +223,33 @@ def apps_update_calculated_properties():
 @task
 def export_all_rows_task(ReportClass, report_state):
     report = object.__new__(ReportClass)
-
-    # Somehow calling generic _init function or __setstate__ is raising AttributeError
-    # on '_update_initial_context' function call...
-    try:
-        report.__setstate__(report_state)
-    except AttributeError:
-        pass
+    report.__setstate__(report_state)
 
     # need to set request
     setattr(report.request, 'REQUEST', {})
 
     file = report.excel_response
     hash_id = _store_excel_in_redis(file)
-    user = WebUser.get(report_state["request"]["couch_user"])
-    _send_email(user.get_email(), report, hash_id)
+    _send_email(report.request.couch_user, report, hash_id)
 
-def _send_email(to, report, hash_id):
-    domain = Site.objects.get_current().domain
-    link = "http://%s%s" % (domain, reverse("export_report", args=[report.domain, str(hash_id), report.export_format]))
+
+def _send_email(user, report, hash_id):
+    domain = report.domain or user.get_domains()[0]
+    link = absolute_reverse("export_report", args=[domain, str(hash_id),
+                                                   report.export_format])
 
     title = "%s: Requested export excel data"
     body = "The export you requested for the '%s' report is ready.<br>" \
            "You can download the data at the following link: %s<br><br>" \
            "Please remember that this link will only be active for 24 hours."
 
-    send_HTML_email(_(title) % report.name, to, _(body) % (report.name, "<a href='%s'>%s</a>" % (link, link)),
-                    email_from=settings.DEFAULT_FROM_EMAIL)
+    send_HTML_email(
+        _(title) % report.name,
+        user.get_email(),
+        _(body) % (report.name, "<a href='%s'>%s</a>" % (link, link)),
+        email_from=settings.DEFAULT_FROM_EMAIL
+    )
+
 
 def _store_excel_in_redis(file):
     hash_id = uuid.uuid4().hex

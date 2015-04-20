@@ -4,12 +4,13 @@ from casexml.apps.case.exceptions import BadStateException
 from casexml.apps.case.mock import CaseBlock
 from casexml.apps.phone.models import SyncLog, User
 from datetime import datetime
-from casexml.apps.phone.restore import generate_restore_payload,\
-    generate_restore_response
 from casexml.apps.phone.checksum import EMPTY_HASH, CaseStateHash
 from casexml.apps.case.xml import V2
 from casexml.apps.case.util import post_case_blocks
 from casexml.apps.case.tests.util import delete_all_sync_logs, delete_all_xforms, delete_all_cases
+from casexml.apps.phone.tests.utils import generate_restore_payload, generate_restore_response
+from corehq import toggles
+from toggle.shortcuts import update_toggle_cache, clear_toggle_cache
 
 
 @override_settings(CASEXML_FORCE_DOMAIN_CHECK=False)
@@ -21,13 +22,13 @@ class StateHashTest(TestCase):
         delete_all_sync_logs()
 
         self.user = User(user_id="state_hash", username="state_hash",
-                         password="changeme", date_joined=datetime(2011, 6, 9)) 
-        
+                         password="changeme", date_joined=datetime(2011, 6, 9))
+
         # this creates the initial blank sync token in the database
         generate_restore_payload(self.user)
         [sync_log] = SyncLog.view("phone/sync_logs_by_user", include_docs=True, reduce=False).all()
         self.sync_log = sync_log
-    
+
     def testEmpty(self):
         empty_hash = CaseStateHash(EMPTY_HASH)
         wrong_hash = CaseStateHash("thisisntright")
@@ -36,7 +37,7 @@ class StateHashTest(TestCase):
         self.assertEqual(200, response.status_code)
         
         try:
-            response = generate_restore_payload(self.user, self.sync_log.get_id,
+            generate_restore_payload(self.user, self.sync_log.get_id,
                                                 version=V2, state_hash=str(wrong_hash))
             self.fail("Call to generate a payload with a bad hash should fail!")
         except BadStateException, e:
@@ -75,3 +76,13 @@ class StateHashTest(TestCase):
             self.assertEqual(2, len(e.case_ids))
             self.assertTrue("abc123" in e.case_ids)
             self.assertTrue("123abc" in e.case_ids)
+
+
+class FileResponseStateHashTest(StateHashTest):
+
+    def setUp(self):
+        super(FileResponseStateHashTest, self).setUp()
+        update_toggle_cache(toggles.FILE_RESTORE.slug, self.user.username, True)
+
+    def tearDown(self):
+        clear_toggle_cache(toggles.FILE_RESTORE.slug, self.user.username)

@@ -3,8 +3,8 @@ from corehq.apps.sms.models import CallLog, INCOMING, OUTGOING
 from corehq.apps.sms.mixin import VerifiedNumber, MobileBackend
 from corehq.apps.sms.util import strip_plus
 from corehq.apps.smsforms.app import start_session, _get_responses
-from corehq.apps.smsforms.models import XFormsSession, XFORMS_SESSION_IVR
-from corehq.apps.app_manager.models import get_app, Form
+from corehq.apps.smsforms.models import XFORMS_SESSION_IVR, get_session_by_session_id
+from corehq.apps.app_manager.models import Form
 from corehq.apps.hqmedia.models import HQMediaMapItem
 from django.http import HttpResponse
 from django.conf import settings
@@ -59,7 +59,29 @@ def get_input_length(question):
     else:
         return None
 
-def incoming(phone_number, backend_module, gateway_session_id, ivr_event, input_data=None):
+
+def hang_up_response(gateway_session_id, backend_module=None):
+    if backend_module:
+        return HttpResponse(backend_module.get_http_response_string(
+            gateway_session_id,
+            [],
+            collect_input=False,
+            hang_up=True
+        ))
+    else:
+        return HttpResponse("")
+
+
+def add_metadata(call_log_entry, duration=None):
+    try:
+        call_log_entry.duration = int(round(float(duration)))
+        call_log_entry.save()
+    except (TypeError, ValueError):
+        pass
+
+
+def incoming(phone_number, backend_module, gateway_session_id, ivr_event, input_data=None,
+    duration=None):
     # Look up the call if one already exists
     call_log_entry = CallLog.view("sms/call_by_session",
                                   startkey=[gateway_session_id, {}],
@@ -70,7 +92,15 @@ def incoming(phone_number, backend_module, gateway_session_id, ivr_event, input_
     
     answer_is_valid = False # This will be set to True if IVR validation passes
     error_occurred = False # This will be set to False if touchforms validation passes (i.e., no form constraints fail)
-    
+
+    if call_log_entry:
+        add_metadata(call_log_entry, duration)
+
+    if call_log_entry and call_log_entry.form_unique_id is None:
+        # If this request is for a call with no touchforms session,
+        # then just short circuit everything and hang up
+        return hang_up_response(gateway_session_id, backend_module=backend_module)
+
     if call_log_entry is not None and backend_module:
         if ivr_event == IVR_EVENT_NEW_CALL and call_log_entry.use_precached_first_response:
             return HttpResponse(call_log_entry.first_response)
@@ -133,7 +163,7 @@ def incoming(phone_number, backend_module, gateway_session_id, ivr_event, input_
         if hang_up:
             if call_log_entry.xforms_session_id is not None:
                 # Process disconnect
-                session = XFormsSession.by_session_id(call_log_entry.xforms_session_id)
+                session = get_session_by_session_id(call_log_entry.xforms_session_id)
                 if session.end_time is None:
                     if call_log_entry.submit_partial_form:
                         submit_unfinished_form(session.session_id, call_log_entry.include_case_side_effects)
@@ -190,8 +220,8 @@ def incoming(phone_number, backend_module, gateway_session_id, ivr_event, input_
         msg.couch_recipient_doc_type = v.owner_doc_type
         msg.couch_recipient = v.owner_id
     msg.save()
-    
-    return HttpResponse("")
+
+    return hang_up_response(gateway_session_id, backend_module=backend_module)
 
 
 def get_ivr_backend(recipient, verified_number=None, unverified_number=None):

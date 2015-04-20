@@ -1,10 +1,12 @@
 import logging
-import simplejson
+import json
 
 from django.utils.translation import ugettext as _
 from django.utils.translation import ugettext_noop
 
 from couchdbkit import RequestFailed
+from corehq.const import SERVER_DATETIME_FORMAT
+from corehq.util.timezones.conversions import PhoneTime
 from dimagi.utils.decorators.memoized import memoized
 
 from corehq.apps.api.es import CaseES
@@ -105,8 +107,8 @@ class CaseListMixin(ElasticProjectInspectionReport, ProjectReportParametersMixin
                 self.request.path,
                 self.request.GET.urlencode(),
                 self.request.couch_user.username,
-                simplejson.dumps(query),
-                simplejson.dumps(query_results)
+                json.dumps(query),
+                json.dumps(query_results)
             ))
             raise RequestFailed
         return query_results
@@ -129,7 +131,7 @@ class CaseListMixin(ElasticProjectInspectionReport, ProjectReportParametersMixin
             user_type_filters.append(user_es.mobile_users())
 
         if len(user_type_filters) > 0:
-            special_q = user_es.UserES().domain(self.domain).OR(*user_type_filters)
+            special_q = user_es.UserES().domain(self.domain).OR(*user_type_filters).show_inactive()
             special_user_ids = special_q.run().doc_ids
         else:
             special_user_ids = []
@@ -157,17 +159,55 @@ class CaseListMixin(ElasticProjectInspectionReport, ProjectReportParametersMixin
                                                 .fields([])
         sharing_group_ids = share_group_q.run().doc_ids
 
-        owner_ids = list(set().union(special_user_ids,
-                                selected_user_ids,
-                                selected_sharing_group_ids,
-                                selected_reporting_group_users,
-                                sharing_group_ids))
+        owner_ids = list(set().union(
+            special_user_ids,
+            selected_user_ids,
+            selected_sharing_group_ids,
+            selected_reporting_group_users,
+            sharing_group_ids
+        ))
         if HQUserType.COMMTRACK in user_types:
             owner_ids.append("commtrack-system")
         if HQUserType.DEMO_USER in user_types:
             owner_ids.append("demo_user_group_id")
+
+        owner_ids += self.location_sharing_owner_ids()
+        owner_ids += self.location_reporting_owner_ids()
         return owner_ids
 
+    def location_sharing_owner_ids(self):
+        """
+        For now (and hopefully for always) the only owner
+        id that is important for case sharing group selection
+        is that actual group id.
+        """
+        return EMWF.selected_location_sharing_group_ids(self.request)
+
+    def location_reporting_owner_ids(self):
+        """
+        Include all users that are assigned to the selected
+        locations or those locations descendants.
+        """
+        from corehq.apps.locations.models import SQLLocation, LOCATION_REPORTING_PREFIX
+        from corehq.apps.users.models import CommCareUser
+        results = []
+        selected_location_group_ids = EMWF.selected_location_reporting_group_ids(self.request)
+
+        for group_id in selected_location_group_ids:
+            loc = SQLLocation.objects.get(
+                location_id=group_id.replace(LOCATION_REPORTING_PREFIX, '')
+            )
+
+            for l in [loc] + list(loc.get_descendants()):
+                users = CommCareUser.get_db().view(
+                    'locations/users_by_location_id',
+                    startkey=[l.location_id],
+                    endkey=[l.location_id, {}],
+                    include_docs=True
+                ).all()
+                results += [u['id'] for u in users]
+
+        return results
 
     def get_case(self, row):
         if '_source' in row:
@@ -198,6 +238,13 @@ class CaseListReport(CaseListMixin, ProjectInspectionReport, ReportDataSource):
 
     name = ugettext_noop('Case List')
     slug = 'case_list'
+
+    @classmethod
+    def display_in_dropdown(cls, domain=None, project=None, user=None):
+        if project and project.commtrack_enabled:
+            return False
+        else:
+            return True
 
     def slugs(self):
         return [
@@ -276,10 +323,7 @@ class CaseListReport(CaseListMixin, ProjectInspectionReport, ReportDataSource):
 
     def date_to_json(self, date):
         if date:
-            return date.strftime('%Y-%m-%d %H:%M:%S')
-            # temporary band aid solution for http://manage.dimagi.com/default.asp?80262
-            # return tz_utils.adjust_datetime_to_timezone(
-            #     date, pytz.utc.zone, self.timezone.zone
-            # ).strftime('%Y-%m-%d %H:%M:%S')
+            return (PhoneTime(date, self.timezone).user_time(self.timezone)
+                    .ui_string(SERVER_DATETIME_FORMAT))
         else:
             return ''

@@ -322,6 +322,24 @@ class CommTrackBalanceTransferTest(CommTrackSubmissionTest):
         for product, amt in transfers:
             self.check_product_stock(self.sp, product, final, 0)
 
+    def test_blank_quantities(self):
+        # submitting a bunch of blank data shouldn't submit transactions
+        # so lets submit some initial data and make sure we don't modify it
+        # or have new transactions
+        initial = float(100)
+        initial_amounts = [(p._id, initial) for p in self.products]
+        self.submit_xml_form(balance_submission(initial_amounts))
+
+        trans_count = StockTransaction.objects.all().count()
+
+        initial_amounts = [(p._id, '') for p in self.products]
+        self.submit_xml_form(balance_submission(initial_amounts))
+
+        self.assertEqual(trans_count, StockTransaction.objects.all().count())
+        for product in self.products:
+            self.check_product_stock(self.sp, product._id, 100, 0)
+
+
 
 class BugSubmissionsTest(CommTrackSubmissionTest):
     def test_device_report_submissions_ignored(self):
@@ -475,7 +493,7 @@ class CommTrackSyncTest(CommTrackSubmissionTest):
             version=V2,
             stock_settings=self.ota_settings,
         )
-        self.sync_log_id = synclog_id_from_restore_payload(restore_config.get_payload())
+        self.sync_log_id = synclog_id_from_restore_payload(restore_config.get_payload().as_string())
 
     def testStockSyncToken(self):
         # first restore should not have the updated case
@@ -496,7 +514,7 @@ class CommTrackArchiveSubmissionTest(CommTrackSubmissionTest):
         initial_amounts = [(p._id, float(100)) for p in self.products]
         self.submit_xml_form(
             balance_submission(initial_amounts),
-            timestamp=datetime.now() + timedelta(-30)
+            timestamp=datetime.utcnow() + timedelta(-30)
         )
 
         final_amounts = [(p._id, float(50)) for i, p in enumerate(self.products)]
@@ -587,4 +605,4 @@ def _get_ota_balance_blocks(ct_settings, user):
         version=V2,
         stock_settings=ota_settings,
     )
-    return extract_balance_xml(restore_config.get_payload())
+    return extract_balance_xml(restore_config.get_payload().as_string())

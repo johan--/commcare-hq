@@ -7,11 +7,7 @@
         <div class="control-group">
             <label class="control-label">{% trans "Form Name" %}</label>
             <div class="controls">
-                {% if edit %}
-                    {{ form.name|input_trans:langs|safe }}
-                {% else %}
-                    {{ form.name|html_trans:langs|safe }}
-                {% endif %}
+                {% input_trans form.name langs %}
             </div>
         </div>
 
@@ -25,12 +21,7 @@
             <div class="control-group" data-bind="
                 visible: visible,
                 css: {error: hasError()}">
-                {% if multimedia %}
-                    {% include "app_manager/partials/nav_menu_media.html" %}
-                {% else %}
-                    {% include "app_manager/partials/nav_menu_media.old.html" with item=form %}
-                {% endif %}
-
+                {% include "app_manager/partials/nav_menu_media.html" with ICON_LABEL="Icon" AUDIO_LABEL="Audio" %}
             </div>
         </div>
 
@@ -56,12 +47,12 @@
         </div>
 
         <legend>
-        <a class="accordion-toggle" data-toggle="collapse" data-bind="attr: {href: '#' + id}, css: {collapsed: reallyCollapse}" href="#form-settings-advanced">
+        <a class="accordion-toggle collapsed" data-toggle="collapse" data-bind="attr: {href: '#' + id}, css: {collapsed: reallyCollapse}" href="#form-settings-advanced">
             <i class="icon-double-angle-down"></i>
             <span data-bind="text: title">Advanced</span>
         </a>
         </legend>
-        <div class="collapse collapse" data-bind="attr: {id: id}, css: {'in': !reallyCollapse()}" id="form-settings-advanced" style="overflow: hidden;">
+        <div class="collapse" data-bind="attr: {id: id}, css: {'in': !reallyCollapse()}" id="form-settings-advanced" style="overflow: hidden;">
             <div class="control-group" data-bind="
                 visible: visible,
                 css: {error: hasError()}">
@@ -80,14 +71,9 @@
                     ></span>
                 </label>
                 <div class="controls" id="no-vellum">
-                    {% if edit %}
-                         <input type="checkbox" value="true"
-                                data-bind="checked: no_vellum"/>
-                    {% else %}
-                        <input type="checkbox" value="true" disabled="disabled"
-                               data-bind="checked: no_vellum"/>
-                    {% endif %}
-                    <input type="hidden" name="no_vellum" data-bind="value: no_vellum"/>
+                     <input type="checkbox" value="true"
+                            data-bind="checked: no_vellum"/>
+                     <input type="hidden" name="no_vellum" data-bind="value: no_vellum"/>
                 </div>
             </div>
             {% endif %}

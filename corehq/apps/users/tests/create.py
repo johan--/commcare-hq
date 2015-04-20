@@ -1,6 +1,7 @@
 from datetime import datetime
 from django.test import TestCase
 from corehq.apps.users.util import format_username
+from corehq.util.dates import iso_string_to_date
 from couchforms.models import XFormInstance
 from corehq.apps.users.models import CouchUser, WebUser, CommCareUser
 from dimagi.utils.dates import force_to_datetime
@@ -66,12 +67,15 @@ class CreateTestCase(TestCase):
     def testDomainMemberships(self):
         w_username = "joe"
         w_email = "joe@domain.com"
+        w2_username = "ben"
+        w2_email = "ben@domain.com"
         cc_username = "mobby"
         password = "password"
         domain = "test-domain"
 
         # check that memberships are added on creation
         webuser = WebUser.create(domain, w_username, password, w_email)
+        webuser2 = WebUser.create('nodomain', w2_username, password, w2_email)
         ccuser = CommCareUser.create(domain, cc_username, password)
 
         self.assertEquals(webuser.is_member_of('test-domain'), True)
@@ -97,15 +101,20 @@ class CreateTestCase(TestCase):
 
         # deleting memberships
         webuser.delete_domain_membership(domain)
-        err = False
-        try:
+
+        with self.assertRaises(NotImplementedError):
             ccuser.delete_domain_membership(domain)
-        except NotImplementedError:
-            err = True
 
         self.assertEquals(webuser.is_member_of(domain), False)
+        self.assertEquals(webuser2.is_member_of(domain), False)
         self.assertEquals(ccuser.is_member_of(domain), True)
         self.assertEquals(ccuser.get_domain_membership(domain).domain, domain)
+
+        webuser.add_domain_membership(domain)
+        webuser.transfer_domain_membership(domain, webuser2)
+
+        self.assertEquals(webuser.is_member_of(domain), False)
+        self.assertEquals(webuser2.is_member_of(domain), True)
 
 
     def _runCreateUserFromRegistrationTest(self):
@@ -124,7 +133,7 @@ class CreateTestCase(TestCase):
         self.assertEqual(couch_user.username, format_username(self.username, self.domain))
         self.assertEqual(couch_user.domain, self.domain)
         self.assertEqual(couch_user.user_id, self.uuid)
-        date = datetime.date(datetime.strptime(self.date_string,'%Y-%m-%d'))
+        date = iso_string_to_date(self.date_string)
         self.assertEqual(couch_user.created_on, force_to_datetime(date))
         self.assertEqual(couch_user.device_ids[0], self.registering_device_id)
 

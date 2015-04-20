@@ -1,12 +1,10 @@
 from datetime import datetime
 import re
 from django.contrib import messages
-from django.core.mail import mail_admins
 from django.core.mail.message import EmailMessage
 from django.core.urlresolvers import reverse
 from django.db import transaction
 from django.db.models.aggregates import Count
-from django.db.models.query_utils import Q
 from django.http.response import Http404
 from django.shortcuts import redirect
 from django.template.loader import render_to_string
@@ -20,15 +18,21 @@ from corehq.apps.reports.dispatcher import AdminReportDispatcher
 from corehq.apps.reports.generic import GenericTabularReport, GetParamsMixin
 from corehq.apps.reports.standard import DatespanMixin
 from dimagi.utils.decorators.memoized import memoized
+from dimagi.utils.parsing import json_format_date
 from dimagi.utils.web import get_url_base
 from pillow_retry.models import PillowError
 from django.conf import settings
+from django.contrib.humanize.templatetags.humanize import naturaltime
 
 SOURCE_SINGLE = 'single'
 ACTION_RESET = 'reset'
 ACTION_DELETE = 'delete'
 ACTION_SEND = 'send'
 ACTIONS = [ACTION_RESET, ACTION_DELETE, ACTION_SEND]
+
+
+def safe_format_date(date):
+    return json_format_date(date) if date else date
 
 
 class PillowErrorsReport(GenericTabularReport, DatespanMixin, GetParamsMixin):
@@ -53,14 +57,15 @@ class PillowErrorsReport(GenericTabularReport, DatespanMixin, GetParamsMixin):
     @property
     def headers(self):
         return DataTablesHeader(
-            DataTablesColumn('Error ID', sortable=False),
-            DataTablesColumn('Doc ID', sortable=False),
+            DataTablesColumn('Error', sortable=False),
             DataTablesColumn('Pillow Class', sortable=True),
-            DataTablesColumn('Date created', sortable=True),
-            DataTablesColumn('Date last attempt', sortable=True),
-            DataTablesColumn('Date next attempt', sortable=True),
+            DataTablesColumn('Created', sortable=True),
+            DataTablesColumn('Next attempt', sortable=True),
             DataTablesColumn('Attempts (current / total)', sortable=True),
             DataTablesColumn('Error type', sortable=True),
+            DataTablesColumn('Doc type', sortable=False),
+            DataTablesColumn('Doc date', sortable=False),
+            DataTablesColumn('Domain(s)', sortable=False),
             DataTablesColumn('Select', sortable=False),
         )
 
@@ -91,7 +96,6 @@ class PillowErrorsReport(GenericTabularReport, DatespanMixin, GetParamsMixin):
         sort_fields = [
             'pillow',
             'date_created',
-            'date_last_attempt',
             'date_next_attempt',
             'current_attempt',
             'error_type'
@@ -146,33 +150,40 @@ class PillowErrorsReport(GenericTabularReport, DatespanMixin, GetParamsMixin):
         query = self.get_query()
         query = query.order_by(self.sort_field)
 
+        next_deploy = _('Next Deploy')
         errors = query[self.pagination.start:(self.pagination.start+self.pagination.count)]
         for error in errors:
             yield [
-                self.make_traceback_link(error),
                 self.make_search_link(error),
-                error.pillow,
-                error.date_created,
-                error.date_last_attempt,
-                error.date_next_attempt,
+                error.pillow.split('.')[-1],
+                naturaltime(error.date_created),
+                naturaltime(error.date_next_attempt) if error.has_next_attempt() else next_deploy,
                 '{0} / {1}'.format(error.current_attempt, error.total_attempts),
                 error.error_type,
+                error.doc_type,
+                safe_format_date(error.doc_date),
+                error.domains,
                 self.make_checkbox(error)
             ]
 
-    def make_traceback_link(self, error):
-        return '<a href="{0}?error={1}" target="_blank">{2}</a>'.format(
-            reverse(EditPillowError.urlname),
-            error.id,
-            error.id
-        )
-
     def make_search_link(self, error):
-        return '<a href="{0}?q={1}" target="_blank">{2}...{3}</a>'.format(
-            reverse("global_quick_find"),
-            error.doc_id,
-            error.doc_id[:5],
-            error.doc_id[-5:]
+        return (
+            '{text}<a href="{search_url}?q={doc_id}" target="_blank" title="{search_title}">'
+            '<i class="icon-search"></i></a>'
+            '&nbsp;<a href="{raw_url}?id={doc_id}" target="_blank" title="{raw_title}">'
+            '<i class="icon-file"></i></a>'
+            '&nbsp;<a href="{error_url}?error={error_id}" target="_blank" title="{error_title}">'
+            '<i class="icon-share"></i></a>'
+        ).format(
+            text='{}...'.format(error.doc_id[:5]),
+            search_url=reverse("global_quick_find"),
+            doc_id=error.doc_id,
+            search_title=_("Search HQ for this document: %(doc_id)s") % {'doc_id': error.doc_id},
+            raw_url=reverse("doc_in_es"),
+            raw_title=_("Open the raw document: %(doc_id)s") % {'doc_id': error.doc_id},
+            error_url=reverse(EditPillowError.urlname),
+            error_id=error.id,
+            error_title=_("View the details of this error: %(error_id)s") % {'error_id': error.id}
         )
 
     def make_checkbox(self, error):

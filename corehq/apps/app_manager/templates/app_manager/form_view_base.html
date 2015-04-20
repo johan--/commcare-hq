@@ -15,10 +15,6 @@
         .casexml ul {
             margin-left: 15px;
         }
-        .no-edit-select {
-            font-weight: bold;
-            color: #444;
-        }
         input[type="radio"]{
             margin: 3px 5px 5px 0px;
         }
@@ -73,21 +69,15 @@
         .indent {
             margin-left: 15px;
         }
-        .ko-no-edit-select {
-            font-weight: bold;
-            color: #444;
-        }
-        .code.ko-no-edit {
-            font-weight: normal;
-        }
     </style>
     {% endif %}
 {% endblock %}
 
 {% block js %}{{ block.super }}
     <script src="{% static 'hqwebapp/js/lib/select2/select2.js' %}"></script>
-    <script src="{% static 'hqwebapp/js/lib/knockout.mapping.js' %}"></script>
-    <script src="{% static 'hqwebapp/js/knockout-bindings.js' %}"></script>
+    <script src="{% static 'style/lib/knockout_plugins/knockout_mapping.ko.min.js' %}"></script>
+    <script src="{% static 'style/ko/knockout_bindings.ko.js' %}"></script>
+    <script src="{% static 'style/lib/jquery/plugins/jquery.caret-1.5.2.min.js' %}"></script>
 
     {% if app.application_version == '2.0' %}
         <script src="{% static 'app_manager/js/case-knockout-bindings.js' %}"></script>
@@ -105,11 +95,11 @@
 {% block js-inline %}{{ block.super }}
     {% include "hqwebapp/ko/value-or-none-ui.html" %}
     {% if not is_user_registration %}
-        {% if multimedia %}
-            {% include "app_manager/partials/nav_menu_media_js.html" %}
-        {% else %}
-            {% include "app_manager/partials/nav_menu_media_js.old.html" with item=form image_default="jr://file/commcare/image/form_name.png" audio_default="jr://file/commcare/audio/form_name.mp3" %}
-        {% endif %}
+        {% include "app_manager/partials/nav_menu_media_js_common.html" %}
+        {% include "app_manager/partials/nav_menu_media_js.html" with item=multimedia.menu %}
+    {% endif %}
+    {% if allow_form_workflow %}
+        <script src="{% static 'app_manager/js/form_workflow.js' %}"></script>
     {% endif %}
     <script>
         $(function(){
@@ -183,29 +173,36 @@
                 {% endif %}
 
                 {% if allow_form_workflow %}
-                    var workflow_labels = {
-                        default: "{% trans "Home Screen" %}",
-                        module: "{% trans "Module:" %} {{ module.name|trans:langs }}",
-                        previous_screen: "{% trans "Previous Screen" %}"
+                    var labels = {};
+                    labels[FormWorkflow.Values.DEFAULT] = "{% trans "Home Screen" %}";
+                    labels[FormWorkflow.Values.ROOT] = "{% trans "Module Menu" %}";
+                    labels[FormWorkflow.Values.MODULE] = "{% trans "Module:" %} {{ module.name|trans:langs }}";
+                    labels[FormWorkflow.Values.PREVIOUS_SCREEN] = "{% trans "Previous Screen" %}";
+
+                    var options = {
+                        labels: labels,
+                        workflow: '{{ form.post_form_workflow }}',
                     };
-                    var workflow_options = _.map(workflow_labels, function (label, value) {
-                        return {value: value, label: (value === 'default' ? '* ' + label : label)};
-                    });
-                    ko.applyBindings({
-                            workflow: ko.observable('{{ form.post_form_workflow }}'),
-                            form_workflow_options: workflow_options,
-                            workflow_display: workflow_labels["{{ form.post_form_workflow }}"]
-                        },
-                        $('#form-workflow').get(0)
-                    );
+                {% endif %}
+
+                {% if allow_form_workflow and request|toggle_enabled:"FORM_LINK_WORKFLOW"%}
+                    labels[FormWorkflow.Values.FORM] = "{% trans "Link to other form" %}";
+                    options.forms = {{ linkable_forms|JSON}}
+                    options.formLinks = {{ form.form_links|JSON }}
+                {% endif %}
+
+                {% if allow_form_workflow %}
+                    ko.applyBindings(new FormWorkflow(options), $('#form-workflow').get(0))
                 {% endif %}
 
                 ko.applyBindings({
                     auto_gps_capture: ko.observable({{ form.auto_gps_capture|JSON }})
                 }, $('#auto-gps-capture').get(0));
+                {% if request|toggle_enabled:'NO_VELLUM' %}
                 ko.applyBindings({
                     no_vellum: ko.observable({{ form.no_vellum|JSON }})
                 }, $('#no-vellum').get(0));
+                {% endif %}
 
             {% endif %}
 
@@ -216,6 +213,7 @@
                 $("#cloudcare-preview-url").attr("href", cloudCareUrl);
                 $('#cloudcare-preview-url').click(function(e) {
                     ga_track_event('CloudCare', 'Click "Try in CloudCare"');
+                    analytics.track('Cliked "Try in CloudCare"');
                 });
             {% endif %}
         {% endif %}
@@ -231,7 +229,7 @@
 
 {% block form-view %}
     <div id="build_errors"></div>
-    {% if edit and not is_user_registration %}
+    {% if not is_user_registration %}
         <div class="delete-me">
             <form action="{% url "delete_form" domain app.id module.unique_id form.unique_id %}" method="post">
                 <button type="submit" class="disable-on-submit btn btn-danger">
@@ -251,7 +249,6 @@
     {% endif %}
     </h3>
 
-    {% if edit %}
     <div class="btn-group">
         {% if not form.no_vellum %}
         <a id="edit_label" href="{% if is_user_registration %}
@@ -281,7 +278,6 @@
         {% endif %}
     </div>
     <hr/>
-    {% endif %}
 
     {% if is_user_registration %}
     <h4>{% trans "User Registration Properties" %}</h4>
@@ -362,7 +358,5 @@
 {% endblock %}
 
 {% block modals %}{{ block.super }}
-{% if multimedia %}
-    {% include "app_manager/partials/nav_menu_media_modals.html" %}
-{% endif %}
+{% include "app_manager/partials/nav_menu_media_modals.html" %}
 {% endblock modals %}

@@ -1,11 +1,29 @@
 import calendar
+from django.core.urlresolvers import reverse
+from corehq.apps.accounting.async_handlers import (
+    SubscriberFilterAsyncHandler,
+    SubscriptionFilterAsyncHandler,
+    AccountFilterAsyncHandler,
+    BillingContactInfoAsyncHandler,
+    SoftwarePlanAsyncHandler,
+)
 from corehq.apps.accounting.models import *
 from corehq.apps.reports.filters.base import (
     BaseReportFilter, BaseSingleOptionFilter
 )
 from corehq.apps.reports.filters.search import SearchFilter
+from corehq.util.dates import iso_string_to_date
 from dimagi.utils.dates import DateSpan
 from django.utils.translation import ugettext_noop as _
+
+
+class BaseAccountingSingleOptionFilter(BaseSingleOptionFilter):
+    is_paginated = True
+
+    @property
+    def pagination_source(self):
+        from corehq.apps.accounting.views import AccountingSingleOptionResponseView
+        return reverse(AccountingSingleOptionResponseView.urlname)
 
 
 class AccountTypeFilter(BaseSingleOptionFilter):
@@ -15,14 +33,12 @@ class AccountTypeFilter(BaseSingleOptionFilter):
     options = BillingAccountType.CHOICES
 
 
-class NameFilter(BaseSingleOptionFilter):
+class NameFilter(BaseAccountingSingleOptionFilter):
     slug = 'account_name'
     label = _("Account Name")
     default_text = _("All")
-
-    @property
-    def options(self):
-        return [(account.name, account.name) for account in BillingAccount.objects.all()]
+    async_handler = AccountFilterAsyncHandler
+    async_action = 'account_name'
 
 
 def clean_options(options):
@@ -33,37 +49,28 @@ def clean_options(options):
     return sorted([_ for _ in set(cleaned_options)])
 
 
-class SalesforceAccountIDFilter(BaseSingleOptionFilter):
+class SalesforceAccountIDFilter(BaseAccountingSingleOptionFilter):
     slug = 'salesforce_account_id'
     label = _("Salesforce Account ID")
     default_text = _("Any")
-
-    @property
-    def options(self):
-        return clean_options([(account.salesforce_account_id, account.salesforce_account_id)
-                              for account in BillingAccount.objects.all()])
+    async_handler = AccountFilterAsyncHandler
+    async_action = 'account_id'
 
 
-class SubscriberFilter(BaseSingleOptionFilter):
+class SubscriberFilter(BaseAccountingSingleOptionFilter):
     slug = 'subscriber'
     label = _('Project Space')
     default_text = _("Any")
-
-    @property
-    def options(self):
-        return clean_options([(subscription.subscriber.domain, subscription.subscriber.domain)
-                              for subscription in Subscription.objects.all()])
+    async_handler = SubscriberFilterAsyncHandler
+    async_action = 'subscriber'
 
 
-class SalesforceContractIDFilter(BaseSingleOptionFilter):
+class SalesforceContractIDFilter(BaseAccountingSingleOptionFilter):
     slug = 'salesforce_contract_id'
     label = _('Salesforce Contract ID')
     default_text = _("Any")
-
-    @property
-    def options(self):
-        return clean_options([(subscription.salesforce_contract_id, subscription.salesforce_contract_id)
-                              for subscription in Subscription.objects.all()])
+    async_handler = SubscriptionFilterAsyncHandler
+    async_action = 'contract_id'
 
 
 class ActiveStatusFilter(BaseSingleOptionFilter):
@@ -78,15 +85,19 @@ class ActiveStatusFilter(BaseSingleOptionFilter):
     ]
 
 
-class DimagiContactFilter(BaseSingleOptionFilter):
+class DimagiContactFilter(BaseAccountingSingleOptionFilter):
     slug = 'dimagi_contact'
     label = _('Dimagi Contact')
     default_text = _("Any")
+    async_handler = AccountFilterAsyncHandler
+    async_action = 'dimagi_contact'
 
-    @property
-    def options(self):
-        return clean_options([(account.dimagi_contact, account.dimagi_contact)
-                             for account in BillingAccount.objects.all()])
+
+class EntryPointFilter(BaseSingleOptionFilter):
+    slug = 'entry_point'
+    label = _('Entry Point')
+    default_text = _("Any")
+    options = EntryPoint.CHOICES
 
 
 INVOICE = "SEND_INVOICE"
@@ -113,6 +124,20 @@ class TrialStatusFilter(BaseSingleOptionFilter):
         (TRIAL, _("Show Non-Trial Subscriptions")),
         (NON_TRIAL, _("Show Only Trial Subscriptions")),
     ]
+
+
+class SubscriptionTypeFilter(BaseSingleOptionFilter):
+    slug = 'service_type'
+    label = _("Type")
+    default_text = _("Any")
+    options = SubscriptionType.CHOICES
+
+
+class ProBonoStatusFilter(BaseSingleOptionFilter):
+    slug = 'pro_bono_status'
+    label = _("Pro-Bono")
+    default_text = _("Any")
+    options = ProBonoStatus.CHOICES
 
 
 class IsHiddenFilter(BaseSingleOptionFilter):
@@ -146,6 +171,9 @@ class DateRangeFilter(BaseReportFilter):
     template = 'reports/filters/daterange.html'
     default_days = 7
 
+    START_DATE = 'startdate'
+    END_DATE = 'enddate'
+
     @property
     def datepicker_config(self):
         return {
@@ -169,23 +197,31 @@ class DateRangeFilter(BaseReportFilter):
     def get_date(cls, request, date_type):
         date_str = cls.get_date_str(request, date_type)
         if date_str is not None:
-            return datetime.datetime.strptime(date_str, "%Y-%m-%d")
+            try:
+                return datetime.datetime.combine(
+                    iso_string_to_date(date_str), datetime.time())
+            except ValueError:
+                if date_type == cls.START_DATE:
+                    return datetime.datetime.today() - datetime.timedelta(days=cls.default_days)
+                elif date_type == cls.END_DATE:
+                    return datetime.datetime.today()
+                else:
+                    return None
         else:
             return None
 
     @classmethod
     def get_start_date(cls, request):
-        return cls.get_date(request, 'startdate')
+        return cls.get_date(request, cls.START_DATE)
 
     @classmethod
     def get_end_date(cls, request):
-        return cls.get_date(request, 'enddate')
+        return cls.get_date(request, cls.END_DATE)
 
     @property
     def datespan(self):
         datespan = DateSpan.since(self.default_days,
                                   enddate=datetime.date.today(),
-                                  format="%Y-%m-%d",
                                   timezone=self.timezone)
         if self.get_start_date(self.request) is not None:
             datespan.startdate = self.get_start_date(self.request)
@@ -193,12 +229,26 @@ class DateRangeFilter(BaseReportFilter):
             datespan.enddate = self.get_end_date(self.request)
         return datespan
 
+    @classmethod
+    def shared_pagination_GET_params(cls, request):
+        return [
+            {'name': '%s_%s' % (cls.slug, date), 'value': cls.get_date_str(request, date)}
+            for date in [cls.START_DATE, cls.END_DATE]
+        ]
+
 
 class OptionalFilterMixin(object):
     @classmethod
     def use_filter(cls, request):
-        return request.GET.get(
-            "report_filter_%s_use_filter" % cls.slug, None) == 'on'
+        return cls.optional_filter_string_value(request) == 'on'
+
+    @classmethod
+    def optional_filter_slug(cls):
+        return "report_filter_%s_use_filter" % cls.slug
+
+    @classmethod
+    def optional_filter_string_value(cls, request):
+        return request.GET.get(cls.optional_filter_slug(), None)
 
 
 class OptionalDateRangeFilter(DateRangeFilter, OptionalFilterMixin):
@@ -261,7 +311,7 @@ class OptionalMonthYearFilter(BaseReportFilter, OptionalFilterMixin):
     @classmethod
     def months(cls):
         month_pairs = []
-        for month_number in range(12):
+        for month_number in range(1, 13):
             month_pairs.append({
                 'name': calendar.month_name[month_number],
                 'value': month_number,
@@ -292,14 +342,12 @@ class DueDatePeriodFilter(OptionalMonthYearFilter):
     label = _("Due Date")
 
 
-class SoftwarePlanNameFilter(BaseSingleOptionFilter):
+class SoftwarePlanNameFilter(BaseAccountingSingleOptionFilter):
     slug = 'plan_name'
     label = _("Plan Name")
     default_text = _("All")
-
-    @property
-    def options(self):
-        return clean_options([(account.name, account.name) for account in SoftwarePlan.objects.all()])
+    async_handler = SoftwarePlanAsyncHandler
+    async_action = 'name'
 
 
 class SoftwarePlanEditionFilter(BaseSingleOptionFilter):
@@ -328,24 +376,15 @@ class PaymentStatusFilter(BaseSingleOptionFilter):
     )
 
 
-class BillingContactFilter(BaseSingleOptionFilter):
+class BillingContactFilter(BaseAccountingSingleOptionFilter):
     slug = 'billing_contact'
     label = _("Billing Contact Name")
     default_text = _("All")
-
-    @property
-    def options(self):
-        return clean_options(
-            [
-                (contact.full_name, contact.full_name)
-                for contact in BillingContactInfo.objects.all()
-                if contact.first_name or contact.last_name
-            ]
-        )
+    async_handler = BillingContactInfoAsyncHandler
+    async_action = 'contact_name'
 
 
 class PaymentTransactionIdFilter(SearchFilter):
     slug = "transaction_id"
     label = _("Transaction ID")
     search_help_inline = _("Usually begins with 'ch_'")
-

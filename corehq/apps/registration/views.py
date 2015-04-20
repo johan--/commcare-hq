@@ -154,17 +154,12 @@ def register_domain(request, domain_type=None):
             if is_new:
                 context.update({
                     'alert_message': _("An email has been sent to %s.") % request.user.username,
-                    'requested_domain': requested_domain
+                    'requested_domain': requested_domain,
+                    'track_domain_registration': True,
                 })
                 return render(request, 'registration/confirmation_sent.html',
                         context)
             else:
-                messages.success(request, _(
-                    '<strong>The project {project} was successfully created!</strong> '
-                    'An email has been sent to {user} for your records.').format(
-                    project=requested_domain, user=request.user.username),
-                    extra_tags="html")
-
                 if nextpage:
                     return HttpResponseRedirect(nextpage)
                 if referer_url:
@@ -284,9 +279,11 @@ def confirm_domain(request, guid=None):
     context['message_body'] = _(
         'Your account has been successfully activated.  Thank you for taking '
         'the time to confirm your email address: %s.'
-    ) % requesting_user.username 
+    ) % requesting_user.username
     context['is_error'] = False
+    context['valid_confirmation'] = True
     return render(request, 'registration/confirmation_complete.html', context)
+
 
 @retry_resource(3)
 def eula_agreement(request):

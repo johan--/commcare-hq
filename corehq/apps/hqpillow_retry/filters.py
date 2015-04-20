@@ -11,10 +11,10 @@ class PillowErrorFilter(BaseDrilldownOptionFilter):
 
     @property
     def drilldown_map(self):
-        def err_item(val, val_count, next_list=None):
+        def err_item(val, name, val_count, next_list=None):
             ret = {
                 'val': val,
-                'text': '{} ({})'.format(val, val_count)
+                'text': '{} ({})'.format(name, val_count)
             }
             if next_list:
                 ret['next'] = next_list
@@ -28,10 +28,13 @@ class PillowErrorFilter(BaseDrilldownOptionFilter):
             pillow = row['pillow']
             error = row['error_type']
             count = row['num_errors']
-            data_map[pillow].append(err_item(error, count))
+            data_map[pillow].append(err_item(error, error, count))
             pillow_counts[pillow] += count
 
-        return [err_item(pillow, pillow_counts[pillow], errors) for pillow, errors in data_map.items()]
+        return [
+            err_item(pillow, pillow.split('.')[-1], pillow_counts[pillow], errors)
+            for pillow, errors in data_map.items()
+        ]
 
     @classmethod
     def get_labels(cls):

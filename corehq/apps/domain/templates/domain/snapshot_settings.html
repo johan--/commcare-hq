@@ -30,11 +30,8 @@
     </script>
     <script>
         function view_on_exchange(version_name) {
-            return ! ga_track_event('Exchange', 'View on exchange', version_name, {
-                'hitCallback': function () {
-                    document.location = $('#view-on-exchange').attr('href');
-                }
-            });
+            gaTrackLink($('#view-on-exchange'), 'Exchange', 'View on exchange', version_name);
+            return false;
         }
 
         $(document).ready(function() {
@@ -43,11 +40,7 @@
                     ga_track_event('Exchange', 'Publish Previous Version', '{{ snapshot.name }}');
                 });
                 $('#view_{{ snapshot.name }}').click(function() {
-                    ga_track_event('Exchange', 'View', '{{ snapshot.name }}', {
-                        'hitCallback': function () {
-                            document.location = $('#view_{{ snapshot.name }}').attr('href');
-                        }
-                    });
+                    gaTrackLink($('#view_{{ snapshot.name }}'), 'Exchange', 'View', '{{ snapshot.name }}');
                 });
             {% endfor %}
         });
@@ -96,7 +89,7 @@
                 </a>
             </td>
             <td>{{ snapshot.snapshot_time }}</td>
-            <td>{{ snapshot.get_license_display }}</td>
+            <td><a href="{{ project.get_license_url }}">{{ project.get_license_display }}</a> </td>
             {% if snapshot.published %}
             <td>
                 {% if snapshot.is_approved %}

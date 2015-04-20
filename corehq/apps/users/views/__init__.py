@@ -4,11 +4,18 @@ import re
 import urllib
 from django.utils.decorators import method_decorator
 from django.views.decorators.debug import sensitive_post_parameters
-from corehq import Domain, privileges
+from djangular.views.mixins import allow_remote_invocation, JSONResponseMixin
+from corehq import Domain, privileges, toggles
 from corehq.apps.accounting.utils import domain_has_privilege
 from corehq.apps.domain.views import BaseDomainView
 from corehq.apps.sms.mixin import BadSMSConfigException
+from corehq.apps.style.decorators import (
+    check_preview_bootstrap3,
+    use_knockout_js,
+)
 from corehq.apps.users.decorators import require_can_edit_web_users, require_permission_to_edit_user
+from corehq.apps.users.util import smart_query_string
+from corehq.elastic import ADD_TO_ES_FILTER, es_query, ES_URLS
 from dimagi.utils.decorators.memoized import memoized
 from django_prbac.exceptions import PermissionDenied
 from django_prbac.utils import ensure_request_has_privilege
@@ -19,7 +26,7 @@ from couchdbkit.exceptions import ResourceNotFound
 from dimagi.utils.couch.database import get_db
 from django.contrib.auth.forms import SetPasswordForm
 from django.core.urlresolvers import reverse
-from django.http import Http404, HttpResponseRedirect, HttpResponse, HttpResponseForbidden
+from django.http import Http404, HttpResponseRedirect, HttpResponse
 from django.shortcuts import render
 from django.template.loader import render_to_string
 from django.views.decorators.http import require_POST
@@ -103,7 +110,10 @@ class DefaultProjectUserSettingsView(BaseUserSettingsView):
                 if user.has_permission(self.domain, 'edit_commcare_users'):
                     redirect = reverse("commcare_users", args=[self.domain])
                 elif user.has_permission(self.domain, 'edit_web_users'):
-                    redirect = reverse(ListWebUsersView.urlname, args=[self.domain])
+                    redirect = reverse(
+                        get_web_user_list_view(self.request).urlname,
+                        args=[self.domain]
+                    )
         return redirect
 
     def get(self, request, *args, **kwargs):
@@ -123,9 +133,10 @@ class BaseEditUserView(BaseUserSettingsView):
 
     @property
     def parent_pages(self):
+        list_view = get_web_user_list_view(self.request)
         return [{
-            'title': ListWebUsersView.page_title,
-            'url': reverse(ListWebUsersView.urlname, args=[self.domain]),
+            'title': list_view.page_title,
+            'url': reverse(list_view.urlname, args=[self.domain]),
         }]
 
     @property
@@ -176,10 +187,14 @@ class BaseEditUserView(BaseUserSettingsView):
     def commtrack_form(self):
         if self.request.method == "POST" and self.request.POST['form_type'] == "commtrack":
             return CommtrackUserForm(self.request.POST, domain=self.domain)
+
         user_domain_membership = self.editable_user.get_domain_membership(self.domain)
         linked_loc = user_domain_membership.location_id
         linked_prog = user_domain_membership.program_id
-        return CommtrackUserForm(domain=self.domain, is_admin=self.request.couch_user.is_domain_admin(self.domain), initial={'supply_point': linked_loc, 'program_id': linked_prog})
+        return CommtrackUserForm(
+            domain=self.domain,
+            initial={'location': linked_loc, 'program_id': linked_prog}
+        )
 
     def update_user(self):
         if self.form_user_update.is_valid():
@@ -197,8 +212,9 @@ class BaseEditUserView(BaseUserSettingsView):
 
     def post(self, request, *args, **kwargs):
         if self.request.POST['form_type'] == "commtrack":
-            self.editable_user.get_domain_membership(self.domain).location_id = self.request.POST['supply_point']
-            self.editable_user.get_domain_membership(self.domain).program_id = self.request.POST['program_id']
+            self.editable_user.get_domain_membership(self.domain).location_id = self.request.POST['location']
+            if self.request.project.commtrack_enabled:
+                self.editable_user.get_domain_membership(self.domain).program_id = self.request.POST['program_id']
             self.editable_user.save()
         elif self.request.POST['form_type'] == "update-user":
             if all([self.update_user(), self.custom_user_is_valid()]):
@@ -353,6 +369,155 @@ class EditMyAccountDomainView(BaseFullEditUserView):
             return HttpResponseRedirect(reverse(EditCommCareUserView.urlname, args=[self.domain, self.editable_user_id]))
         return super(EditMyAccountDomainView, self).get(request, *args, **kwargs)
 
+
+class NewListWebUsersView(JSONResponseMixin, BaseUserSettingsView):
+    template_name = 'users/web_users.b3.html'
+    page_title = ugettext_lazy("Web Users & Roles")
+    urlname = 'web_users_b3'
+
+    @method_decorator(check_preview_bootstrap3())
+    @method_decorator(use_knockout_js())
+    @method_decorator(require_can_edit_web_users)
+    def dispatch(self, request, *args, **kwargs):
+        return super(NewListWebUsersView, self).dispatch(request, *args, **kwargs)
+
+    def query_es(self, limit, skip, query=None):
+        is_simple, query = smart_query_string(query or '')
+
+        web_user_filter = [
+            {"term": {"user.domain_memberships.domain": self.domain}},
+        ]
+        web_user_filter.extend(ADD_TO_ES_FILTER['web_users'])
+
+        default_fields = ["username", "last_name", "first_name"]
+        q = {
+            "query": {"query_string": {
+                "query": query,
+                "default_operator": "AND",
+                "fields": default_fields if is_simple else None
+            }},
+            "filter": {"and": web_user_filter},
+            "sort": {'username.exact': 'asc'},
+        }
+        return es_query(
+            params={}, q=q, es_url=ES_URLS["users"],
+            size=limit, start_at=skip,
+        )
+
+    def apply_teams_to_users(self, web_users):
+        teams = Team.get_by_domain(self.domain)
+        for team in teams:
+            for user in team.get_members():
+                if user.get_id not in [web_user.get_id for web_user in web_users]:
+                    user.from_team = True
+                    web_users.append(user)
+        for user in web_users:
+            user.current_domain = self.domain
+
+    @allow_remote_invocation
+    def get_users(self, in_data):
+        if not isinstance(in_data, dict):
+            return {
+                'success': False,
+                'error': _("Please provide pagination info."),
+            }
+        try:
+            limit = in_data.get('limit', 10)
+            page = in_data.get('page', 1)
+            skip = limit * (page - 1)
+            query = in_data.get('query')
+
+            web_users_query = self.query_es(limit, skip, query=query)
+            total = web_users_query.get('hits', {}).get('total', 0)
+            results = web_users_query.get('hits', {}).get('hits', [])
+
+            web_users = [WebUser.wrap(w['_source']) for w in results]
+            self.apply_teams_to_users(web_users)  # for roles
+
+            def _fmt_result(domain, u):
+                return {
+                    'email': u.email,
+                    'domain': domain,
+                    'name': u.full_name,
+                    'role': u.role_label(),
+                    'phoneNumbers': u.phone_numbers,
+                    'id': u.get_id,
+                    'editUrl': reverse('user_account', args=[domain, u.get_id]),
+                    'removeUrl': (
+                        reverse('remove_web_user', args=[domain, u.user_id])
+                        if self.request.user.username != u.username else None
+                    ),
+                }
+            web_users_fmt = [_fmt_result(self.domain, u) for u in web_users]
+
+            return {
+                'response': {
+                    'users': web_users_fmt,
+                    'total': total,
+                    'page': page,
+                    'query': query,
+                },
+                'success': True,
+            }
+        except Exception as e:
+            return {
+                'error': e.message,
+                'success': False,
+            }
+
+    @property
+    @memoized
+    def user_roles(self):
+        user_roles = [AdminUserRole(domain=self.domain)]
+        user_roles.extend(sorted(
+            UserRole.by_domain(self.domain),
+            key=lambda role: role.name if role.name else u'\uFFFF'
+        ))
+
+        #  indicate if a role has assigned users, skip admin role
+        for i in range(1, len(user_roles)):
+            role = user_roles[i]
+            role.__setattr__('hasUsersAssigned',
+                             True if len(role.ids_of_assigned_users) > 0 else False)
+        return user_roles
+
+    @property
+    def can_edit_roles(self):
+        try:
+            ensure_request_has_privilege(self.request, privileges.ROLE_BASED_ACCESS)
+        except PermissionDenied:
+            return False
+        return self.couch_user.is_domain_admin
+
+    @property
+    @memoized
+    def role_labels(self):
+        role_labels = {}
+        for r in self.user_roles:
+            key = 'user-role:%s' % r.get_id if r.get_id else r.get_qualified_id()
+            role_labels[key] = r.name
+        return role_labels
+
+    @property
+    @memoized
+    def invitations(self):
+        invitations = DomainInvitation.by_domain(self.domain)
+        for invitation in invitations:
+            invitation.role_label = self.role_labels.get(invitation.role, "")
+        return invitations
+
+    @property
+    def page_context(self):
+        return {
+            'user_roles': self.user_roles,
+            'can_edit_roles': self.can_edit_roles,
+            'default_role': UserRole.get_default(),
+            'report_list': get_possible_reports(self.domain),
+            'invitations': self.invitations,
+            'domain_object': self.domain_object,
+        }
+
+
 class ListWebUsersView(BaseUserSettingsView):
     template_name = 'users/web_users.html'
     page_title = ugettext_lazy("Web Users & Roles")
@@ -429,6 +594,12 @@ class ListWebUsersView(BaseUserSettingsView):
         }
 
 
+def get_web_user_list_view(request):
+    if toggles.PAGINATE_WEB_USERS.enabled(request.couch_user.username):
+        return NewListWebUsersView
+    return ListWebUsersView
+
+
 @require_can_edit_web_users
 @require_POST
 def remove_web_user(request, domain, couch_user_id):
@@ -442,7 +613,10 @@ def remove_web_user(request, domain, couch_user_id):
             username=user.username,
             url=reverse('undo_remove_web_user', args=[domain, record.get_id])
         ), extra_tags="html")
-    return HttpResponseRedirect(reverse(ListWebUsersView.urlname, args=[domain]))
+
+    return HttpResponseRedirect(
+        reverse(get_web_user_list_view(request).urlname, args=[domain]))
+
 
 @require_can_edit_web_users
 def undo_remove_web_user(request, domain, record_id):
@@ -451,7 +625,10 @@ def undo_remove_web_user(request, domain, record_id):
     messages.success(request, 'You have successfully restored {username}.'.format(
         username=WebUser.get_by_user_id(record.user_id).username
     ))
-    return HttpResponseRedirect(reverse(ListWebUsersView.urlname, args=[domain]))
+
+    return HttpResponseRedirect(
+        reverse(get_web_user_list_view(request).urlname, args=[domain]))
+
 
 # If any permission less than domain admin were allowed here, having that permission would give you the permission
 # to change the permissions of your own role such that you could do anything, and would thus be equivalent to having
@@ -461,7 +638,7 @@ def undo_remove_web_user(request, domain, record_id):
 def post_user_role(request, domain):
     if not domain_has_privilege(domain, privileges.ROLE_BASED_ACCESS):
         return json_response({})
-    role_data = json.loads(request.raw_post_data)
+    role_data = json.loads(request.body)
     role_data = dict([(p, role_data[p]) for p in set(UserRole.properties().keys() + ['_id', '_rev']) if p in role_data])
     role = UserRole.wrap(role_data)
     role.domain = domain
@@ -538,12 +715,13 @@ def reinvite_web_user(request, domain):
     invitation_id = request.POST['invite']
     try:
         invitation = DomainInvitation.get(invitation_id)
-        invitation.invited_on = datetime.now()
+        invitation.invited_on = datetime.utcnow()
         invitation.save()
         invitation.send_activation_email()
         return json_response({'response': _("Invitation resent"), 'status': 'ok'})
     except ResourceNotFound:
         return json_response({'response': _("Error while attempting resend"), 'status': 'error'})
+
 
 @require_POST
 @require_can_edit_web_users
@@ -562,9 +740,10 @@ class BaseManageWebUserView(BaseUserSettingsView):
 
     @property
     def parent_pages(self):
+        list_view = get_web_user_list_view(self.request)
         return [{
-            'title': ListWebUsersView.page_title,
-            'url': reverse(ListWebUsersView.urlname, args=[self.domain]),
+            'title': list_view.page_title,
+            'url': reverse(list_view.urlname, args=[self.domain]),
         }]
 
 
@@ -605,7 +784,10 @@ class InviteWebUserView(BaseManageWebUserView):
             invite.save()
             invite.send_activation_email()
             messages.success(request, "Invitation sent to %s" % invite.email)
-            return HttpResponseRedirect(reverse(ListWebUsersView.urlname, args=[self.domain]))
+            return HttpResponseRedirect(reverse(
+                get_web_user_list_view(self.request).urlname,
+                args=[self.domain]
+            ))
         return self.get(request, *args, **kwargs)
 
 
@@ -628,6 +810,7 @@ def make_phone_number_default(request, domain, couch_user_id):
         redirect = reverse(EditMyAccountDomainView.urlname, args=[domain])
     return HttpResponseRedirect(redirect)
 
+
 @require_POST
 @require_permission_to_edit_user
 def delete_phone_number(request, domain, couch_user_id):
@@ -646,6 +829,7 @@ def delete_phone_number(request, domain, couch_user_id):
     else:
         redirect = reverse(EditMyAccountDomainView.urlname, args=[domain])
     return HttpResponseRedirect(redirect)
+
 
 @require_permission_to_edit_user
 def verify_phone_number(request, domain, couch_user_id):
@@ -675,30 +859,6 @@ def verify_phone_number(request, domain, couch_user_id):
     return HttpResponseRedirect(redirect)
 
 
-#@require_POST
-#@require_permission_to_edit_user
-#def link_commcare_account_to_user(request, domain, couch_user_id, commcare_login_id):
-#    user = WebUser.get_by_user_id(couch_user_id, domain)
-#    if 'commcare_couch_user_id' not in request.POST:
-#        return Http404("Poorly formed link request")
-#    user.link_commcare_account(domain,
-#                               request.POST['commcare_couch_user_id'],
-#                               commcare_login_id)
-#    return HttpResponseRedirect(reverse("user_account", args=(domain, couch_user_id)))
-#
-#@require_POST
-#@require_permission_to_edit_user
-#def unlink_commcare_account(request, domain, couch_user_id, commcare_user_index):
-#    user = WebUser.get_by_user_id(couch_user_id, domain)
-#    if commcare_user_index:
-#        user.unlink_commcare_account(domain, commcare_user_index)
-#        user.save()
-#    return HttpResponseRedirect(reverse("user_account", args=(domain, couch_user_id )))
-
-#@login_and_domain_required
-#def my_domains(request, domain):
-#    return HttpResponseRedirect(reverse("domain_accounts", args=(domain, request.couch_user._id)))
-
 @require_superuser
 @login_and_domain_required
 def domain_accounts(request, domain, couch_user_id, template="users/domain_accounts.html"):
@@ -708,9 +868,10 @@ def domain_accounts(request, domain, couch_user_id, template="users/domain_accou
         domain = request.POST['domain']
         couch_user.add_domain_membership(domain)
         couch_user.save()
-        messages.success(request,'Domain added')
+        messages.success(request, 'Domain added')
     context.update({"user": request.user})
     return render(request, template, context)
+
 
 @require_POST
 @require_superuser
@@ -756,7 +917,6 @@ def test_httpdigest(request, domain):
 
 @require_superuser
 def audit_logs(request, domain):
-    from auditcare.models import NavigationEventAudit
     usernames = [user.username for user in WebUser.by_domain(domain)]
     data = {}
     for username in usernames:
@@ -774,6 +934,7 @@ def audit_logs(request, domain):
             except Exception:
                 pass
     return json_response(data)
+
 
 @domain_admin_required
 @require_POST

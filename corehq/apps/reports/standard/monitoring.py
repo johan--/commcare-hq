@@ -1,19 +1,16 @@
-from _collections import defaultdict
+from collections import defaultdict
 import datetime
 from urllib import urlencode
-import dateutil
-from django.core.urlresolvers import reverse
 import math
 from django.db.models.aggregates import Max, Min, Avg, StdDev, Count
 import operator
-import pytz
 from corehq.apps.es import filters
 from corehq.apps.es.cases import CaseES
 from corehq.apps.es.forms import FormES
 from corehq.apps.reports import util
 from corehq.apps.reports.filters.users import ExpandedMobileWorkerFilter as EMWF
 from corehq.apps.reports.standard import ProjectReportParametersMixin, \
-    DatespanMixin, ProjectReport, DATE_FORMAT
+    DatespanMixin, ProjectReport
 from corehq.apps.reports.filters.forms import CompletionOrSubmissionTimeFilter, FormsByApplicationFilter, SingleFormByApplicationFilter, MISSING_APP_ID
 from corehq.apps.reports.datatables import DataTablesHeader, DataTablesColumn, DTSortType, DataTablesColumnGroup
 from corehq.apps.reports.generic import GenericTabularReport
@@ -22,12 +19,13 @@ from corehq.apps.sofabed.models import FormData, CaseData
 from corehq.apps.users.models import CommCareUser
 from corehq.elastic import es_query
 from corehq.pillows.mappings.case_mapping import CASE_INDEX
+from corehq.util.dates import iso_string_to_datetime
+from corehq.util.timezones.conversions import ServerTime, PhoneTime
+from corehq.util.view_utils import absolute_reverse
 from dimagi.utils.couch.database import get_db
 from dimagi.utils.dates import DateSpan, today_or_tomorrow
 from dimagi.utils.decorators.memoized import memoized
-from dimagi.utils.parsing import string_to_datetime
-from dimagi.utils.timezones import utils as tz_utils
-from dimagi.utils.web import get_url_base
+from dimagi.utils.parsing import string_to_datetime, json_format_date
 from django.utils.translation import ugettext as _
 from django.utils.translation import ugettext_noop
 
@@ -36,15 +34,18 @@ class WorkerMonitoringReportTableBase(GenericTabularReport, ProjectReport, Proje
     exportable = True
 
     def get_raw_user_link(self, user):
-        from corehq.apps.reports.standard.cases.basic import CaseListReport
         user_link_template = '<a href="%(link)s?%(params)s">%(username)s</a>'
         user_link = user_link_template % {
-            'link': "%s%s" % (get_url_base(),
-                              CaseListReport.get_url(domain=self.domain)),
+            'link': self.raw_user_link_url,
             'params': urlencode(EMWF.for_user(user.user_id)),
             'username': user.username_in_report,
         }
         return user_link
+
+    @property
+    def raw_user_link_url(self):
+        from corehq.apps.reports.standard.cases.basic import CaseListReport
+        return CaseListReport.get_url(domain=self.domain)
 
     def get_user_link(self, user):
         user_link = self.get_raw_user_link(user)
@@ -88,6 +89,13 @@ class CaseActivityReport(WorkerMonitoringReportTableBase):
     emailable = True
     description = ugettext_noop("Followup rates on active cases.")
     is_cacheable = True
+
+    @classmethod
+    def display_in_dropdown(cls, domain=None, project=None, user=None):
+        if project and project.commtrack_enabled:
+            return False
+        else:
+            return True
 
     @property
     def special_notice(self):
@@ -182,7 +190,17 @@ class CaseActivityReport(WorkerMonitoringReportTableBase):
     @property
     @memoized
     def utc_now(self):
-        return tz_utils.adjust_datetime_to_timezone(datetime.datetime.utcnow(), self.timezone.zone, pytz.utc.zone)
+        # Fun story:
+        # this function was wrong since 2012. Through a convoluted series
+        # of refactors where no one was really thinking hard about this
+        # it at some point morphed into translating by self.timezone
+        # in the opposite direction.
+        # Additionally, when I (Danny) re-wrote this report in 2012
+        # I had no conception that the dates were suffering from this
+        # timezone stripping problem, and so I hadn't factored that in.
+        # As a result, this was two timezones off from correct
+        # and no one noticed all these years...
+        return datetime.datetime.utcnow()
 
     @property
     def headers(self):
@@ -262,9 +280,11 @@ class CaseActivityReport(WorkerMonitoringReportTableBase):
         if closed is not None:
             kwargs['closed'] = bool(closed)
         if modified_after:
-            kwargs['modified_on__gte'] = modified_after
+            kwargs['modified_on__gte'] = ServerTime(modified_after).phone_time(self.timezone).done()
         if modified_before:
-            kwargs['modified_on__lt'] = modified_before
+            kwargs['modified_on__lt'] = ServerTime(modified_before).phone_time(self.timezone).done()
+        if self.case_type:
+            kwargs['type'] = self.case_type
 
         qs = CaseData.objects.filter(
             domain=self.domain,
@@ -286,6 +306,13 @@ class SubmissionsByFormReport(WorkerMonitoringReportTableBase,
     emailable = True
     is_cacheable = True
     description = ugettext_noop("Number of submissions by form.")
+
+    @classmethod
+    def display_in_dropdown(cls, domain=None, project=None, user=None):
+        if project and project.commtrack_enabled:
+            return False
+        else:
+            return True
 
     @property
     def headers(self):
@@ -335,7 +362,7 @@ class SubmissionsByFormReport(WorkerMonitoringReportTableBase,
                 row_sum = sum(row)
                 row = (
                     [self.get_user_link(user)] +
-                    [self.table_cell(row_data) for row_data in row] +
+                    [self.table_cell(row_data, zerostyle=True) for row_data in row] +
                     [self.table_cell(row_sum, "<strong>%s</strong>" % row_sum)]
                 )
                 totals = [totals[i] + col.get('sort_key')
@@ -392,6 +419,14 @@ class DailyFormStatsReport(WorkerMonitoringReportTableBase, CompletionOrSubmissi
     emailable = True
     is_cacheable = False
     ajax_pagination = True
+    exportable_all = True
+
+    @classmethod
+    def display_in_dropdown(cls, domain=None, project=None, user=None):
+        if project and project.commtrack_enabled:
+            return False
+        else:
+            return True
 
     @property
     @memoized
@@ -405,7 +440,7 @@ class DailyFormStatsReport(WorkerMonitoringReportTableBase, CompletionOrSubmissi
     def headers(self):
         headers = DataTablesHeader(DataTablesColumn(_("Username"), span=3))
         for d in self.dates:
-            headers.add_column(DataTablesColumn(d.strftime(DATE_FORMAT), sort_type=DTSortType.NUMERIC))
+            headers.add_column(DataTablesColumn(json_format_date(d), sort_type=DTSortType.NUMERIC))
         headers.add_column(DataTablesColumn(_("Total"), sort_type=DTSortType.NUMERIC))
         return headers
 
@@ -549,12 +584,17 @@ class DailyFormStatsReport(WorkerMonitoringReportTableBase, CompletionOrSubmissi
         count_field = '%s__count' % self.date_field
         counts_by_date = dict((result['date'].isoformat(), result[count_field]) for result in results)
         date_cols = [
-            counts_by_date.get(date.strftime(DATE_FORMAT), 0)
+            counts_by_date.get(json_format_date(date), 0)
             for date in self.dates
         ]
+        styled_date_cols = ['<span class="muted">0</span>' if c == 0 else c for c in date_cols]
         first_col = self.get_raw_user_link(user) if user else _("Total")
-        return [first_col] + date_cols + [sum(date_cols)]
+        return [first_col] + styled_date_cols + [sum(date_cols)]
 
+    @property
+    def raw_user_link_url(self):
+        from corehq.apps.reports.standard.inspect import SubmitHistory
+        return SubmitHistory.get_url(domain=self.domain)
 
 class FormCompletionTimeReport(WorkerMonitoringReportTableBase, DatespanMixin,
                                CompletionOrSubmissionTimeMixin):
@@ -586,7 +626,7 @@ class FormCompletionTimeReport(WorkerMonitoringReportTableBase, DatespanMixin,
         from corehq.apps.reports.standard.inspect import SubmitHistory
 
         user_link_template = '<a href="%(link)s">%(username)s</a>'
-        base_link = "%s%s" % (get_url_base(), SubmitHistory.get_url(domain=self.domain))
+        base_link = SubmitHistory.get_url(domain=self.domain)
         link = "{baselink}?{params}".format(baselink=base_link, params=urlencode(params))
         user_link = user_link_template % {
             'link': link,
@@ -758,15 +798,10 @@ class FormCompletionVsSubmissionTrendsReport(WorkerMonitoringReportTableBase, Mu
                 )
 
             for row in results:
-                completion_time = row['time_end'].replace(tzinfo=None)
-                completion_dst = False if self.timezone == pytz.utc else\
-                    tz_utils.is_timezone_in_dst(self.timezone, completion_time)
-                completion_time = self.timezone.localize(completion_time, is_dst=completion_dst)
-
-                submission_time = row['received_on'].replace(tzinfo=pytz.utc)
-                submission_time = tz_utils.adjust_datetime_to_timezone(submission_time, pytz.utc.zone, self.timezone.zone)
-
-                td = submission_time-completion_time
+                completion_time = (PhoneTime(row['time_end'], self.timezone)
+                                   .server_time().done())
+                submission_time = row['received_on']
+                td = submission_time - completion_time
                 td_total = (td.seconds + td.days * 24 * 3600)
                 rows.append([
                             self.get_user_link(user_map.get(row['user_id'])),
@@ -786,10 +821,14 @@ class FormCompletionVsSubmissionTrendsReport(WorkerMonitoringReportTableBase, Mu
         self.total_row = [_("Average"), "-", "-", "-", "-", self._format_td_status(int(total_seconds/total), False) if total > 0 else "--"]
         return rows
 
-    def _format_date(self, date, d_format="%d %b %Y, %H:%M:%S"):
+    def _format_date(self, date):
+        """
+        date is a datetime
+        """
+
         return self.table_cell(
             date,
-            "%s (%s)" % (date.strftime(d_format), date.tzinfo._tzname)
+            ServerTime(date).user_time(self.timezone).ui_string()
         )
 
     def _format_td_status(self, td, use_label=True):
@@ -826,7 +865,8 @@ class FormCompletionVsSubmissionTrendsReport(WorkerMonitoringReportTableBase, Mu
             return ", ".join(status)
 
     def _view_form_link(self, instance_id):
-        return '<a class="btn" href="%s">View Form</a>' % reverse('render_form_data', args=[self.domain, instance_id])
+        return '<a class="btn" href="%s">View Form</a>' % absolute_reverse(
+            'render_form_data', args=[self.domain, instance_id])
 
 
 class WorkerMonitoringChartBase(ProjectReport, ProjectReportParametersMixin):
@@ -871,10 +911,15 @@ class WorkerActivityTimes(WorkerMonitoringChartBase,
                     startkey=key+[self.datespan.startdate_param_utc],
                     endkey=key+[self.datespan.enddate_param_utc],
                 ).all()
-                all_times.extend([dateutil.parser.parse(d['key'][-1]) for d in data])
+                all_times.extend([iso_string_to_datetime(d['key'][-1])
+                                  for d in data])
         if self.by_submission_time:
-            # completion time is assumed to be in the phone's timezone until we can send proper timezone info
-            all_times = [tz_utils.adjust_datetime_to_timezone(t, pytz.utc.zone, self.timezone.zone) for t in all_times]
+            all_times = [ServerTime(t).user_time(self.timezone).done()
+                         for t in all_times]
+        else:
+            all_times = [PhoneTime(t, self.timezone).user_time(self.timezone).done()
+                         for t in all_times]
+
         return [(t.weekday(), t.hour) for t in all_times]
 
     @property
@@ -948,6 +993,13 @@ class WorkerActivityReport(WorkerMonitoringReportTableBase, DatespanMixin):
     fix_left_col = True
     emailable = True
 
+    @classmethod
+    def display_in_dropdown(cls, domain=None, project=None, user=None):
+        if project and project.commtrack_enabled:
+            return False
+        else:
+            return True
+
     @property
     @memoized
     def case_types_filter(self):
@@ -969,7 +1021,7 @@ class WorkerActivityReport(WorkerMonitoringReportTableBase, DatespanMixin):
             DataTablesColumn(_("# Forms Submitted"), sort_type=DTSortType.NUMERIC,
                 help_text=_("Number of forms submitted in chosen date range. %s" % CASE_TYPE_MSG)),
             DataTablesColumn(_("Avg # Forms Submitted"), sort_type=DTSortType.NUMERIC,
-                help_text=_("Average number of forms submitted in the last three date ranges of the same length. %s" % CASE_TYPE_MSG)),
+                help_text=_("Average number of forms submitted in the three preceding date ranges of the same length. %s" % CASE_TYPE_MSG)),
             DataTablesColumn(_("Last Form Submission"),
                 help_text=_("Date of last form submission in time period.  Total row displays proportion of users submitting forms in date range")) \
             if not by_group else DataTablesColumn(_("# Active Users"), sort_type=DTSortType.NUMERIC,
@@ -1137,7 +1189,7 @@ class WorkerActivityReport(WorkerMonitoringReportTableBase, DatespanMixin):
             """
             takes a row, and converts certain cells in the row to links that link to the submit history report
             """
-            fs_url = reverse('project_report_dispatcher', args=(self.domain, 'submit_history'))
+            fs_url = absolute_reverse('project_report_dispatcher', args=(self.domain, 'submit_history'))
             if type == 'user':
                 url_args = EMWF.for_user(owner_id)
             else:
@@ -1150,8 +1202,7 @@ class WorkerActivityReport(WorkerMonitoringReportTableBase, DatespanMixin):
                 "enddate": end_date,
             })
 
-            return util.numcell(u'<a href="{base}{report}?{params}" target="_blank">{display}</a>'.format(
-                base=get_url_base(),
+            return util.numcell(u'<a href="{report}?{params}" target="_blank">{display}</a>'.format(
                 report=fs_url,
                 params=urlencode(url_args, True),
                 display=val,
@@ -1161,7 +1212,7 @@ class WorkerActivityReport(WorkerMonitoringReportTableBase, DatespanMixin):
             """
                 takes a row, and converts certain cells in the row to links that link to the case list page
             """
-            cl_url = reverse('project_report_dispatcher', args=(self.domain, 'case_list'))
+            cl_url = absolute_reverse('project_report_dispatcher', args=(self.domain, 'case_list'))
             url_args = EMWF.for_user(owner_id)
 
             start_date, end_date = dates_for_linked_reports(case_list=True)
@@ -1196,7 +1247,7 @@ class WorkerActivityReport(WorkerMonitoringReportTableBase, DatespanMixin):
             """
                 takes group info, and creates a cell that links to the user status report focused on the group
             """
-            us_url = reverse('project_report_dispatcher', args=(self.domain, 'worker_activity'))
+            us_url = absolute_reverse('project_report_dispatcher', args=(self.domain, 'worker_activity'))
             start_date, end_date = dates_for_linked_reports()
             url_args = {
                 "group": group_id,
@@ -1231,7 +1282,8 @@ class WorkerActivityReport(WorkerMonitoringReportTableBase, DatespanMixin):
                                         type='group'),
                     util.numcell(sum([int(avg_submissions_by_user.get(user["user_id"], 0)) for user in users]) / self.num_avg_intervals),
                     util.numcell("%s / %s" % (active_users, total_users),
-                                 int((float(active_users)/total_users) * 10000) if total_users else -1),
+                                 value=int((float(active_users) / total_users) * 10000) if total_users else -1,
+                                 raw="%s / %s" % (active_users, total_users)),
                     util.numcell(sum([int(creations_by_user.get(user["user_id"].lower(), 0)) for user in users])),
                     util.numcell(sum([int(closures_by_user.get(user["user_id"].lower(), 0)) for user in users])),
                     util.numcell(active_cases),

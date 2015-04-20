@@ -14,8 +14,6 @@ from django.http import (
     HttpResponseForbidden,
 )
 from redis import ConnectionError
-from casexml.apps.case.exceptions import IllegalCaseId
-from corehq.util.couch_helpers import CouchAttachmentsBuilder
 
 from dimagi.utils.mixins import UnicodeMixIn
 from dimagi.utils.couch import uid, LockManager, ReleaseOnError
@@ -123,6 +121,8 @@ def create_xform(xml_string, attachments=None, _id=None, process=None):
       - raise couchforms.XMLSyntaxError
 
     """
+    from corehq.util.couch_helpers import CouchAttachmentsBuilder
+
     assert attachments is not None
     json_form = convert_xform_to_json(xml_string)
 
@@ -209,16 +209,18 @@ def _handle_id_conflict(instance, attachments, process, domain):
     previous form and overwrite it with the new form's contents.
     """
 
+    assert domain
     conflict_id = _extract_id_from_raw_xml(instance)
 
-    # get old document
     existing_doc = XFormInstance.get_db().get(conflict_id, attachments=True)
-    assert domain
-    if existing_doc.get('domain') != domain\
-            or existing_doc.get('doc_type') not in doc_types():
+    if existing_doc.get('domain') != domain or existing_doc.get('doc_type') not in doc_types():
+        # the same form was submitted to two domains, or a form was submitted with
+        # an ID that belonged to a different doc type. these are likely developers
+        # manually testing or broken API users. just resubmit with a generated ID.
         return process_xform(instance, attachments=attachments,
                              process=process, _id=uid.new())
     else:
+        # It looks like a duplicate/edit in the same domain so pursue that workflow.
         existing_doc = XFormInstance.wrap(existing_doc)
         return _handle_duplicate(existing_doc, instance, attachments, process)
 
@@ -232,16 +234,16 @@ def _handle_duplicate(existing_doc, instance, attachments, process):
 
     """
     conflict_id = existing_doc.get_id
-    # compare md5s
     existing_md5 = existing_doc.xml_md5()
     new_md5 = hashlib.md5(instance).hexdigest()
 
-    # if not same:
-    # Deprecate old form (including changing ID)
-    # to deprecate, copy new instance into a XFormDeprecated
-    # todo: save transactionally like the rest of the code
     if existing_md5 != new_md5:
-        old_id = existing_doc.get_id
+        # if the form contents are not the same:
+        #  - "Deprecate" the old form by making a new document with the same contents
+        #    but a different ID and a doc_type of XFormDeprecated
+        #  - Save the new instance to the previous document to preserve the ID
+
+        old_id = existing_doc._id
         new_id = XFormInstance.get_db().server.next_uuid()
 
         multi_lock_manager = process_xform(instance, attachments=attachments,
@@ -253,8 +255,14 @@ def _handle_duplicate(existing_doc, instance, attachments, process):
         xform._id, existing_doc._id = old_id, new_id
         xform._rev, existing_doc._rev = existing_doc._rev, xform._rev
 
-        existing_doc.doc_type = XFormDeprecated.__name__
+        # flag the old doc with metadata pointing to the new one
+        existing_doc.doc_type = deprecation_type()
         existing_doc.orig_id = old_id
+
+        # and give the new doc server data of the old one and some metadata
+        xform.received_on = existing_doc.received_on
+        xform.deprecated_form_id = existing_doc._id
+        xform.edited_on = datetime.datetime.utcnow()
 
         multi_lock_manager.append(
             LockManager(existing_doc,
@@ -262,18 +270,29 @@ def _handle_duplicate(existing_doc, instance, attachments, process):
         )
         return multi_lock_manager
     else:
-        # follow standard dupe handling
+        # follow standard dupe handling, which simply saves a copy of the form
+        # but a new doc_id, and a doc_type of XFormDuplicate
         new_doc_id = uid.new()
         new_form, lock = create_xform(instance, attachments=attachments,
                                       _id=new_doc_id, process=process)
 
-        # create duplicate doc
-        # get and save the duplicate to ensure the doc types are set correctly
-        # so that it doesn't show up in our reports
         new_form.doc_type = XFormDuplicate.__name__
         dupe = XFormDuplicate.wrap(new_form.to_json())
         dupe.problem = "Form is a duplicate of another! (%s)" % conflict_id
         return MultiLockManager([LockManager(dupe, lock)])
+
+
+def is_deprecation(xform):
+    return xform.doc_type == deprecation_type()
+
+
+def deprecation_type():
+    return XFormDeprecated.__name__
+
+
+def is_override(xform):
+    # it's an override if we've explicitly set the "deprecated_form_id" property on it.
+    return bool(getattr(xform, 'deprecated_form_id', None))
 
 
 def _log_hard_failure(instance, attachments, error):
@@ -413,10 +432,12 @@ class SubmissionPost(object):
             )
             return self.get_exception_response(e.error_log), None, []
         else:
-            from casexml.apps.case import process_cases_with_casedb
             from casexml.apps.case.models import CommCareCase
-            from casexml.apps.case.xform import get_and_check_xform_domain, CaseDbCache
+            from casexml.apps.case.xform import (
+                get_and_check_xform_domain, CaseDbCache, process_cases_with_casedb_bulk
+            )
             from casexml.apps.case.signals import case_post_save
+            from casexml.apps.case.exceptions import IllegalCaseId
             from corehq.apps.commtrack.processing import process_stock
 
             cases = []
@@ -424,46 +445,26 @@ class SubmissionPost(object):
             errors = []
             with lock_manager as xforms:
                 instance = xforms[0]
-                if instance.doc_type == "XFormInstance":
+                if instance.doc_type == 'XFormInstance':
+                    if len(xforms) > 1:
+                        assert len(xforms) == 2
+                        assert is_deprecation(xforms[1])
                     domain = get_and_check_xform_domain(instance)
-                    with CaseDbCache(domain=domain, lock=True, deleted_ok=True) as case_db:
+                    with CaseDbCache(domain=domain, lock=True, deleted_ok=True, xforms=xforms) as case_db:
                         try:
-                            process_cases_with_casedb(instance, case_db)
+                            process_cases_with_casedb_bulk(xforms, case_db)
                             process_stock(instance, case_db)
                         except IllegalCaseId as e:
-                            error_message = '{}: {}'.format(
-                                type(e).__name__, unicode(e))
-                            logging.exception((
-                                u"Warning in case or stock processing "
-                                u"for form {}: {}."
-                            ).format(instance._id, error_message))
-                            instance.__class__ = XFormError
-                            instance.problem = error_message
-                            instance.save()
+                            # errors we know about related to the content of the form
+                            # log the error and respond with a success code so that the phone doesn't
+                            # keep trying to send the form
+                            instance = _handle_known_error(e, instance)
                             response = self._get_open_rosa_response(instance,
                                                                     None, None)
                             return response, instance, cases
                         except Exception as e:
-                            # Some things to consider here
-                            # The following code saves the xform instance
-                            # as an XFormError, with a different ID.
-                            # That's because if you save with the original ID
-                            # and then resubmit, the new submission never has a
-                            # chance to get reprocessed; it'll just get saved as
-                            # a duplicate.
-                            error_message = '{}: {}'.format(
-                                type(e).__name__, unicode(e))
-                            new_id = XFormError.get_db().server.next_uuid()
-                            logging.exception((
-                                u"Error in case or stock processing "
-                                u"for form {}: {}.\n"
-                                u"Error saved as {}"
-                            ).format(instance._id, error_message, new_id))
-                            instance.__class__ = XFormError
-                            instance.orig_id = instance._id
-                            instance._id = new_id
-                            instance.problem = error_message
-                            instance.save()
+                            # handle / log the error and reraise so the phone knows to resubmit
+                            _handle_unexpected_error(e, instance)
                             raise
                         now = datetime.datetime.utcnow()
                         unfinished_submission_stub = UnfinishedSubmissionStub(
@@ -498,6 +499,8 @@ class SubmissionPost(object):
                         try:
                             XFormInstance.get_db().bulk_save(docs)
                         except BulkSaveError as e:
+                            logging.error('BulkSaveError saving forms', exc_info=1,
+                                          extra={'details': {'errors': e.errors}})
                             raise
                         unfinished_submission_stub.saved = True
                         unfinished_submission_stub.save()
@@ -594,6 +597,42 @@ class SubmissionPost(object):
             nature=ResponseNature.SUBMIT_ERROR,
             status=500,
         ).response()
+
+
+def _handle_known_error(e, instance):
+    error_message = '{}: {}'.format(
+        type(e).__name__, unicode(e))
+    logging.exception((
+        u"Warning in case or stock processing "
+        u"for form {}: {}."
+    ).format(instance._id, error_message))
+    instance.__class__ = XFormError
+    instance.problem = error_message
+    instance.save()
+    return instance
+
+
+def _handle_unexpected_error(e, instance):
+    # Some things to consider here
+    # The following code saves the xform instance
+    # as an XFormError, with a different ID.
+    # That's because if you save with the original ID
+    # and then resubmit, the new submission never has a
+    # chance to get reprocessed; it'll just get saved as
+    # a duplicate.
+    error_message = '{}: {}'.format(
+        type(e).__name__, unicode(e))
+    new_id = XFormError.get_db().server.next_uuid()
+    logging.exception((
+        u"Error in case or stock processing "
+        u"for form {}: {}.\n"
+        u"Error saved as {}"
+    ).format(instance._id, error_message, new_id))
+    instance.__class__ = XFormError
+    instance.orig_id = instance._id
+    instance._id = new_id
+    instance.problem = error_message
+    instance.save()
 
 
 def fetch_and_wrap_form(doc_id):

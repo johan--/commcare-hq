@@ -1,12 +1,15 @@
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
+from functools import wraps
 import logging
+from django.utils.translation import ugettext_lazy as _
 from casexml.apps.case.xml import V2_NAMESPACE
-from corehq.apps.app_manager.const import APP_V1, SCHEDULE_PHASE, SCHEDULE_LAST_VISIT, SCHEDULE_LAST_VISIT_DATE
+from corehq.apps.app_manager.const import APP_V1, SCHEDULE_PHASE, SCHEDULE_LAST_VISIT, SCHEDULE_LAST_VISIT_DATE, \
+    CASE_ID, USERCASE_ID, USERCASE_PREFIX
 from lxml import etree as ET
 from corehq.util.view_utils import get_request
 from dimagi.utils.decorators.memoized import memoized
 from .xpath import CaseIDXPath, session_var, CaseTypeXpath
-from .exceptions import XFormError, CaseError, XFormValidationError, BindNotFound
+from .exceptions import XFormException, CaseError, XFormValidationError, BindNotFound
 import formtranslate.api
 
 
@@ -18,7 +21,7 @@ def parse_xml(string):
     try:
         return ET.fromstring(string, parser=ET.XMLParser(encoding="utf-8", remove_comments=True))
     except ET.ParseError, e:
-        raise XFormError("Error parsing XML" + (": %s" % str(e)))
+        raise XFormException(_("Error parsing XML: %s") % str(e))
 
 
 namespaces = dict(
@@ -69,7 +72,21 @@ def relative_path(from_path, to_path):
             return '%s/%s' % ('/'.join(['..' for n in from_nodes]), '/'.join(to_nodes))
 
 
-SESSION_CASE_ID = CaseIDXPath(session_var('case_id'))
+def requires_itext(on_fail_return=None):
+    def _wrapper(func):
+        @wraps(func)
+        def _inner(self, *args, **kwargs):
+            try:
+                self.itext_node
+            except XFormException:
+                return on_fail_return() if on_fail_return else None
+            return func(self, *args, **kwargs)
+        return _inner
+    return _wrapper
+
+
+SESSION_CASE_ID = CaseIDXPath(session_var(CASE_ID))
+SESSION_USERCASE_ID = CaseIDXPath(session_var(USERCASE_ID))
 
 
 class WrappedAttribs(object):
@@ -181,20 +198,20 @@ class ItextNodeGroup(object):
 
     def add_node(self, node):
         if self.nodes.get(node.lang):
-            raise Exception("Group already has node for lang: {0}".format(node.lang))
+            raise XFormException(_("Group already has node for lang: {0}").format(node.lang))
         else:
             self.nodes[node.lang] = node
 
     def __eq__(self, other):
         for lang, node in self.nodes.items():
             other_node = other.nodes.get(lang)
-            if node.values != other_node.values:
+            if node.rendered_values != other_node.rendered_values:
                 return False
 
         return True
 
     def __hash__(self):
-        return ''.join(["{0}{1}".format(n.lang, n.values) for n in self.nodes.values()]).__hash__()
+        return ''.join(["{0}{1}".format(n.lang, n.rendered_values) for n in self.nodes.values()]).__hash__()
 
     def __repr__(self):
         return "{0}, {1}".format(self.id, self.nodes)
@@ -205,7 +222,12 @@ class ItextNode(object):
         self.lang = lang
         self.id = itext_node.attrib['id']
         values = itext_node.findall('{f}value')
-        self.values = sorted([str.strip(ET.tostring(v.xml)) for v in values])
+        self.values_by_form = {value.attrib.get('form'): value for value in values}
+
+    @property
+    @memoized
+    def rendered_values(self):
+        return sorted([str.strip(ET.tostring(v.xml)) for v in self.values_by_form.values()])
 
     def __repr__(self):
         return self.id
@@ -259,14 +281,14 @@ def raise_if_none(message):
     """
     raise_if_none("message") is a decorator that turns a function that returns a WrappedNode
     whose xml can possibly be None to a function that always returns a valid WrappedNode or raises
-    an XFormError with the message given
+    an XFormException with the message given
 
     """
     def decorator(fn):
         def _fn(*args, **kwargs):
             n = fn(*args, **kwargs)
             if not n.exists():
-                raise XFormError(message)
+                raise XFormException(message)
             else:
                 return n
         return _fn
@@ -385,6 +407,10 @@ class CaseBlock(object):
         for key, value in updates.items():
             if key == 'name':
                 key = 'case_name'
+            elif key.startswith(USERCASE_PREFIX):
+                # Skip usercase keys. They are handled by the usercase block.
+                # cf. add_usercase
+                continue
             if self.is_attachment(value):
                 attachments[key] = value
             else:
@@ -485,6 +511,9 @@ class XForm(WrappedNode):
             self.namespaces.update(x="{%s}" % xmlns)
         self.has_casedb = False
 
+    def __str__(self):
+        return ET.tostring(self.xml) if self.xml is not None else ''
+
     def validate(self, version='1.0'):
         validate_xform(ET.tostring(self.xml) if self.xml is not None else '',
                        version=version)
@@ -519,12 +548,10 @@ class XForm(WrappedNode):
         else:
             return self.data_node.find('{x}case')
 
+    @requires_itext(list)
     def media_references(self, form):
-        try:
-            nodes = self.itext_node.findall('{f}translation/{f}text/{f}value[@form="%s"]' % form)
-            return list(set([n.text for n in nodes]))
-        except XFormError:
-            return []
+        nodes = self.itext_node.findall('{f}translation/{f}text/{f}value[@form="%s"]' % form)
+        return list(set([n.text for n in nodes]))
 
     @property
     def image_references(self):
@@ -544,9 +571,43 @@ class XForm(WrappedNode):
             title.xml.text = new_name
         try:
             self.data_node.set('name', "%s" % new_name)
-        except XFormError:
+        except XFormException:
             pass
 
+    @memoized
+    @requires_itext(dict)
+    def translations(self):
+        translations = OrderedDict()
+        for translation in self.itext_node.findall('{f}translation'):
+            lang = translation.attrib['lang']
+            translations[lang] = translation
+
+        return translations
+
+    @memoized
+    def itext_node_groups(self):
+        """
+        :return: dict mapping 'lang' to ItextNodeGroup objects.
+        """
+        node_groups = {}
+        for lang, translation in self.translations().items():
+            text_nodes = translation.findall('{f}text')
+            for text in text_nodes:
+                node = ItextNode(lang, text)
+                group = node_groups.get(node.id)
+                if not group:
+                    group = ItextNodeGroup([node])
+                else:
+                    group.add_node(node)
+                node_groups[node.id] = group
+
+        return node_groups
+
+    def _reset_translations_cache(self):
+        self.translations.reset_cache(self)
+        self.itext_node_groups.reset_cache(self)
+
+    @requires_itext()
     def normalize_itext(self):
         """
         Convert this:
@@ -560,24 +621,8 @@ class XForm(WrappedNode):
 
         and rename the appropriate label references.
         """
-        try:
-            itext = self.itext_node
-        except Exception:
-            return
-        node_groups = {}
-        translations = {}
-        for translation in itext.findall('{f}translation'):
-            lang = translation.attrib['lang']
-            translations[lang] = translation
-            text_nodes = translation.findall('{f}text')
-            for text in text_nodes:
-                node = ItextNode(lang, text)
-                group = node_groups.get(node.id)
-                if not group:
-                    group = ItextNodeGroup([node])
-                else:
-                    group.add_node(node)
-                node_groups[node.id] = group
+        translations = self.translations()
+        node_groups = self.itext_node_groups()
 
         duplicate_dict = defaultdict(list)
         for g in node_groups.values():
@@ -609,6 +654,8 @@ class XForm(WrappedNode):
 
         self.xml = parse_xml(xf_string)
 
+        self._reset_translations_cache()
+
     def strip_vellum_ns_attributes(self):
         # vellum_ns is wrapped in braces i.e. '{http...}'
         vellum_ns = self.namespaces['v']
@@ -618,27 +665,30 @@ class XForm(WrappedNode):
                 if key.startswith(vellum_ns):
                     del node.attrib[key]
 
+    @requires_itext()
     def rename_language(self, old_code, new_code):
-        trans_node = self.itext_node.find('{f}translation[@lang="%s"]' % old_code)
-        duplicate_node = self.itext_node.find('{f}translation[@lang="%s"]' % new_code)
-        if not trans_node.exists():
-            raise XFormError("There's no language called '%s'" % old_code)
-        if duplicate_node.exists():
-            raise XFormError("There's already a language called '%s'" % new_code)
+        trans_node = self.translations().get(old_code)
+        duplicate_node = self.translations().get(new_code)
+
+        if not trans_node or not trans_node.exists():
+            raise XFormException(_("There's no language called '%s'") % old_code)
+        if duplicate_node and duplicate_node.exists():
+            raise XFormException(_("There's already a language called '%s'") % new_code)
         trans_node.attrib['lang'] = new_code
 
+        self._reset_translations_cache()
+
     def exclude_languages(self, whitelist):
-        try:
-            translations = self.itext_node.findall('{f}translation')
-        except XFormError:
-            # if there's no itext then they must be using labels
-            return
-
-        for trans_node in translations:
-            if trans_node.attrib.get('lang') not in whitelist:
+        changes = False
+        for lang, trans_node in self.translations().items():
+            if lang not in whitelist:
                 self.itext_node.remove(trans_node.xml)
+                changes = True
 
-    def localize(self, id, lang=None, form=None):
+        if changes:
+            self._reset_translations_cache()
+
+    def _normalize_itext_id(self, id):
         pre = 'jr:itext('
         post = ')'
 
@@ -647,39 +697,55 @@ class XForm(WrappedNode):
         if id[0] == id[-1] and id[0] in ('"', "'"):
             id = id[1:-1]
 
-        if lang is None:
-            trans_node = self.itext_node.find('{f}translation')
-        else:
-            trans_node = self.itext_node.find('{f}translation[@lang="%s"]' % lang)
-            if not trans_node.exists():
-                return None
-        text_node = trans_node.find('{f}text[@id="%s"]' % id)
-        if not text_node.exists():
+        return id
+
+    def localize(self, id, lang=None, form=None):
+        # fail hard if no itext node present
+        self.itext_node
+
+        id = self._normalize_itext_id(id)
+        node_group = self.itext_node_groups().get(id)
+        if not node_group:
             return None
 
-        search_tag = '{f}value'
-        if form:
-            search_tag += '[@form="%s"]' % form
-        value_node = text_node.find(search_tag)
+        lang = lang or self.translations().keys()[0]
+        text_node = node_group.nodes.get(lang)
+        if not text_node:
+            return None
+
+        value_node = text_node.values_by_form.get(form)
 
         if value_node:
             text = ItextValue.from_node(value_node)
         else:
-            raise XFormError('<translation lang="%s"><text id="%s"> node has no <value>' % (
-                trans_node.attrib.get('lang'), id
+            raise XFormException(_('<translation lang="%s"><text id="%s"> node has no <value>') % (
+                lang, id
             ))
 
         return text
 
-    def get_label_text(self, prompt, langs, form=None):
+    def get_label_translations(self, prompt, langs):
         if prompt.tag_name == 'repeat':
-            return self.get_label_text(prompt.find('..'), langs, form)
+            return self.get_label_translations(prompt.find('..'), langs)
+        label_node = prompt.find('{f}label')
+        translations = {}
+        if label_node.exists() and 'ref' in label_node.attrib:
+            for lang in langs:
+                label = self.localize(label_node.attrib['ref'], lang)
+                if label:
+                    translations[lang] = label
+
+        return translations
+
+    def get_label_text(self, prompt, langs):
+        if prompt.tag_name == 'repeat':
+            return self.get_label_text(prompt.find('..'), langs)
         label_node = prompt.find('{f}label')
         label = ""
         if label_node.exists():
             if 'ref' in label_node.attrib:
                 for lang in langs + [None]:
-                    label = self.localize(label_node.attrib['ref'], lang, form)
+                    label = self.localize(label_node.attrib['ref'], lang)
                     if label is not None:
                         break
             elif label_node.text:
@@ -701,25 +767,20 @@ class XForm(WrappedNode):
         else:
             return "%s/%s" % (path_context, path)
 
+    @requires_itext(list)
     def get_languages(self):
         if not self.exists():
             return []
-        try:
-            itext = self.itext_node
-        except:
-            return []
-        langs = []
-        for translation in itext.findall('{f}translation'):
-            langs.append(translation.attrib['lang'])
-        return langs
+
+        return self.translations().keys()
 
     def get_questions(self, langs, include_triggers=False,
-                      include_groups=False):
+                      include_groups=False, include_translations=False):
         """
         parses out the questions from the xform, into the format:
         [{"label": label, "tag": tag, "value": value}, ...]
 
-        if the xform is bad, it will raise an XFormError
+        if the xform is bad, it will raise an XFormException
 
         """
 
@@ -732,7 +793,7 @@ class XForm(WrappedNode):
 
         control_nodes = self.get_control_nodes()
 
-        for node, path, repeat, group, items, is_leaf, data_type in control_nodes:
+        for node, path, repeat, group, items, is_leaf, data_type, relevant, required in control_nodes:
             excluded_paths.add(path)
             if not is_leaf and not include_groups:
                 continue
@@ -750,41 +811,55 @@ class XForm(WrappedNode):
                 "repeat": repeat,
                 "group": group,
                 "type": data_type,
+                "relevant": relevant,
+                "required": required == "true()"
             }
 
-            if items:
+            if include_translations:
+                question["translations"] = self.get_label_translations(node, langs)
+
+            if items is not None:
                 options = []
                 for item in items:
                     translation = self.get_label_text(item, langs)
                     try:
                         value = item.findtext('{f}value').strip()
                     except AttributeError:
-                        raise XFormError("<item> (%r) has no <value>" % translation)
-                    options.append({
+                        raise XFormException(_("<item> (%r) has no <value>") % translation)
+                    option = {
                         'label': translation,
                         'value': value
-                    })
+                    }
+                    if include_translations:
+                        option['translations'] = self.get_label_translations(item, langs)
+                    options.append(option)
                 question['options'] = options
             questions.append(question)
 
         repeat_contexts = sorted(repeat_contexts, reverse=True)
-       
+
         for data_node, path in self.get_leaf_data_nodes():
             if path not in excluded_paths:
+                bind = self.get_bind(path)
                 try:
                     matching_repeat_context = [
                         rc for rc in repeat_contexts if path.startswith(rc)
                     ][0]
                 except IndexError:
                     matching_repeat_context = None
-                questions.append({
+                question = {
                     "label": path,
                     "tag": "hidden",
                     "value": path,
                     "repeat": matching_repeat_context,
                     "group": matching_repeat_context,
                     "type": "DataBindOnly",
-                })
+                    "calculate": bind.attrib.get('calculate') if hasattr(bind, 'attrib') else None,
+                }
+                if include_translations:
+                    question["translations"] = {}
+
+                questions.append(question)
 
         return questions
 
@@ -810,6 +885,8 @@ class XForm(WrappedNode):
                     path = self.resolve_path(self.get_path(node), path_context)
                     bind = self.get_bind(path)
                     data_type = infer_vellum_type(node, bind)
+                    relevant = bind.attrib.get('relevant') if bind else None
+                    required = bind.attrib.get('required') if bind else None
                     skip = False
 
                     if tag == "group":
@@ -844,7 +921,7 @@ class XForm(WrappedNode):
                     if not skip:
                         control_nodes.append((node, path, repeat_context,
                                               group_context, items, is_leaf,
-                                              data_type))
+                                              data_type, relevant, required))
                     if recursive_kwargs:
                         for_each_control_node(**recursive_kwargs)
 
@@ -869,7 +946,7 @@ class XForm(WrappedNode):
         elif node.tag_name == "repeat":
             path = node.attrib['nodeset']
         else:
-            raise XFormError("Node <%s> has no 'ref' or 'bind'" % node.tag_name)
+            raise XFormException(_("Node <%s> has no 'ref' or 'bind'") % node.tag_name)
         return path
     
     def get_leaf_data_nodes(self):
@@ -893,6 +970,7 @@ class XForm(WrappedNode):
             self.add_case_and_meta_1(form)
         else:
             self.create_casexml_2(form)
+            self.add_usercase(form)
             self.add_meta_2(form)
 
     def add_case_and_meta_advanced(self, form):
@@ -907,6 +985,51 @@ class XForm(WrappedNode):
                 meta_blocks.add(meta)
 
         return meta_blocks
+
+    def _add_usercase_bind(self, usercase_path):
+        self.add_bind(
+            nodeset=usercase_path + 'case/@case_id',
+            calculate=SESSION_USERCASE_ID,
+        )
+
+    def add_case_preloads(self, preloads, case_id_xpath=None):
+        from corehq.apps.app_manager.util import split_path
+
+        self.add_casedb()
+        for nodeset, property_ in preloads.items():
+            parent_path, property_ = split_path(property_)
+            property_xpath = {
+                'name': 'case_name',
+                'owner_id': '@owner_id'
+            }.get(property_, property_)
+
+            id_xpath = get_case_parent_id_xpath(parent_path, case_id_xpath=case_id_xpath)
+            self.add_setvalue(
+                ref=nodeset,
+                value=id_xpath.case().property(property_xpath),
+            )
+
+    def add_usercase(self, form):
+        from corehq.apps.app_manager.util import get_usercase_keys, get_usercase_values
+
+        usercase_path = 'commcare_usercase/'
+        actions = form.active_actions()
+
+        if 'update_case' in actions:
+            usercase_updates = get_usercase_keys(actions['update_case'].update)
+            if usercase_updates:
+                self._add_usercase_bind(usercase_path)
+                usercase_block = _make_elem('{x}commcare_usercase')
+                case_block = CaseBlock(self, usercase_path)
+                case_block.add_update_block(usercase_updates)
+                usercase_block.append(case_block.elem)
+                self.data_node.append(usercase_block)
+
+        if 'case_preload' in actions:
+            self.add_case_preloads(
+                get_usercase_values(actions['case_preload'].preload),
+                case_id_xpath=SESSION_USERCASE_ID
+            )
 
     def add_meta_2(self, form):
         case_parent = self.data_node
@@ -989,15 +1112,10 @@ class XForm(WrappedNode):
             # casexml has to be valid, 'cuz *I* made it
             casexml = parse_xml(casexml)
             case_parent.append(casexml)
-            # if DEBUG: tree = ET.fromstring(ET.tostring(tree))
             for bind in bind_parent.findall('{f}bind'):
                 if bind.attrib['nodeset'].startswith('case/'):
                     bind_parent.remove(bind.xml)
             for bind in binds:
-#                if DEBUG:
-#                    xpath = ".//{x}" + bind.attrib['nodeset'].replace("/", "/{x}")
-#                    if tree.find(fmt(xpath)) is None:
-#                        raise Exception("Invalid XPath Expression %s" % xpath)
                 conflicting = bind_parent.find('{f}bind[@nodeset="%s"]' % bind.attrib['nodeset'])
                 if conflicting.exists():
                     for a in bind.attrib:
@@ -1006,11 +1124,11 @@ class XForm(WrappedNode):
                     bind_parent.append(bind)
 
         if not case_parent.exists():
-            raise XFormError("Couldn't get the case XML from one of your forms. "
+            raise XFormException(_("Couldn't get the case XML from one of your forms. "
                              "A common reason for this is if you don't have the "
                              "xforms namespace defined in your form. Please verify "
                              'that the xmlns="http://www.w3.org/2002/xforms" '
-                             "attribute exists in your form.")
+                             "attribute exists in your form."))
 
         # Test all of the possibilities so that we don't end up with two "meta" blocks
         for meta in self.already_has_meta():
@@ -1040,17 +1158,13 @@ class XForm(WrappedNode):
         # necessary to make casexml work
         transformation()
 
+    @requires_itext()
     def set_default_language(self, lang):
-        try:
-            itext_node = self.itext_node
-        except XFormError:
-            return
-        else:
-            for translation in itext_node.findall('{f}translation'):
-                if translation.attrib.get('lang') == lang:
-                    translation.attrib['default'] = ""
-                else:
-                    translation.attrib.pop('default', None)
+        for this_lang, translation in self.translations().items():
+            if this_lang == lang:
+                translation.attrib['default'] = ""
+            else:
+                translation.attrib.pop('default', None)
 
     def set_version(self, version):
         """set the form's version attribute"""
@@ -1107,9 +1221,9 @@ class XForm(WrappedNode):
             return 'true()'
         elif condition.type == 'if':
             if condition.operator == 'selected':
-                template = "selected({path}, '{answer}')"
+                template = u"selected({path}, '{answer}')"
             else:
-                template = "{path} = '{answer}'"
+                template = u"{path} = '{answer}'"
             return template.format(
                 path=self.resolve_path(condition.question),
                 answer=condition.answer
@@ -1118,7 +1232,7 @@ class XForm(WrappedNode):
             return 'false()'
 
     def create_casexml_2(self, form):
-        from corehq.apps.app_manager.util import split_path
+        from corehq.apps.app_manager.util import skip_usercase_values
 
         actions = form.active_actions()
 
@@ -1131,7 +1245,7 @@ class XForm(WrappedNode):
         else:
             extra_updates = {}
             case_block = CaseBlock(self)
-
+            module = form.get_module()
             if form.requires != 'none':
                 def make_delegation_stub_case_block():
                     path = 'cc_delegation_stub/'
@@ -1156,17 +1270,19 @@ class XForm(WrappedNode):
                     outer_block.append(delegation_case_block.elem)
                     return outer_block
 
-                if form.get_module().task_list.show:
+                if module.task_list.show:
                     delegation_case_block = make_delegation_stub_case_block()
 
             if 'open_case' in actions:
                 open_case_action = actions['open_case']
+                case_id = session_var(form.session_var_for_action('open_case'))
                 case_block.add_create_block(
                     relevance=self.action_relevance(open_case_action.condition),
                     case_name=open_case_action.name_path,
                     case_type=form.get_case_type(),
                     autoset_owner_id=autoset_owner_id_for_open_case(actions),
                     has_case_sharing=form.get_app().case_sharing,
+                    case_id=case_id
                 )
                 if 'external_id' in actions['open_case'] and actions['open_case'].external_id:
                     extra_updates['external_id'] = actions['open_case'].external_id
@@ -1186,19 +1302,7 @@ class XForm(WrappedNode):
                 case_block.add_close_block(self.action_relevance(actions['close_case'].condition))
 
             if 'case_preload' in actions:
-                self.add_casedb()
-                for nodeset, property in actions['case_preload'].preload.items():
-                    parent_path, property = split_path(property)
-                    property_xpath = {
-                        'name': 'case_name',
-                        'owner_id': '@owner_id'
-                    }.get(property, property)
-
-                    id_xpath = get_case_parent_id_xpath(parent_path)
-                    self.add_setvalue(
-                        ref=nodeset,
-                        value=id_xpath.case().property(property_xpath),
-                    )
+                self.add_case_preloads(skip_usercase_values(actions['case_preload'].preload))
 
         if 'subcases' in actions:
             subcases = actions['subcases']
@@ -1216,10 +1320,12 @@ class XForm(WrappedNode):
                         '/{x}'.join(subcase.repeat_context.split('/'))[1:]
                     )
                     nest = repeat_contexts[subcase.repeat_context] > 1
+                    case_id = 'uuid()'
                 else:
                     base_path = ''
                     parent_node = self.data_node
                     nest = True
+                    case_id = session_var(form.session_var_for_action('subcase', i))
 
                 if nest:
                     name = 'subcase_%s' % i
@@ -1239,6 +1345,7 @@ class XForm(WrappedNode):
                     delay_case_id=bool(subcase.repeat_context),
                     autoset_owner_id=autoset_owner_id_for_subcase(subcase),
                     has_case_sharing=form.get_app().case_sharing,
+                    case_id=case_id
                 )
 
                 subcase_block.add_update_block(subcase.case_properties)
@@ -1259,18 +1366,19 @@ class XForm(WrappedNode):
 
         if case_block is not None:
             if case.exists():
-                raise XFormError("You cannot use the Case Management UI if you already have a case block in your form.")
+                raise XFormException(_("You cannot use the Case Management UI "
+                                       "if you already have a case block in your form."))
             else:
                 case_parent.append(case_block.elem)
                 if delegation_case_block is not None:
                     case_parent.append(delegation_case_block.elem)
 
         if not case_parent.exists():
-            raise XFormError("Couldn't get the case XML from one of your forms. "
+            raise XFormException(_("Couldn't get the case XML from one of your forms. "
                              "A common reason for this is if you don't have the "
                              "xforms namespace defined in your form. Please verify "
                              'that the xmlns="http://www.w3.org/2002/xforms" '
-                             "attribute exists in your form.")
+                             "attribute exists in your form."))
 
     def create_casexml_2_advanced(self, form):
         from corehq.apps.app_manager.util import split_path
@@ -1331,13 +1439,28 @@ class XForm(WrappedNode):
             None
         )
 
-        has_schedule = form.get_module().has_schedule and form.schedule and form.schedule.anchor
+        module = form.get_module()
+        has_schedule = module.has_schedule and form.schedule and form.schedule.anchor
 
-        for action in form.actions.load_update_cases:
-            session_case_id = CaseIDXPath(session_var(action.case_session_var))
+        adjusted_datums = {}
+        if module.root_module and module.root_module.module_type == 'basic':
+            # for child modules the session variable for a case may have been
+            # changed to match the parent module.
+            from corehq.apps.app_manager.suite_xml import SuiteGenerator
+            gen = SuiteGenerator(form.get_app())
+            datums_meta, _ = gen.get_datum_meta_assertions_advanced(module, form)
+            adjusted_datums = {
+                getattr(meta['action'], 'id', None): meta['datum'].id
+                for meta in datums_meta
+                if meta['action']
+            }
+
+        for action in form.actions.get_load_update_actions():
+            var_name = adjusted_datums.get(action.id, action.case_session_var)
+            session_case_id = CaseIDXPath(session_var(var_name))
             if action.preload:
                 self.add_casedb()
-                for property, nodeset in action.preload.items():
+                for nodeset, property in action.preload.items():
                     parent_path, property = split_path(property)
                     property_xpath = {
                         'name': 'case_name',
@@ -1397,8 +1520,10 @@ class XForm(WrappedNode):
 
             return path, subcase_node
 
-        for action in form.actions.open_cases:
+        for action in form.actions.get_open_actions():
             check_case_type(action)
+
+            case_id = 'uuid()' if action.repeat_context else session_var(action.case_session_var)
 
             path, subcase_node = get_action_path(action)
 
@@ -1411,6 +1536,7 @@ class XForm(WrappedNode):
                 delay_case_id=bool(action.repeat_context),
                 autoset_owner_id=('owner_id' not in action.case_properties),
                 has_case_sharing=form.get_app().case_sharing,
+                case_id=case_id
             )
 
             if action.case_properties:
@@ -1923,108 +2049,130 @@ VELLUM_TYPES = {
         'tag': 'input',
         'type': 'intent',
         'icon': 'icon-vellum-android-intent',
+        'icon_bs3': 'fcc fcc-fd-android-intent',
     },
     "Audio": {
         'tag': 'upload',
         'media': 'audio/*',
         'type': 'binary',
         'icon': 'icon-vellum-audio-capture',
+        'icon_bs3': 'fcc fcc-fd-audio-capture',
     },
     "Barcode": {
         'tag': 'input',
         'type': 'barcode',
         'icon': 'icon-vellum-android-intent',
+        'icon_bs3': 'fcc fcc-fd-android-intent',
     },
     "DataBindOnly": {
         'icon': 'icon-vellum-variable',
+        'icon_bs3': 'fcc fcc-fd-variable',
     },
     "Date": {
         'tag': 'input',
         'type': 'xsd:date',
         'icon': 'icon-calendar',
+        'icon_bs3': 'fa fa-calendar',
     },
     "DateTime": {
         'tag': 'input',
         'type': 'xsd:datetime',
         'icon': 'icon-vellum-datetime',
+        'icon_bs3': 'fcc fcc-fd-datetime',
     },
     "Double": {
         'tag': 'input',
         'type': 'xsd:double',
         'icon': 'icon-vellum-decimal',
+        'icon_bs3': 'fcc fcc-fd-decimal',
     },
     "FieldList": {
         'tag': 'group',
         'appearance': 'field-list',
         'icon': 'icon-reorder',
+        'icon_bs3': 'fa fa-bars',
     },
     "Geopoint": {
         'tag': 'input',
         'type': 'geopoint',
         'icon': 'icon-map-marker',
+        'icon_bs3': 'fa fa-map-marker',
     },
     "Group": {
         'tag': 'group',
         'icon': 'icon-folder-open',
+        'icon_bs3': 'fa fa-folder-open',
     },
     "Image": {
         'tag': 'upload',
         'media': 'image/*',
         'type': 'binary',
         'icon': 'icon-camera',
+        'icon_bs3': 'fa fa-camera',
     },
     "Int": {
         'tag': 'input',
         'type': ('xsd:int', 'xsd:integer'),
         'icon': 'icon-vellum-numeric',
+        'icon_bs3': 'fcc fcc-fd-numeric',
     },
     "Long": {
         'tag': 'input',
         'type': 'xsd:long',
         'icon': 'icon-vellum-long',
+        'icon_bs3': 'fcc fcc-fd-long',
     },
     "MSelect": {
         'tag': 'select',
         'icon': 'icon-vellum-multi-select',
+        'icon_bs3': 'fcc fcc-fd-multi-select',
     },
     "PhoneNumber": {
         'tag': 'input',
         'type': ('xsd:string', None),
         'appearance': 'numeric',
         'icon': 'icon-signal',
+        'icon_bs3': 'fa fa-signal',
     },
     "Repeat": {
         'tag': 'repeat',
         'icon': 'icon-retweet',
+        'icon_bs3': 'fa fa-retweet',
     },
     "Secret": {
         'tag': 'secret',
         'type': ('xsd:string', None),
         'icon': 'icon-key',
+        'icon_bs3': 'fa fa-key',
     },
     "Select": {
         'tag': 'select1',
         'icon': 'icon-vellum-single-select',
+        'icon_bs3': 'fcc fcc-fd-single-select',
     },
     "Text": {
         'tag': 'input',
         'type': ('xsd:string', None),
         'icon': "icon-vellum-text",
+        'icon_bs3': 'fcc fcc-fd-text',
     },
     "Time": {
         'tag': 'input',
         'type': 'xsd:time',
         'icon': 'icon-time',
+        'icon_bs3': 'a fa-clock-o',
     },
     "Trigger": {
         'tag': 'trigger',
         'icon': 'icon-tag',
+        'icon_bs3': 'fa fa-tag',
     },
     "Video": {
         'tag': 'upload',
         'media': 'video/*',
         'type': 'binary',
         'icon': 'icon-facetime-video',
+        'icon_bs3': 'fa fa-video-camera',
     },
 }
 

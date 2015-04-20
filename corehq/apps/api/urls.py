@@ -1,3 +1,4 @@
+from corehq.apps.api.accounting import *
 from corehq.apps.api.domain_metadata import DomainMetadataResource
 from corehq.apps.api.object_fetch_api import CaseAttachmentAPI
 
@@ -8,7 +9,7 @@ from corehq.apps.commtrack.resources.v0_1 import ProductResource
 from corehq.apps.fixtures.resources.v0_1 import FixtureResource
 from corehq.apps.locations.resources.v0_1 import LocationResource
 from corehq.apps.reports.resources.v0_1 import ReportResource
-from django.conf.urls.defaults import *
+from django.conf.urls import *
 from django.http import HttpResponseNotFound
 from tastypie.api import Api
 from corehq.apps.api.es import XFormES
@@ -108,6 +109,28 @@ urlpatterns = patterns('',
 ADMIN_API_LIST = (
     v0_5.AdminWebUserResource,
     DomainMetadataResource,
+    FeatureResource,
+    FutureRateResource,
+    RoleResource,
+    BillingAccountAdminResource,
+    AccountingCurrencyResource,
+    SoftwareProductResource,
+    SoftwarePlanResource,
+    DefaultProductPlanResource,
+    SoftwareProductRateResource,
+    SoftwarePlanVersionResource,
+    SubscriberResource,
+    BillingAccountResource,
+    SubscriptionResource,
+    InvoiceResource,
+    LineItemResource,
+    PaymentMethodResource,
+    BillingContactInfoResource,
+    PaymentRecordResource,
+    CreditLineResource,
+    CreditAdjustmentResource,
+    SubscriptionAndAdjustmentResource,
+    BillingRecordResource,
 )
 
 @inline

@@ -1,12 +1,9 @@
 from django.utils.translation import ugettext_noop
-from corehq.apps.groups.models import Group
 from corehq.apps.reports.dont_use.fields import ReportSelectField
-from corehq.apps.reports.filters.base import BaseDrilldownOptionFilter, BaseSingleOptionFilter
-from corehq.apps.users.models import CouchUser
+from corehq.apps.reports.filters.base import BaseSingleOptionFilter
 from corehq.elastic import es_query
+from corehq.apps.es import CaseES
 from corehq.pillows.mappings.reportcase_mapping import REPORT_CASE_INDEX
-from custom.succeed.reports import SUBMISSION_SELECT_FIELDS
-from casexml.apps.case.models import CommCareCase
 from custom.succeed.utils import (
     CONFIG
 )
@@ -21,29 +18,14 @@ class CareSite(ReportSelectField):
 
     @property
     def options(self):
-        q = { "query": {
-                "filtered": {
-                    "query": {
-                        "match_all": {}
-                    },
-                    "filter": {
-                        "bool": {
-                            "must": [
-                                {"term": {"domain.exact": self.domain}}
-                            ],
-                            "must_not": []
-                        }
-                    }
-                }
-            }
-        }
-        es_results = es_query(q=q, es_url=REPORT_CASE_INDEX + '/_search', dict_only=False)
-        care_sites = []
-        for case in es_results['hits'].get('hits', []):
-            prop = CommCareCase.get(case['_id']).get_case_property('care_site_display')
-            if prop is not None and prop not in care_sites:
-                care_sites.append(prop)
-        return [dict(val=care_site, text=ugettext_noop(care_site)) for care_site in care_sites]
+        res = (CaseES('report_cases')
+               .domain(self.domain)
+               .exists('care_site_display.#value')
+               .fields(['care_site_display'])
+               .run())
+        care_sites = {c['care_site_display']['#value'] for c in res.hits}
+        return [{'val': care_site, 'text': care_site}
+                for care_site in care_sites]
 
 
 class ResponsibleParty(ReportSelectField):
@@ -70,21 +52,22 @@ class PatientStatus(ReportSelectField):
     options = [dict(val="active", text=ugettext_noop("Active")),
                dict(val="not_active", text=ugettext_noop("Not Active"))]
 
-class PatientFormNameFilter(BaseDrilldownOptionFilter):
-    label = ugettext_noop("Filter Forms")
+
+class PatientFormNameFilter(BaseSingleOptionFilter):
+    label = ugettext_noop("Form Group")
     slug = "form_name"
     css_class = "span5"
+    default_text = 'All Forms'
 
     @property
-    def drilldown_map(self):
-        return SUBMISSION_SELECT_FIELDS
-
-    @classmethod
-    def get_labels(cls):
+    def options(self):
         return [
-            ('Form Group', 'All Form Groups', 'group'),
-            ('Form Name', 'All Form names', 'xmlns'),
+            ('pm_forms', 'PM Forms'),
+            ('cm_forms', 'CM Forms'),
+            ('chw_forms', 'CHW Forms'),
+            ('task', 'Tasks and Appointments')
         ]
+
 
 class PatientNameFilterMixin(object):
     slug = "patient_id"

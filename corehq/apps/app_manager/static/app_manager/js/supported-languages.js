@@ -37,7 +37,7 @@ var SupportedLanguages = (function () {
         var validate = options.validate;
         var self = this;
 
-        this.editing = ko.observable(options.edit);
+        this.addLanguageDisabled = ko.observable(false);
         this._seen = ko.observable(false);
         this.seen = ko.computed({
             read: function () {
@@ -90,6 +90,7 @@ var SupportedLanguages = (function () {
                             }
                         }
                         self.removedLanguages.removeAll();
+                        self.addLanguageDisabled(false);
                         ko.utils.arrayForEach(self.languages(), function (language) {
                             language.originalLangcode(language.langcode());
                         });
@@ -113,6 +114,7 @@ var SupportedLanguages = (function () {
         }
         this.addLanguage = function () {
             self.languages.push(newLanguage());
+            this.addLanguageDisabled(true);
             self._seen(true);
         };
         this.removeLanguage = function (language) {
@@ -131,7 +133,7 @@ var SupportedLanguages = (function () {
         this.languages.subscribe(changeSaveButton);
 
         this.canSortLanguages = ko.computed(function () {
-             return self.editing() && self.languages().length > 1;
+             return self.languages().length > 1;
         });
 
         this.validateGeneral = function () {
@@ -170,9 +172,9 @@ var SupportedLanguages = (function () {
                 self.languages()[i].originalLangcode();
                 if (message || language == self.languages()[i]) {
                     continue;
-                } else if (language === self.languages()[i].langcode()) {
+                } else if (language.langcode() === self.languages()[i].langcode()) {
                     message = "Language appears twice";
-                } else if (language === self.languages()[i].originalLangcode()) {
+                } else if (language.originalLangcode() === self.languages()[i].originalLangcode()) {
                     message = "This conflicts with a current language";
                 }
             }

@@ -1,6 +1,7 @@
 import datetime
+from corehq.util.dates import iso_string_to_date
 from dimagi.utils.dates import DateSpan
-from django.utils import simplejson
+import json
 from django.utils.translation import ugettext as _, ugettext_noop
 from corehq.apps.reports.dont_use.fields import ReportField
 
@@ -18,8 +19,10 @@ class DateRangeField(ReportField):
         range = self.request.GET.get('range', None)
         if range is not None:
             dates = str(range).split(_(' to '))
-            self.request.datespan.startdate = datetime.datetime.strptime(dates[0], '%Y-%m-%d')
-            self.request.datespan.enddate = datetime.datetime.strptime(dates[1], '%Y-%m-%d')
+            self.request.datespan.startdate = datetime.datetime.combine(
+                iso_string_to_date(dates[0]), datetime.time())
+            self.request.datespan.enddate = datetime.datetime.combine(
+                iso_string_to_date(dates[1]), datetime.time())
 
         self.datespan = DateSpan.since(self.default_days, timezone=self.timezone, inclusive=self.inclusive)
         if self.request.datespan.is_valid():
@@ -28,7 +31,7 @@ class DateRangeField(ReportField):
         self.context['timezone'] = self.timezone.zone
         self.context['datespan'] = self.datespan
 
-        report_labels = simplejson.dumps({
+        report_labels = json.dumps({
             'year_to_date': _('Year to Date'), 'last_month': _('Last Month'),
             'last_quarter': _('Last Quarter'), 'last_two_quarters': _('Last Two Quarters'),
             'last_three_quarters': _('Last Three Quarters'), 'last_year': _('Last Year'),

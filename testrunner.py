@@ -1,4 +1,3 @@
-import functools
 from couchdbkit.ext.django import loading
 from couchdbkit.ext.django.testrunner import CouchDbKitTestSuiteRunner
 import datetime
@@ -47,6 +46,11 @@ class HqTestSuiteRunner(CouchDbKitTestSuiteRunner):
             setattr(settings, setting, value)
             print "set %s settting to %s" % (setting, value)
 
+        settings.EXTRA_COUCHDB_DATABASES = {
+            db_name: self.get_test_db_name(url)
+            for db_name, url in settings.EXTRA_COUCHDB_DATABASES.items()
+        }
+
         return super(HqTestSuiteRunner, self).setup_databases(**kwargs)
 
     def get_all_test_labels(self):
@@ -68,20 +72,28 @@ class TimingTestSuite(unittest.TestSuite):
     def __init__(self, tests=()):
         super(TimingTestSuite, self).__init__(tests)
         self.test_times = []
+        self._patched_test_classes = set()
+
+    def patch_test_class(self, klass):
+        if klass in self._patched_test_classes:
+            return
+
+        suite = self
+        original_call = klass.__call__
+
+        def new_call(self, *args, **kwargs):
+            start = datetime.datetime.utcnow()
+            result = original_call(self, *args, **kwargs)
+            end = datetime.datetime.utcnow()
+            suite.test_times.append((self, end - start))
+            return result
+
+        klass.__call__ = new_call
+
+        self._patched_test_classes.add(klass)
 
     def addTest(self, test):
-        suite = self
-
-        class Foo(test.__class__):
-            def __call__(self, *args, **kwargs):
-                start = datetime.datetime.utcnow()
-                result = super(Foo, self).__call__(*args, **kwargs)
-                end = datetime.datetime.utcnow()
-                suite.test_times.append((self, end - start))
-                return result
-        Foo.__name__ = test.__class__.__name__
-        Foo.__module__ = test.__class__.__module__
-        test.__class__ = Foo
+        self.patch_test_class(test.__class__)
         super(TimingTestSuite, self).addTest(test)
 
 
@@ -101,7 +113,7 @@ class TwoStageTestRunner(HqTestSuiteRunner):
         Check if any of the tests to run subclasses TransactionTestCase.
         """
         simple_tests = unittest.TestSuite()
-        db_tests = unittest.TestSuite()
+        db_tests = TimingTestSuite()
         for test in suite:
             if isinstance(test, TransactionTestCase):
                 db_tests.addTest(test)
@@ -115,9 +127,13 @@ class TwoStageTestRunner(HqTestSuiteRunner):
         """
         self._db_patch = patch('django.db.backends.util.CursorWrapper')
         db_mock = self._db_patch.start()
-        db_mock.side_effect = RuntimeError('No database present during SimpleTestCase run.')
+        error = RuntimeError(
+            "Attempt to access database in a 'no database' test suite run. "
+            "It could be that you don't have 'BASE_ADDRESS' set in your localsettings.py. "
+            "If your test really needs database access it must subclass 'TestCase' and not 'SimpleTestCase'.")
+        db_mock.side_effect = error
 
-        mock_couch = Mock(side_effect=RuntimeError('No database present during SimpleTestCase run.'), spec=[])
+        mock_couch = Mock(side_effect=error, spec=[])
 
         # register our dbs with the extension document classes
         old_handler = loading.couchdbkit_handler
@@ -168,8 +184,7 @@ class TwoStageTestRunner(HqTestSuiteRunner):
 
         if db_suite.countTestCases():
             failures += self.run_db_tests(db_suite)
-            # disabled until TimingTestSuite fixed: http://manage.dimagi.com/default.asp?121894
-            # self.print_test_times(db_suite)
+            self.print_test_times(db_suite)
         self.teardown_test_environment()
         return failures
 
@@ -262,8 +277,7 @@ class GroupTestRunnerCatchall(_OnlySpecificApps, TwoStageTestRunner):
 
         if db_suite.countTestCases():
             failures += self.run_db_tests(db_suite)
-            # disabled until TimingTestSuite fixed: http://manage.dimagi.com/default.asp?121894
-            # self.print_test_times(db_suite)
+            self.print_test_times(db_suite)
         self.teardown_test_environment()
         return failures
 

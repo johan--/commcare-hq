@@ -6,6 +6,7 @@ from django.db import models
 from casexml.apps.stock.models import DocDomainMapping
 from corehq.apps.products.models import Product
 from corehq.apps.locations.models import SQLLocation
+from custom.utils.utils import add_to_module_map
 from dimagi.utils.dates import force_to_datetime
 
 
@@ -15,6 +16,8 @@ class ILSGatewayConfig(Document):
     url = StringProperty(default="http://ilsgateway.com/api/v0_1")
     username = StringProperty()
     password = StringProperty()
+    steady_sync = BooleanProperty(default=False)
+    all_stock_data = BooleanProperty(default=False)
 
     @classmethod
     def for_domain(cls, name):
@@ -35,6 +38,13 @@ class ILSGatewayConfig(Document):
         configs = cls.get_all_configs()
         return [c.domain for c in filter(lambda config: config.enabled, configs)]
 
+    @classmethod
+    def get_all_steady_sync_configs(cls):
+        return [
+            config for config in cls.get_all_configs()
+            if config.steady_sync
+        ]
+
     @property
     def is_configured(self):
         return True if self.enabled and self.url and self.password and self.username else False
@@ -49,6 +59,7 @@ class ILSGatewayConfig(Document):
             DocDomainMapping.objects.create(doc_id=self._id,
                                             domain_name=self.domain,
                                             doc_type='ILSGatewayConfig')
+            add_to_module_map(self.domain, 'custom.ilsgateway')
 
 
 # Ported from:
@@ -151,7 +162,7 @@ class SupplyPointStatus(models.Model):
 class DeliveryGroupReport(models.Model):
     supply_point = models.CharField(max_length=100, db_index=True)
     quantity = models.IntegerField()
-    report_date = models.DateTimeField(default=datetime.now())
+    report_date = models.DateTimeField(default=datetime.utcnow())
     message = models.CharField(max_length=100, db_index=True)
     delivery_group = models.CharField(max_length=1)
     external_id = models.PositiveIntegerField(null=True, db_index=True)
@@ -373,21 +384,21 @@ class DeliveryGroups(object):
             facs = self.facs
         if not facs:
             return []
-        return filter(lambda f: self.current_delivering_group(month) in f.metadata.get('groups', []), facs)
+        return filter(lambda f: self.current_delivering_group(month) == f.metadata.get('group', None), facs)
 
     def processing(self, facs=None, month=None):
         if not facs:
             facs = self.facs
         if not facs:
             return []
-        return filter(lambda f: self.current_processing_group(month) in f.metadata.get('groups', []), facs)
+        return filter(lambda f: self.current_processing_group(month) == f.metadata.get('group', None), facs)
 
     def submitting(self, facs=None, month=None):
         if not facs:
             facs = self.facs
         if not facs:
             return []
-        return filter(lambda f: self.current_submitting_group(month) in f.metadata.get('groups', []), facs)
+        return filter(lambda f: self.current_submitting_group(month) == f.metadata.get('group', None), facs)
 
 
 # Ported from:
@@ -403,6 +414,7 @@ class ReportRun(models.Model):
     complete = models.BooleanField(default=False)
     has_error = models.BooleanField(default=False)
     domain = models.CharField(max_length=60)
+    location = models.ForeignKey(SQLLocation, null=True)
 
     @classmethod
     def last_success(cls, domain):
@@ -410,6 +422,11 @@ class ReportRun(models.Model):
         The last successful execution of a report, or None if no records found.
         """
         qs = cls.objects.filter(complete=True, has_error=False, domain=domain)
+        return qs.order_by("-start_run")[0] if qs.count() else None
+
+    @classmethod
+    def last_run(cls, domain):
+        qs = cls.objects.filter(complete=True, domain=domain)
         return qs.order_by("-start_run")[0] if qs.count() else None
 
 
@@ -426,3 +443,20 @@ class RequisitionReport(models.Model):
     location_id = models.CharField(max_length=100, db_index=True)
     submitted = models.BooleanField(default=False)
     report_date = models.DateTimeField(default=datetime.utcnow)
+
+
+class SupervisionDocument(models.Model):
+    document = models.TextField()
+    domain = models.CharField(max_length=100)
+    name = models.CharField(max_length=100)
+    data_type = models.CharField(max_length=100)
+
+
+class ILSNotes(models.Model):
+    location = models.ForeignKey(SQLLocation)
+    domain = models.CharField(max_length=100, null=False)
+    user_name = models.CharField(max_length=128, null=False)
+    user_role = models.CharField(max_length=100, null=True)
+    user_phone = models.CharField(max_length=20, null=True)
+    date = models.DateTimeField()
+    text = models.TextField()

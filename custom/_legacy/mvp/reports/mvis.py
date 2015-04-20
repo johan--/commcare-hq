@@ -6,6 +6,7 @@ import logging
 import numpy
 import pytz
 from corehq.apps.indicators.models import DynamicIndicatorDefinition, CombinedCouchViewIndicatorDefinition
+from corehq.const import USER_MONTH_FORMAT
 from dimagi.utils.decorators.memoized import memoized
 from mvp.models import MVP
 from mvp.reports import MVPIndicatorReport
@@ -59,8 +60,10 @@ class HealthCoordinatorReport(MVPIndicatorReport):
             total_rowspan = 0
             for slug in category_group['indicator_slugs']:
                 try:
-                    indicator = DynamicIndicatorDefinition.get_current(MVP.NAMESPACE, self.domain, slug,
-                                                                       wrap_correctly=True)
+                    indicator = DynamicIndicatorDefinition.get_current(
+                        MVP.NAMESPACE, self.domain, slug,
+                        wrap_correctly=True,
+                    )
                     if self.is_rendered_as_email:
                         retrospective = indicator.get_monthly_retrospective(user_ids=self.user_ids)
                     else:
@@ -141,6 +144,7 @@ class HealthCoordinatorReport(MVPIndicatorReport):
                 'category_title': "Child Health",
                 'category_slug': 'child_health',
                 'indicator_slugs': [
+                    "length_reading_proportion",
                     "muac_routine_proportion",
                     "muac_wasting_proportion",
                     "moderate_muac_wasting_proportion",
@@ -240,7 +244,7 @@ class HealthCoordinatorReport(MVPIndicatorReport):
 
     def get_indicator_row(self, retrospective):
         row = [i.get('value', 0) for i in retrospective]
-        nonzero_row = [r for r in row if r]
+        nonzero_row = [r for r in row]
         row.extend(self._get_statistics(nonzero_row))
         return dict(
             numerators=self._format_row(row)
@@ -255,7 +259,7 @@ class HealthCoordinatorReport(MVPIndicatorReport):
         )
         if self.is_debug:
             for result in retrospective:
-                result['date'] = result['date'].strftime("%B %Y")
+                result['date'] = result['date'].strftime(USER_MONTH_FORMAT)
             return retrospective
         if isinstance(indicator, CombinedCouchViewIndicatorDefinition):
             table = self.get_indicator_table(retrospective)

@@ -16,7 +16,7 @@
     ],
     "columns": [
         {
-            "type": "owner",
+            "type": "field",
             "display": "Owner",
             "field": "owner",
             "aggregation": "simple"
@@ -24,6 +24,7 @@
         {
             "type": "field",
             "display": "Tickets",
+            "description": "Number of tickets",
             "field": "count",
             "aggregation": "sum"
         },
@@ -31,7 +32,8 @@
             "type": "field",
             "display": "Starred",
             "field": "is_starred",
-            "aggregation": "sum"
+            "aggregation": "sum",
+            "format": "percent_of_total"
         }
     ]
 }

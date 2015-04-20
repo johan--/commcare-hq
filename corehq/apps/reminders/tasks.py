@@ -42,22 +42,26 @@ def case_changed(case_id, handler_ids, retry_num=0):
                     message="Error processing reminder rule updates for case %s" %
                     case_id)
         else:
-            notify_exception(None,
-                message="Error processing reminder rule updates for case %s" %
-                case_id)
+            notify_exception(None, message="Error processing reminder rule updates for case %s" % case_id)
+
 
 def _case_changed(case_id, handler_ids):
     subcases = None
     case = CommCareCase.get(case_id)
-    for handler_id in handler_ids:
-        handler = CaseReminderHandler.get(handler_id)
+    for handler in CaseReminderHandler.get_handlers_from_ids(handler_ids):
         if handler.start_condition_type == CASE_CRITERIA:
-            handler.case_changed(case)
+            kwargs = {}
+            if handler.uses_time_case_property:
+                kwargs = {
+                    'schedule_changed': True,
+                    'prev_definition': handler,
+                }
+            handler.case_changed(case, **kwargs)
             if handler.uses_parent_case_property:
                 if subcases is None:
                     subcases = get_subcases(case)
                 for subcase in subcases:
-                    handler.case_changed(subcase)
+                    handler.case_changed(subcase, **kwargs)
 
 @task(queue=settings.CELERY_REMINDER_RULE_QUEUE)
 def process_reminder_rule(handler, schedule_changed, prev_definition,

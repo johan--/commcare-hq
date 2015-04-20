@@ -1,12 +1,12 @@
 <suite version="1" descriptor="Suite File">
 <xform>
-    <resource id="18a9fb5f97a467ace9c523e2f1199169b2134290" version="1">
+    <resource id="22d1de45951bf13617ccf67363a17654fd6a7e4b" version="1">
         <location authority="local">./modules-0/forms-0.xml</location>
         <location authority="remote">./modules-0/forms-0.xml</location>
     </resource>
 </xform>
 <xform>
-    <resource id="1496209be7dca714fb2306204b7042b16979099f" version="1">
+    <resource id="ce346cae72738cf8aee66244fe9e8946a8119e17" version="1">
         <location authority="local">./modules-0/forms-1.xml</location>
         <location authority="remote">./modules-0/forms-1.xml</location>
     </resource>
@@ -288,6 +288,9 @@
             <locale id="forms.m0f0"/>
         </text>
     </command>
+    <session>
+        <datum id="case_id_new_suite_test_0" function="uuid()"/>
+    </session>
 </entry>
 <entry>
     <form>http://openrosa.org/formdesigner/BC66AA7E-7CB8-4D98-8FAA-68B60E52285D</form>

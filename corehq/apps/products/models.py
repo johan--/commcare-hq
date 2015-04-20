@@ -70,7 +70,7 @@ class Product(Document):
         product.
         """
         # mark modified time stamp for selective syncing
-        self.last_modified = datetime.now()
+        self.last_modified = datetime.utcnow()
 
         # generate code if user didn't specify one
         if not self.code:
@@ -124,6 +124,8 @@ class Product(Document):
         Gets all products in a domain.
 
         By default this filters out any archived products.
+        WARNING: this doesn't paginate correctly; it filters after the query
+        If you need pagination, use SQLProduct instead
         """
         kwargs.update(dict(
             view_name='commtrack/products',
@@ -296,8 +298,15 @@ class SQLProduct(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     last_modified = models.DateTimeField(auto_now=True)
 
+    def __unicode__(self):
+        return u"{} ({})".format(self.name, self.domain)
+
     def __repr__(self):
         return "<SQLProduct(domain=%s, name=%s)>" % (
             self.domain,
             self.name
         )
+
+    @classmethod
+    def by_domain(cls, domain):
+        return cls.objects.filter(domain=domain).all()

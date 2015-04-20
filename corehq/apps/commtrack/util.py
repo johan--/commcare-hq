@@ -2,11 +2,12 @@ from xml.etree import ElementTree
 from casexml.apps.case.models import CommCareCase
 from corehq.apps.commtrack import const
 from corehq.apps.commtrack.models import (
-    CommtrackConfig, CommtrackActionConfig, LocationType, RequisitionActions,
-    CommtrackRequisitionConfig, Product, SupplyPointCase, RequisitionCase
+    CommtrackConfig, CommtrackActionConfig, RequisitionActions,
+    CommtrackRequisitionConfig, SupplyPointCase, RequisitionCase
 )
+from corehq.apps.products.models import Product
 from corehq.apps.programs.models import Program
-from corehq.apps.locations.models import Location
+from corehq.apps.locations.models import Location, LocationType
 import itertools
 from datetime import datetime, date, timedelta
 from calendar import monthrange
@@ -17,6 +18,8 @@ from casexml.apps.case.mock import CaseBlock
 from casexml.apps.case.xml import V2
 from django.utils.text import slugify
 from unidecode import unidecode
+from corehq.feature_previews import enable_commtrack_previews
+from corehq.util.dates import iso_string_to_date
 from dimagi.utils.parsing import json_format_datetime
 from django.utils.translation import ugettext as _
 import re
@@ -85,11 +88,31 @@ def get_or_create_default_program(domain):
         )
 
 
+def bootstrap_location_types(domain):
+    previous = None
+    for name, administrative in [
+        ('state', True),
+        ('district', True),
+        ('block', True),
+        ('village', True),
+        ('outlet', False),
+    ]:
+        location_type, _ = LocationType.objects.get_or_create(
+            domain=domain,
+            name=name,
+            defaults={
+                'parent_type': previous,
+                'administrative': administrative,
+            },
+        )
+        previous = location_type
+
+
+
 def bootstrap_commtrack_settings_if_necessary(domain, requisitions_enabled=False):
     """
     Create a new CommtrackConfig object for a domain
     if it does not already exist.
-
 
     This adds some collection of default products, programs,
     SMS keywords, etc.
@@ -134,33 +157,8 @@ def bootstrap_commtrack_settings_if_necessary(domain, requisitions_enabled=False
                 caption='Stock-out',
             ),
         ],
-        location_types=[
-            LocationType(
-                name='state',
-                allowed_parents=[''],
-                administrative=True
-            ),
-            LocationType(
-                name='district',
-                allowed_parents=['state'],
-                administrative=True
-            ),
-            LocationType(
-                name='block',
-                allowed_parents=['district'],
-                administrative=True
-            ),
-            LocationType(
-                name='village',
-                allowed_parents=['block'],
-                administrative=True
-            ),
-            LocationType(
-                name='outlet',
-                allowed_parents=['village']
-            ),
-        ],
     )
+
     if requisitions_enabled:
         config.requisition_config = get_default_requisition_config()
 
@@ -170,6 +168,12 @@ def bootstrap_commtrack_settings_if_necessary(domain, requisitions_enabled=False
     make_product(domain.name, 'Sample Product 1', 'pp', program.get_id)
     make_product(domain.name, 'Sample Product 2', 'pq', program.get_id)
     make_product(domain.name, 'Sample Product 3', 'pr', program.get_id)
+
+    bootstrap_location_types(domain.name)
+
+    # Enable feature flags if necessary - this is required by exchange
+    # and should have no effect on changing the project settings directly
+    enable_commtrack_previews(domain)
 
     return config
 
@@ -236,7 +240,7 @@ def due_date_monthly(day, from_end=False, past_period=0):
 
 
 def num_periods_late(product_case, schedule, *schedule_args):
-    last_reported = datetime.strptime(getattr(product_case, 'last_reported', '2000-01-01')[:10], '%Y-%m-%d').date()
+    last_reported = iso_string_to_date(getattr(product_case, 'last_reported', '2000-01-01')[:10])
 
     class DueDateStream(object):
         """mimic an array of due dates to perform a binary search"""

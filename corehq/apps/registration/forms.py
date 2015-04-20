@@ -9,10 +9,11 @@ from django.core.validators import validate_email
 from corehq.apps.domain.models import Domain
 from corehq.apps.domain.utils import new_domain_re, new_org_re, website_re
 from corehq.apps.orgs.models import Organization
+from corehq.apps.style.forms.widgets import Select2Widget
 from django.utils.encoding import smart_str
 from django.utils.safestring import mark_safe
-from dimagi.utils.timezones.fields import TimeZoneField
-from dimagi.utils.timezones.forms import TimeZoneChoiceField
+from corehq.util.timezones.fields import TimeZoneField
+from corehq.util.timezones.forms import TimeZoneChoiceField
 from django.utils.translation import ugettext_lazy as _
 
 class NewWebUserRegistrationForm(forms.Form):
@@ -139,9 +140,9 @@ class DomainRegistrationForm(forms.Form):
                                   initial='commcare')
     domain_timezone = TimeZoneChoiceField(
         label=_("Time Zone:"), initial="UTC", required=False,
-        widget=forms.Select(attrs={'class': 'input-xlarge',
-                                   'bindparent': 'visible: override_tz',
-                                   'data-bind': 'event: {change: updateForm}'}))
+        widget=Select2Widget(attrs={'class': 'input-xlarge',
+                                    'bindparent': 'visible: override_tz',
+                                    'data-bind': 'event: {change: updateForm}'}))
 
     def clean_domain_name(self):
         data = self.cleaned_data['domain_name'].strip().lower()

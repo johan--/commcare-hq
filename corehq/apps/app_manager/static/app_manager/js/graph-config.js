@@ -8,6 +8,7 @@
  *      lang
  *      langs
  *      childCaseTypes
+ *      fixtures
  * @param serverRepresentationOfGraph
  * Object corresponding to a graph configuration saved in couch.
  * @constructor
@@ -18,9 +19,9 @@ uiElement.GraphConfiguration = function(moduleOptions, serverRepresentationOfGra
 
     var $editButtonDiv = $(
         '<div>' +
-            '<button class="btn" data-bind="click: openModal, visible: $data.edit">' +
+            '<button class="btn" data-bind="click: openModal">' +
                 '<i class="icon-pencil"></i>' +
-                'Edit Graph' +
+                ' Edit Graph' +
             '</button>' +
         '</div>'
     );
@@ -29,7 +30,6 @@ uiElement.GraphConfiguration = function(moduleOptions, serverRepresentationOfGra
     self.graphViewModel = new GraphViewModel(moduleOptions);
     self.graphViewModel.populate(getGraphViewModelJS(serverRepresentationOfGraph, moduleOptions));
 
-    self.edit = ko.observable(true);
     self.openModal = function (uiElementViewModel){
 
         // make a copy of the view model
@@ -128,8 +128,8 @@ uiElement.GraphConfiguration = function(moduleOptions, serverRepresentationOfGra
      * An object in the form returned of that returned by self.val(). That is,
      * in the same form as the the graph configuration saved in couch.
      * @param moduleOptions
-     * Additional options that are derived from the module like lang, langs,
-     * and childCaseTypes.
+     * Additional options that are derived from the module (or app) like lang,
+     * langs, childCaseTypes, and fixtures.
      * @returns {{}}
      */
     function getGraphViewModelJS(serverGraphObject, moduleOptions){
@@ -181,6 +181,7 @@ uiElement.GraphConfiguration = function(moduleOptions, serverRepresentationOfGra
             };
         });
         ret.childCaseTypes = moduleOptions.childCaseTypes;
+        ret.fixtures = moduleOptions.fixtures;
 
         return ret;
     }
@@ -284,7 +285,7 @@ var GraphViewModel = function(moduleOptions){
     self.annotations = ko.observableArray([]);
     self.axisTitleConfigurations = ko.observableArray(_.map(
         // If you add to this list, don't forget to update theOrder in populate() (I know this is gross)
-        ['x-title', 'y-title'/*, 'secondary-y-title'*/],
+        ['x-title', 'y-title', 'secondary-y-title'],
         function(s){return new LocalizedConfigPropertyValuePair({
             'property': s,
             'lang': self.lang,
@@ -298,20 +299,12 @@ var GraphViewModel = function(moduleOptions){
         'x-max',
         'y-min',
         'y-max',
-        /* Not available until 2.17
         'secondary-y-min',
         'secondary-y-max',
-        */
         // Axis labels:
-        /* Not available until 2.17
         'x-labels',
         'y-labels',
-        */
-        'x-label-count',
-        'y-label-count',
-        /* Not available until 2.17
         'secondary-y-labels',
-        */
         // other:
         'show-grid',
         'show-axes',
@@ -328,25 +321,24 @@ var GraphViewModel = function(moduleOptions){
         'x-max': 'ex: 100',
         'y-min': 'ex: 0',
         'y-max': 'ex: 100',
-        //'secondary-y-min': 'ex: 0',
-        //'secondary-y-max': 'ex: 100',
+        'secondary-y-min': 'ex: 0',
+        'secondary-y-max': 'ex: 100',
         // Axis labels:
-        //'x-labels': 'ex: 3 or [1,3,5] or {"0":"freezing"}',
-        //'y-labels': 'ex: 3 or [1,3,5] or {"0":"freezing"}',
-        'x-label-count': 'ex: 3',
-        'y-label-count': 'ex: 3',
-        //'secondary-y-labels': 'ex: 3 or [1,3,5] or {"0":"freezing"}',
+        'x-labels': 'ex: 3 or \'[1,3,5]\' or \'{"0":"freezing"}\'',
+        'y-labels': 'ex: 3 or \'[1,3,5]\' or \'{"0":"freezing"}\'',
+        'secondary-y-labels': 'ex: 3 or [1,3,5] or {"0":"freezing"}',
         // other:
-        'show-grid': 'true or false',
-        'show-axes': 'true or false',
-        'zoom': 'true or false'
+        'show-grid': 'true() or false()',
+        'show-axes': 'true() or false()',
+        'zoom': 'true() or false()'
     };
     self.childCaseTypes = moduleOptions.childCaseTypes || [];
+    self.fixtures = moduleOptions.fixtures || [];
 
     self.selectedGraphType.subscribe(function(newValue) {
         // Recreate the series objects to be of the correct type.
         self.series(_.map(self.series(), function(series){
-            return new (self.getSeriesConstructor())(ko.toJS(series), self.childCaseTypes);
+            return new (self.getSeriesConstructor())(ko.toJS(series), self.childCaseTypes, self.fixtures);
         }));
     });
 
@@ -354,7 +346,7 @@ var GraphViewModel = function(moduleOptions){
         self.graphDisplayName(obj.graphDisplayName);
         self.selectedGraphType(obj.selectedGraphType);
         self.series(_.map(obj.series, function(o){
-            return new (self.getSeriesConstructor())(o, self.childCaseTypes);
+            return new (self.getSeriesConstructor())(o, self.childCaseTypes, self.fixtures);
         }));
         self.annotations(_.map(obj.annotations, function(o){
             return new Annotation(o);
@@ -367,7 +359,7 @@ var GraphViewModel = function(moduleOptions){
         }
         // This is dumb:
         // might make more sense to sort this in getGraphViewModelJS. Either way it's annoying.
-        var theOrder = {'x-title':0, 'y-title':1/*, 'secondary-y-title': 2*/};
+        var theOrder = {'x-title':0, 'y-title':1, 'secondary-y-title': 2};
         self.axisTitleConfigurations.sort(function(a, b){
             return theOrder[a.property] - theOrder[b.property];
         });
@@ -377,13 +369,14 @@ var GraphViewModel = function(moduleOptions){
         }));
 
         self.childCaseTypes = obj.childCaseTypes.slice(0);
+        self.fixtures = obj.fixtures.slice(0);
     };
 
     self.removeSeries = function (series){
         self.series.remove(series);
     };
     self.addSeries = function (series){
-        self.series.push(new (self.getSeriesConstructor())({}, self.childCaseTypes));
+        self.series.push(new (self.getSeriesConstructor())({}, self.childCaseTypes, self.fixtures));
     };
     /**
      * Return the proper Series object constructor based on the current state
@@ -422,15 +415,21 @@ var Annotation = function(original){
 Annotation.prototype = new LocalizableValue();
 Annotation.prototype.constructor = Annotation;
 
-var GraphSeries = function (original, childCaseTypes){
+var GraphSeries = function (original, childCaseTypes, fixtures){
     PairConfiguration.apply(this, [original]);
     var self = this;
     original = original || {};
     childCaseTypes = childCaseTypes || [];
+    fixtures = fixtures || [];
 
     function origOrDefault(prop, fallback){
         return original[prop] === undefined ? fallback : original[prop];
     }
+
+    self.getFixtureInstanceId = function(fixtureName){
+        return "item-list:" + fixtureName;
+    };
+
     /**
      * Return the default value for the data path field based on the given source.
      * This is used to change the data path field when a new source type is selected.
@@ -438,10 +437,12 @@ var GraphSeries = function (original, childCaseTypes){
      * @returns {string}
      */
     self.getDefaultDataPath = function(source){
-        if (source == "custom"){
+        if (source.type == "custom"){
              return "instance('name')/root/path-to-point/point";
-        } else {
-            return "instance('casedb')/casedb/case[@case_type='"+source+"'][index/parent=current()/@case_id][@status='open']";
+        } else if (source.type == 'case') {
+            return "instance('casedb')/casedb/case[@case_type='"+source.name+"'][index/parent=current()/@case_id][@status='open']";
+        } else if (source.type == 'fixture') {
+            return "instance('" + self.getFixtureInstanceId(source.name) + "')/" + source.name + "_list/" + source.name;
         }
     };
 
@@ -450,10 +451,16 @@ var GraphSeries = function (original, childCaseTypes){
         _.map(childCaseTypes, function(s){
             return {
                 'text': "Child case: " + s,
-                'value' : s
+                'value': {'type': 'case', 'name': s}
             };
-        }).concat([{'text':'custom', 'value':'custom'}])
+        }).concat(_.map(fixtures, function(s){
+            return {
+                'text': "Lookup table: " + s,
+                'value': {type: 'fixture', name: s}
+            };
+        })).concat([{'text':'custom', 'value': 'custom'}])
     ));
+
     self.selectedSource = ko.observable(origOrDefault('selectedSource', self.sourceOptions()[0]));
     // Fix selectedSource reference:
     //  (selectedSource has to be a reference to an object in sourceOptions.
@@ -462,7 +469,7 @@ var GraphSeries = function (original, childCaseTypes){
     if (!_.contains(self.sourceOptions(), self.selectedSource())){
         var curSource = self.selectedSource();
         var source = _.find(self.sourceOptions(), function(opt){
-            return opt.text == curSource.text && opt.value == curSource.value;
+            return _.isEqual(opt, curSource);
         });
         self.selectedSource(source);
     }
@@ -494,19 +501,19 @@ var GraphSeries = function (original, childCaseTypes){
 GraphSeries.prototype = new PairConfiguration();
 GraphSeries.prototype.constructor = GraphSeries;
 
-var XYGraphSeries = function(original, childCaseTypes){
-    GraphSeries.apply(this, [original, childCaseTypes]);
+var XYGraphSeries = function(original, childCaseTypes, fixtures){
+    GraphSeries.apply(this, [original, childCaseTypes, fixtures]);
     var self = this;
-    self.configPropertyOptions = self.configPropertyOptions.concat(['point-style'/*,'secondary-y'*/]);
-    self.configPropertyHints['point-style'] = "'none', 'circle', or 'x'";
-    //self.configPropertyHints['secondary-y'] = 'ex: false';
+    self.configPropertyOptions = self.configPropertyOptions.concat(['point-style', 'secondary-y']);
+    self.configPropertyHints['point-style'] = "'none', 'circle', 'x', 'diamond', ..."; //triangle and square are also options
+    self.configPropertyHints['secondary-y'] = 'true() or false()';
 
 };
 XYGraphSeries.prototype = new GraphSeries();
 XYGraphSeries.constructor = XYGraphSeries;
 
-var BubbleGraphSeries = function(original, childCaseTypes){
-    GraphSeries.apply(this, [original, childCaseTypes]);
+var BubbleGraphSeries = function(original, childCaseTypes, fixtures){
+    GraphSeries.apply(this, [original, childCaseTypes, fixtures]);
     var self = this;
 
     self.radiusFunction = ko.observable(original.radiusFunction === undefined ? "" : original.radiusFunction);

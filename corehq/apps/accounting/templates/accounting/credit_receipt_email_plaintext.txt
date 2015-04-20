@@ -9,7 +9,7 @@ Payment Date: {{ date_paid }}
 Transaction No.: {{ transaction_id }}
 
 Thank you for using {{ product }}. If you have any questions, please don't
-hesitate to contact accounts@dimagi.com.
+hesitate to contact {{ invoicing_contact_email }}.
 
 Best Regards,
 The {{ product }} HQ Team
@@ -17,5 +17,5 @@ www.commcarehq.org
 
 Email From:
 CommCare HQ and the corporation Dimagi, Inc.
-585 Massachusetts Ave, Ste 3, Cambridge, MA 02139 USA
+585 Massachusetts Ave, Ste 4, Cambridge, MA 02139 USA
 {% endblocktrans %}

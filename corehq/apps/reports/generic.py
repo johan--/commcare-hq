@@ -1,19 +1,22 @@
 from StringIO import StringIO
 import datetime
+import re
+import pytz
+import json
+
 from celery.utils.log import get_task_logger
-from django.core.urlresolvers import reverse
 from django.http import HttpResponse, Http404
 from django.template.context import RequestContext
-import json
 from django.template.loader import render_to_string
 from django.shortcuts import render
 
-import pytz
+from corehq.apps.reports.tasks import export_all_rows_task
 from corehq.apps.reports.models import ReportConfig
-from corehq.apps.reports import util
 from corehq.apps.reports.datatables import DataTablesHeader
 from corehq.apps.reports.filters.dates import DatespanFilter
 from corehq.apps.users.models import CouchUser
+from corehq.util.timezones.utils import get_timezone_for_user
+from corehq.util.view_utils import absolute_reverse
 from couchexport.export import export_from_tables
 from couchexport.shortcuts import export_response
 from dimagi.utils.couch.pagination import DatatablesParams
@@ -21,13 +24,13 @@ from dimagi.utils.decorators.memoized import memoized
 from dimagi.utils.modules import to_function
 from dimagi.utils.web import json_request, json_response
 from dimagi.utils.parsing import string_to_boolean
-from corehq.apps.reports.cache import CacheableRequestMixIn, request_cache
+from corehq.apps.reports.cache import request_cache
 from django.utils.translation import ugettext
 
 CHART_SPAN_MAP = {1: '10', 2: '6', 3: '4', 4: '3', 5: '2', 6: '2'}
 
 
-class GenericReportView(CacheableRequestMixIn):
+class GenericReportView(object):
     """
         A generic report structure for viewing a report
         (or pages that follow the reporting structure closely---though that seems a bit hacky)
@@ -70,6 +73,8 @@ class GenericReportView(CacheableRequestMixIn):
     section_name = None  # string. ex: "Reports"
     dispatcher = None  # ReportDispatcher subclass
 
+    is_cacheable = False  # whether to use caching on @request_cache methods
+
     # Code can expect `fields` to be an iterable even when empty (never None)
     fields = ()
 
@@ -84,7 +89,7 @@ class GenericReportView(CacheableRequestMixIn):
     printable = False
 
     exportable = False
-    exportable_all = False
+    exportable_all = False  # also requires overriding self.get_all_rows
     mobile_enabled = False
     export_format_override = None
     icon = None
@@ -121,7 +126,7 @@ class GenericReportView(CacheableRequestMixIn):
             raise ValueError("Class property dispatcher should point to a subclass of ReportDispatcher.")
 
         self.request = request
-        self.request_params = json_request(self.request.GET)
+        self.request_params = json_request(self.request.GET if self.request.method == 'GET' else self.request.POST)
         self.domain = domain
         self.context = base_context or {}
         self._update_initial_context()
@@ -146,7 +151,7 @@ class GenericReportView(CacheableRequestMixIn):
         # pickle only what the report needs from the request object
 
         request = dict(
-            GET=self.request.GET,
+            GET=self.request.GET if self.request.method == 'GET' else self.request.POST,
             META=dict(
                 QUERY_STRING=self.request.META.get('QUERY_STRING'),
                 PATH_INFO=self.request.META.get('PATH_INFO')
@@ -190,7 +195,7 @@ class GenericReportView(CacheableRequestMixIn):
         request.datespan = request_data.get('datespan')
 
         try:
-            couch_user = CouchUser.get(request_data.get('couch_user'))
+            couch_user = CouchUser.get_by_user_id(request_data.get('couch_user'))
             request.couch_user = couch_user
         except Exception as e:
             logging.error("Could not unpickle couch_user from request for report %s. Error: %s" %
@@ -231,9 +236,9 @@ class GenericReportView(CacheableRequestMixIn):
             return pytz.utc
         else:
             try:
-                return util.get_timezone(self.request.couch_user, self.domain)
+                return get_timezone_for_user(self.request.couch_user, self.domain)
             except AttributeError:
-                return util.get_timezone(None, self.domain)
+                return get_timezone_for_user(None, self.domain)
 
     @property
     @memoized
@@ -356,8 +361,8 @@ class GenericReportView(CacheableRequestMixIn):
                 'table_or_sheet_name',
                 [
                     ['header'],
-                    ['row 1']
-                    ['row 2']
+                    ['row 1'],
+                    ['row 2'],
                 ]
             ]
         ]
@@ -497,7 +502,6 @@ class GenericReportView(CacheableRequestMixIn):
         self.context.update(self._validate_context_dict(self.report_context))
 
     @property
-    @request_cache("default")
     def view_response(self):
         """
             Intention: Not to be overridden in general.
@@ -512,12 +516,11 @@ class GenericReportView(CacheableRequestMixIn):
         self.set_announcements()
         return render(self.request, template, self.context)
 
-    
     @property
-    @request_cache("mobile")
+    @request_cache()
     def mobile_response(self):
         """
-        This tries to render a mobile version of the report, by just calling 
+        This tries to render a mobile version of the report, by just calling
         out to a very simple default template. Likely won't work out of the box
         with most reports.
         """
@@ -528,7 +531,7 @@ class GenericReportView(CacheableRequestMixIn):
         async_context = self._async_context()
         self.context.update(async_context)
         return render(self.request, self.mobile_template_base, self.context)
-    
+
     @property
     def email_response(self):
         """
@@ -539,14 +542,14 @@ class GenericReportView(CacheableRequestMixIn):
         return self.async_response
 
     @property
-    @request_cache("async")
+    @request_cache()
     def async_response(self):
         """
             Intention: Not to be overridden in general.
             Renders the asynchronous view of the report template, returned as json.
         """
         return HttpResponse(json.dumps(self._async_context()), content_type='application/json')
-    
+
     def _async_context(self):
         self.update_template_context()
         self.update_report_context()
@@ -576,7 +579,7 @@ class GenericReportView(CacheableRequestMixIn):
         return file
 
     @property
-    @request_cache("filters", expiry=60 * 10)
+    @request_cache(expiry=60 * 10)
     def filters_response(self):
         """
             Intention: Not to be overridden in general.
@@ -593,7 +596,7 @@ class GenericReportView(CacheableRequestMixIn):
         )))
 
     @property
-    @request_cache("json")
+    @request_cache()
     def json_response(self):
         """
             Intention: Not to be overridden in general.
@@ -602,18 +605,22 @@ class GenericReportView(CacheableRequestMixIn):
         return json_response(self.json_dict)
 
     @property
-    @request_cache("export")
+    @request_cache()
     def export_response(self):
         """
         Intention: Not to be overridden in general.
         Returns the tabular export of the data, if available.
         """
-        temp = StringIO()
-        export_from_tables(self.export_table, temp, self.export_format)
-        return export_response(temp, self.export_format, self.export_name)
+        if self.exportable_all:
+            export_all_rows_task.delay(self.__class__, self.__getstate__())
+            return HttpResponse()
+        else:
+            temp = StringIO()
+            export_from_tables(self.export_table, temp, self.export_format)
+            return export_response(temp, self.export_format, self.export_name)
 
     @property
-    @request_cache("raw")
+    @request_cache()
     def print_response(self):
         """
         Returns the report for printing.
@@ -646,11 +653,16 @@ class GenericReportView(CacheableRequestMixIn):
         url_args = [domain] if domain is not None else []
         if render_as is not None:
             url_args.append(render_as+'/')
-        return reverse(cls.dispatcher.name(), args=url_args+[cls.slug])
+        return absolute_reverse(cls.dispatcher.name(),
+                                args=url_args + [cls.slug])
 
     @classmethod
     def show_in_navigation(cls, domain=None, project=None, user=None):
         return True
+
+    @classmethod
+    def display_in_dropdown(cls, domain=None, project=None, user=None):
+        return False
 
     @classmethod
     def get_subpages(cls):
@@ -709,7 +721,7 @@ class GenericTabularReport(GenericReportView):
     use_datatables = True
     charts_per_row = 1
     bad_request_error_text = None
-    
+
     # override old class properties
     report_template_path = "reports/async/tabular.html"
     flush_layout = True
@@ -826,6 +838,21 @@ class GenericTabularReport(GenericReportView):
         """
         return dict(num=1, width=200)
 
+    @staticmethod
+    def _strip_tags(value):
+        """
+        Strip HTML tags from a value
+        """
+        # Uses regex. Regex is much faster than using an HTML parser, but will
+        # strip "<2 && 3>" from a value like "1<2 && 3>2". A parser will treat
+        # each cell like an HTML document, which might be overkill, but if
+        # using regex breaks values then we should use a parser instead, and
+        # take the knock. Assuming we won't have values with angle brackets,
+        # using regex for now.
+        if isinstance(value, basestring):
+            return re.sub('<[^>]*?>', '', value)
+        return value
+
     @property
     def override_export_sheet_name(self):
         """
@@ -857,7 +884,7 @@ class GenericTabularReport(GenericReportView):
             def _unformat_val(val):
                 if isinstance(val, dict):
                     return val.get('raw', val.get('sort_key', val))
-                return val
+                return self._strip_tags(val)
 
             return [_unformat_val(val) for val in row]
 
@@ -883,6 +910,7 @@ class GenericTabularReport(GenericReportView):
             return self.rows
 
     @property
+    @request_cache()
     def report_context(self):
         """
             Don't override.
@@ -943,10 +971,11 @@ class GenericTabularReport(GenericReportView):
             context.update(provider_function(self))
         return context
 
-    def table_cell(self, value, html=None):
+    def table_cell(self, value, html=None, zerostyle=False):
+        styled_value = '<span class="muted">0</span>' if zerostyle and value == 0 else value
         return dict(
             sort_key=value,
-            html="%s" % value if html is None else html
+            html="%s" % styled_value if html is None else html
         )
 
 

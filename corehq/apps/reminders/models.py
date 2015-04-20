@@ -6,7 +6,7 @@ from couchdbkit.ext.django.schema import *
 from casexml.apps.case.models import CommCareCase, CommCareCaseGroup
 from corehq.apps.sms.models import CommConnectCase
 from corehq.apps.users.cases import get_owner_id, get_wrapped_owner
-from corehq.apps.users.models import CommCareUser, CouchUser
+from corehq.apps.users.models import CouchUser
 from corehq.apps.groups.models import Group
 from dimagi.utils.parsing import string_to_datetime, json_format_datetime
 from dateutil.parser import parse
@@ -22,6 +22,10 @@ from dimagi.utils.multithreading import process_fast
 from dimagi.utils.logging import notify_exception
 from random import randint
 from django.conf import settings
+from dimagi.utils.couch.database import iter_docs
+
+class IllegalModelStateException(Exception):
+    pass
 
 METHOD_SMS = "sms"
 METHOD_SMS_CALLBACK = "callback"
@@ -115,7 +119,9 @@ FORM_TYPE_CHOICES = [FORM_TYPE_ONE_BY_ONE, FORM_TYPE_ALL_AT_ONCE]
 REMINDER_TYPE_ONE_TIME = "ONE_TIME"
 REMINDER_TYPE_KEYWORD_INITIATED = "KEYWORD_INITIATED"
 REMINDER_TYPE_DEFAULT = "DEFAULT"
-REMINDER_TYPE_CHOICES = [REMINDER_TYPE_DEFAULT, REMINDER_TYPE_ONE_TIME, REMINDER_TYPE_KEYWORD_INITIATED]
+REMINDER_TYPE_SURVEY_MANAGEMENT = "SURVEY_MANAGEMENT"
+REMINDER_TYPE_CHOICES = [REMINDER_TYPE_DEFAULT, REMINDER_TYPE_ONE_TIME,
+    REMINDER_TYPE_KEYWORD_INITIATED, REMINDER_TYPE_SURVEY_MANAGEMENT]
 
 SEND_NOW = "NOW"
 SEND_LATER = "LATER"
@@ -169,6 +175,25 @@ def case_matches_criteria(case, match_type, case_property, value_to_match):
             result = False
     
     return result
+
+
+def get_events_scheduling_info(events):
+    """
+    Return a list of events as dictionaries, only with information pertinent to scheduling changes.
+    """
+    result = []
+    for e in events:
+        result.append({
+            "day_num": e.day_num,
+            "fire_time": e.fire_time,
+            "fire_time_aux": e.fire_time_aux,
+            "fire_time_type": e.fire_time_type,
+            "time_window_length": e.time_window_length,
+            "callback_timeout_intervals": e.callback_timeout_intervals,
+            "form_unique_id": e.form_unique_id,
+        })
+    return result
+
 
 class MessageVariable(object):
     def __init__(self, variable):
@@ -256,9 +281,9 @@ class CaseReminderEvent(DocumentSchema):
     callback_timeout_intervals = ListProperty(IntegerProperty)
     form_unique_id = StringProperty()
 
+
 def run_rule(case_id, handler, schedule_changed, prev_definition):
     case = CommCareCase.get(case_id)
-    handler.set_rule_checkpoint(1, incr=True)
     try:
         handler.case_changed(case, schedule_changed=schedule_changed,
             prev_definition=prev_definition)
@@ -267,20 +292,17 @@ def run_rule(case_id, handler, schedule_changed, prev_definition):
         # the scheduling.
         handler.case_changed(case, schedule_changed=schedule_changed,
             prev_definition=prev_definition)
-    handler.set_rule_checkpoint(2, incr=True)
     try:
-        # It shouldn't be necessary to lock this out, but a deadlock can
-        # happen in rare cases without it
-        with CriticalSection(["reminder-rule-processing-%s" % handler._id], timeout=15):
-            client = get_redis_client()
-            client.incr("reminder-rule-processing-current-%s" % handler._id)
+        client = get_redis_client()
+        client.incr("reminder-rule-processing-current-%s" % handler._id)
     except:
         pass
-    handler.set_rule_checkpoint(3, incr=True)
+
 
 def retire_reminder(reminder_id):
     r = CaseReminder.get(reminder_id)
     r.retire()
+
 
 def get_case_ids(domain):
     """
@@ -300,6 +322,7 @@ def get_case_ids(domain):
         except Exception:
             if i == (max_tries - 1):
                 raise
+
 
 class CaseReminderHandler(Document):
     """
@@ -485,15 +508,6 @@ class CaseReminderHandler(Document):
     # and if a case other than that case triggered the reminder.
     force_surveys_to_use_triggered_case = BooleanProperty(default=False)
 
-    def set_rule_checkpoint(self, num, incr=False):
-        """ Only used for debugging. """
-        client = get_redis_client()
-        key = "reminder-rule-processing-checkpoint-%s-%s" % (num, self._id)
-        if incr:
-            client.incr(key)
-        else:
-            client.set(key, 0)
-
     @property
     def uses_parent_case_property(self):
         events_use_parent_case_property = False
@@ -509,6 +523,13 @@ class CaseReminderHandler(Document):
             property_references_parent(self.until)
         )
 
+    @property
+    def uses_time_case_property(self):
+        for event in self.events:
+            if event.fire_time_type == FIRE_TIME_CASE_PROPERTY:
+                return True
+        return False
+
     @classmethod
     def get_now(cls):
         try:
@@ -516,6 +537,21 @@ class CaseReminderHandler(Document):
             return getattr(cls, 'now')
         except Exception:
             return datetime.utcnow()
+
+    def schedule_has_changed(self, old_definition):
+        """
+        Returns True if the scheduling information in self is different from
+        the scheduling information in old_definition.
+
+        old_definition - the CaseReminderHandler to compare to
+        """
+        return (
+            get_events_scheduling_info(old_definition.events) !=
+            get_events_scheduling_info(self.events) or
+            old_definition.start_offset != self.start_offset or
+            old_definition.schedule_length != self.schedule_length or
+            old_definition.max_iteration_count != self.max_iteration_count
+        )
 
     def get_reminder(self, case):
         domain = self.domain
@@ -589,7 +625,7 @@ class CaseReminderHandler(Document):
         """
         if recipient is None:
             if self.recipient == RECIPIENT_USER:
-                recipient = CommCareUser.get_by_user_id(case.user_id)
+                recipient = CouchUser.get_by_user_id(case.user_id)
             elif self.recipient == RECIPIENT_CASE:
                 recipient = CommConnectCase.get(case._id)
             elif self.recipient == RECIPIENT_PARENT_CASE:
@@ -826,13 +862,13 @@ class CaseReminderHandler(Document):
         # Retrieve the corresponding verified number entries for all individual recipients
         verified_numbers = {}
         for r in recipients:
-            try:
+            if hasattr(r, "get_verified_numbers"):
                 contact_verified_numbers = r.get_verified_numbers(False)
                 if len(contact_verified_numbers) > 0:
                     verified_number = sorted(contact_verified_numbers.iteritems())[0][1]
                 else:
                     verified_number = None
-            except Exception:
+            else:
                 verified_number = None
             verified_numbers[r.get_id] = verified_number
         
@@ -902,15 +938,15 @@ class CaseReminderHandler(Document):
         """
         now = now or self.get_now()
         reminder = self.get_reminder(case)
-        
-        try:
-            if (case.user_id == case._id) or (case.user_id is None):
+
+        if case and case.user_id and (case.user_id != case._id):
+            try:
+                user = CouchUser.get_by_user_id(case.user_id)
+            except KeyError:
                 user = None
-            else:
-                user = CommCareUser.get_by_user_id(case.user_id)
-        except Exception:
+        else:
             user = None
-        
+
         if (case.closed or case.type != self.case_type or
             case.doc_type.endswith("-Deleted") or self.deleted() or
             (self.recipient == RECIPIENT_USER and not user)):
@@ -988,7 +1024,7 @@ class CaseReminderHandler(Document):
         elif self.recipient == RECIPIENT_USER_GROUP:
             recipient = Group.get(self.user_group_id)
         elif self.recipient == RECIPIENT_USER:
-            recipient = CommCareUser.get(self.user_id)
+            recipient = CouchUser.get_by_user_id(self.user_id)
         elif self.recipient == RECIPIENT_CASE:
             recipient = CommCareCase.get(self.case_id)
         else:
@@ -1028,8 +1064,111 @@ class CaseReminderHandler(Document):
                     self.set_next_fire(reminder, now)
                 reminder.save()
 
+    def check_state(self):
+        """
+        Double-checks the model for any inconsistencies and raises an
+        IllegalModelStateException if any exist.
+        """
+        def check_attr(name, obj=self):
+            # don't allow None or empty string, but allow 0
+            if getattr(obj, name) in [None, ""]:
+                raise IllegalModelStateException("%s is required" % name)
+
+        if self.start_condition_type == CASE_CRITERIA:
+            check_attr("case_type")
+            check_attr("start_property")
+            check_attr("start_match_type")
+            if self.start_match_type != MATCH_ANY_VALUE:
+                check_attr("start_value")
+
+        if self.start_condition_type == ON_DATETIME:
+            check_attr("start_datetime")
+
+        if self.method == METHOD_SMS:
+            check_attr("default_lang")
+
+        check_attr("schedule_length")
+        check_attr("max_iteration_count")
+        check_attr("start_offset")
+
+        if len(self.events) == 0:
+            raise IllegalModelStateException("len(events) must be > 0")
+
+        last_day = 0
+        for event in self.events:
+            check_attr("day_num", obj=event)
+            if event.day_num < 0:
+                raise IllegalModelStateException("event.day_num must be "
+                    "non-negative")
+
+            if event.fire_time_type in [FIRE_TIME_DEFAULT, FIRE_TIME_RANDOM]:
+                check_attr("fire_time", obj=event)
+            if event.fire_time_type == FIRE_TIME_RANDOM:
+                check_attr("time_window_length", obj=event)
+            if event.fire_time_type == FIRE_TIME_CASE_PROPERTY:
+                check_attr("fire_time_aux", obj=event)
+
+            if self.method == METHOD_SMS and not self.custom_content_handler:
+                if not isinstance(event.message, dict):
+                    raise IllegalModelStateException("event.message expected "
+                        "to be a dictionary")
+                if self.default_lang not in event.message:
+                    raise IllegalModelStateException("default_lang missing "
+                        "from event.message")
+            if self.method in [METHOD_SMS_SURVEY, METHOD_IVR_SURVEY]:
+                check_attr("form_unique_id", obj=event)
+
+            if not isinstance(event.callback_timeout_intervals, list):
+                raise IllegalModelStateException("event."
+                    "callback_timeout_intervals expected to be a list")
+
+            last_day = event.day_num
+
+        if self.event_interpretation == EVENT_AS_SCHEDULE:
+            if self.schedule_length <= last_day:
+                raise IllegalModelStateException("schedule_length must be "
+                    "greater than last event's day_num")
+        else:
+            if self.schedule_length < 0:
+                raise IllegalModelStateException("schedule_length must be"
+                    "non-negative")
+
+        if self.recipient == RECIPIENT_SUBCASE:
+            check_attr("recipient_case_match_property")
+            check_attr("recipient_case_match_type")
+            if self.recipient_case_match_type != MATCH_ANY_VALUE:
+                check_attr("recipient_case_match_value")
+
+        if (self.custom_content_handler and self.custom_content_handler not in
+            settings.ALLOWED_CUSTOM_CONTENT_HANDLERS):
+            raise IllegalModelStateException("unknown custom_content_handler")
+
+        self.check_min_tick()
+
+    def check_min_tick(self, minutes=60):
+        """
+        For offset-based schedules that are repeated multiple times
+        intraday, makes sure that the events are separated by at least
+        the given number of minutes.
+        """
+        if (self.event_interpretation == EVENT_AS_OFFSET and
+            self.max_iteration_count != 1 and self.schedule_length == 0):
+            minimum_tick = None
+            for e in self.events:
+                this_tick = timedelta(days=e.day_num, hours=e.fire_time.hour,
+                    minutes=e.fire_time.minute)
+                if minimum_tick is None:
+                    minimum_tick = this_tick
+                elif this_tick < minimum_tick:
+                    minimum_tick = this_tick
+            if minimum_tick < timedelta(minutes=minutes):
+                raise IllegalModelStateException("Minimum tick for a schedule "
+                    "repeated multiple times intraday is %s minutes." % minutes)
+
+
     def save(self, **params):
         from corehq.apps.reminders.tasks import process_reminder_rule
+        self.check_state()
         schedule_changed = params.pop("schedule_changed", False)
         prev_definition = params.pop("prev_definition", None)
         send_immediately = params.pop("send_immediately", False)
@@ -1061,38 +1200,53 @@ class CaseReminderHandler(Document):
                         len(case_ids))
                 except:
                     pass
-                self.set_rule_checkpoint(1)
-                self.set_rule_checkpoint(2)
-                self.set_rule_checkpoint(3)
                 process_fast(case_ids, run_rule, item_goal=100, max_threads=5,
                     args=(self, schedule_changed, prev_definition),
-                    use_critical_section=True, print_stack_interval=60)
+                    use_critical_section=False, print_stack_interval=60)
             elif self.start_condition_type == ON_DATETIME:
                 self.datetime_definition_changed(send_immediately=send_immediately)
         else:
             reminder_ids = self.get_reminders(ids_only=True)
             process_fast(reminder_ids, retire_reminder, item_goal=100,
-                max_threads=5, use_critical_section=True,
+                max_threads=5, use_critical_section=False,
                 print_stack_interval=60)
 
     @classmethod
-    def get_handlers(cls, domain, case_type=None, ids_only=False):
-        key = [domain]
-        if case_type:
-            key.append(case_type)
-        result = cls.view('reminders/handlers_by_domain_case_type',
-            startkey=key,
-            endkey=key + [{}],
-            include_docs=(not ids_only),
+    def get_handlers(cls, domain, reminder_type_filter=None):
+        ids = cls.get_handler_ids(domain,
+            reminder_type_filter=reminder_type_filter)
+        return cls.get_handlers_from_ids(ids)
+
+    @classmethod
+    def get_handlers_from_ids(cls, ids):
+        return [
+            CaseReminderHandler.wrap(doc)
+            for doc in iter_docs(cls.get_db(), ids)
+        ]
+
+    @classmethod
+    def get_handler_ids(cls, domain, reminder_type_filter=None):
+        result = cls.view('reminders/handlers_by_reminder_type',
+            startkey=[domain],
+            endkey=[domain, {}],
+            include_docs=False,
+            reduce=False,
         )
-        if ids_only:
-            return [row["id"] for row in result]
-        else:
-            return result
+
+        def filter_fcn(reminder_type):
+            if reminder_type_filter is None:
+                return True
+            else:
+                return ((reminder_type or REMINDER_TYPE_DEFAULT) ==
+                    reminder_type_filter)
+        return [
+            row['id'] for row in result
+            if filter_fcn(row['key'][1])
+        ]
 
     @classmethod
     def get_referenced_forms(cls, domain):
-        handlers = cls.get_handlers(domain=domain).all()
+        handlers = cls.get_handlers(domain)
         referenced_forms = [e.form_unique_id for events in [h.events for h in handlers] for e in events]
         return filter(None, referenced_forms)
 
@@ -1157,7 +1311,7 @@ class CaseReminder(SafeSaveDocument, LockableMixIn):
     last_modified = DateTimeProperty()
     case_id = StringProperty()                      # Reference to the CommCareCase
     handler_id = StringProperty()                   # Reference to the CaseReminderHandler
-    user_id = StringProperty()                      # Reference to the CommCareUser who will receive the SMS messages
+    user_id = StringProperty()                      # Reference to the CouchUser who will receive the SMS messages
     method = StringProperty(choices=METHOD_CHOICES) # See CaseReminderHandler.method
     next_fire = DateTimeProperty()                  # The date and time that the next message should go out
     last_fired = DateTimeProperty()                 # The date and time that the last message went out
@@ -1194,11 +1348,7 @@ class CaseReminder(SafeSaveDocument, LockableMixIn):
     @property
     def user(self):
         if self.handler.recipient == RECIPIENT_USER:
-            try:
-                return CommCareUser.get_by_user_id(self.user_id)
-            except Exception:
-                self.retire()
-                return None
+            return CouchUser.get_by_user_id(self.user_id)
         else:
             return None
 

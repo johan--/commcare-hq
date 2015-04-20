@@ -1,22 +1,30 @@
 from django.utils.translation import ugettext_noop
 from django.utils.translation import ugettext as _
+from corehq.apps.domain.models import Domain
+from corehq.apps.locations.models import SQLLocation
+from corehq.apps.reports.filters.dates import DatespanFilter
+from corehq.apps.reports.filters.fixtures import AsyncLocationFilter
 from corehq.apps.reports.standard import DatespanMixin, ProjectReport,\
     ProjectReportParametersMixin
 from corehq.apps.reports.generic import GenericTabularReport
 from corehq.apps.reports.datatables import DataTablesColumn, DataTablesHeader,\
     DTSortType
 from corehq.apps.sms.filters import MessageTypeFilter
-from dimagi.utils.web import get_url_base
-from django.core.urlresolvers import reverse
+from corehq.const import SERVER_DATETIME_FORMAT
+from corehq.util.timezones.conversions import ServerTime
+from corehq.util.view_utils import absolute_reverse
+from dimagi.utils.decorators.memoized import memoized
 from dimagi.utils.parsing import json_format_datetime
 from corehq.apps.reports.util import format_datatables_data
 from corehq.apps.users.models import CouchUser
 from casexml.apps.case.models import CommCareCase
 from django.conf import settings
-from dimagi.utils.timezones import utils as tz_utils
-import pytz
-from corehq.apps.users.views import EditWebUserView
-from corehq.apps.users.views.mobile.users import EditCommCareUserView
+# This import is not used, but there's some sort circular dependency
+# that is exposed if you remove this. That's not something I've seen before
+# but presumably having this here changes the order in which files are imported
+# and that ends up mattering.
+# todo: figure out what that circular dependency is
+from corehq.apps.users.views import mobile
 from corehq.apps.hqwebapp.doc_info import get_doc_info
 from corehq.apps.sms.models import (
     WORKFLOW_REMINDER,
@@ -53,10 +61,11 @@ class MessagesReport(ProjectReport, ProjectReportParametersMixin, GenericTabular
     def get_user_link(self, user):
         user_link_template = '<a href="%(link)s">%(username)s</a>'
         from corehq.apps.users.views.mobile import EditCommCareUserView
-        user_link = user_link_template % {"link": "%s%s" % (get_url_base(),
-                                                            reverse(EditCommCareUserView.urlname,
-                                                                    args=[self.domain, user._id])),
-                                          "username": user.username_in_report}
+        user_link = user_link_template % {
+            "link": absolute_reverse(EditCommCareUserView.urlname,
+                                     args=[self.domain, user._id]),
+            "username": user.username_in_report
+        }
         return self.table_cell(user.raw_username, user_link)
 
     @property
@@ -115,7 +124,7 @@ class BaseCommConnectLogReport(ProjectReport, ProjectReportParametersMixin, Gene
     def _fmt_timestamp(self, timestamp):
         return self.table_cell(
             timestamp,
-            timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            timestamp.strftime(SERVER_DATETIME_FORMAT),
         )
 
     def _fmt_contact_link(self, msg, doc_info):
@@ -185,10 +194,7 @@ the domain to the list in settings.MESSAGE_LOG_OPTIONS["abbreviated_phone_number
 class MessageLogReport(BaseCommConnectLogReport):
     name = ugettext_noop('Message Log')
     slug = 'message_log'
-    fields = [
-        'corehq.apps.reports.filters.dates.DatespanFilter',
-        'corehq.apps.sms.filters.MessageTypeFilter',
-    ]
+
     exportable = True
 
     def get_message_type_filter(self):
@@ -197,6 +203,20 @@ class MessageLogReport(BaseCommConnectLogReport):
             filtered_types = set([mt.lower() for mt in filtered_types])
             return lambda message_types: len(filtered_types.intersection(message_types)) > 0
         return lambda message_types: True
+
+    def get_location_filter(self):
+        locations = []
+        location_id = AsyncLocationFilter.get_value(self.request, self.domain)
+        if location_id:
+            locations = SQLLocation.objects.get(
+                location_id=location_id
+            ).get_descendants(
+                include_self=True
+            ).filter(
+                location_type__administrative=False
+            ).values_list('location_id', flat=True)
+
+        return locations
 
     @staticmethod
     def _get_message_types(message):
@@ -217,6 +237,13 @@ class MessageLogReport(BaseCommConnectLogReport):
         return types
 
     @property
+    def fields(self):
+        fields = [DatespanFilter, MessageTypeFilter]
+        if self.locations_enabled:
+            fields.insert(0, AsyncLocationFilter)
+        return fields
+
+    @property
     def headers(self):
         header = DataTablesHeader(
             DataTablesColumn(_("Timestamp")),
@@ -230,6 +257,11 @@ class MessageLogReport(BaseCommConnectLogReport):
         return header
 
     @property
+    @memoized
+    def locations_enabled(self):
+        return Domain.get_by_name(self.domain).locations_enabled
+
+    @property
     def rows(self):
         startdate = json_format_datetime(self.datespan.startdate_utc)
         enddate = json_format_datetime(self.datespan.enddate_utc)
@@ -240,7 +272,7 @@ class MessageLogReport(BaseCommConnectLogReport):
             INCOMING: _("Incoming"),
             OUTGOING: _("Outgoing"),
         }
-
+        reporting_locations_id = self.get_location_filter() if self.locations_enabled else []
         # Retrieve message log options
         message_log_options = getattr(settings, "MESSAGE_LOG_OPTIONS", {})
         abbreviated_phone_number_domains = message_log_options.get("abbreviated_phone_number_domains", [])
@@ -257,13 +289,16 @@ class MessageLogReport(BaseCommConnectLogReport):
             if not message_type_filter(message_types):
                 continue
 
+            if reporting_locations_id and message.location_id not in reporting_locations_id:
+                continue
+
             doc_info = self.get_recipient_info(message, contact_cache)
 
             phone_number = message.phone_number
             if abbreviate_phone_number and phone_number is not None:
                 phone_number = phone_number[0:7] if phone_number[0:1] == "+" else phone_number[0:6]
 
-            timestamp = tz_utils.adjust_datetime_to_timezone(message.date, pytz.utc.zone, self.timezone.zone)
+            timestamp = ServerTime(message.date).user_time(self.timezone).done()
             result.append([
                 self._fmt_timestamp(timestamp),
                 self._fmt_contact_link(message, doc_info),
@@ -274,5 +309,3 @@ class MessageLogReport(BaseCommConnectLogReport):
             ])
 
         return result
-
-

@@ -1,9 +1,10 @@
 from django import template
 from django.core.urlresolvers import reverse
 from datetime import datetime, timedelta
+from corehq.const import SERVER_DATETIME_FORMAT_NO_SEC
 
 xmldate_format= '%Y-%m-%dT%H:%M:%S'
-output_format = '%Y-%m-%d %H:%M'
+output_format = SERVER_DATETIME_FORMAT_NO_SEC
 username_datecount_cache = {}
 
 register = template.Library()
@@ -20,7 +21,7 @@ def get_daterange_links_raw(base_link, args={}):
     delta_month = timedelta(days=30)
     delta_3month = timedelta(days=90)
     
-    enddate = datetime.now()
+    enddate = datetime.utcnow()
     yesterday = enddate - delta_day
     #datetime.strptime(startdate_str,'%m/%d/%Y')
     ret = '\n'
@@ -40,7 +41,7 @@ def get_daterange_links_basic(base_link, days=[0,7,30,90], args={}):
        a pretty string to display the time, otherwise it will say
        "last n days"''' 
     #base_link = reverse(view_name,kwargs=args)
-    end_date = datetime.now()
+    end_date = datetime.utcnow()
     ret = ''
     ret += '<div class="daterange_tabs"><ul>\n'
     for num_days in days:

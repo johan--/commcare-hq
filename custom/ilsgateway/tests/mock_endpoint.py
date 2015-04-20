@@ -6,6 +6,9 @@ from custom.ilsgateway.api import ILSGatewayEndpoint
 class MockEndpoint(ILSGatewayEndpoint):
     datapath = os.path.join(os.path.dirname(__file__), 'data')
 
+    def get_groups(self, **kwargs):
+        return {}, []
+
     def get_objects(self, url, params=None, filters=None, limit=1000, offset=0, **kwargs):
         if 'locations' in url:
             return self._from_json('sample_locations.json', **kwargs)
@@ -20,7 +23,7 @@ class MockEndpoint(ILSGatewayEndpoint):
         with open(os.path.join(self.datapath, filename)) as f:
             objects = json.loads(f.read())
             meta = {
-                "limit": 1000,
+                "limit": 100,
                 "next": None,
                 "offset": 0,
                 "previous": None,

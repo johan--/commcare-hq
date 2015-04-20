@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 import logging
+from urllib import urlencode
 from django.core.urlresolvers import reverse
 from django.http import Http404
 from django.utils import html
@@ -11,12 +12,15 @@ from corehq.apps.app_manager.models import get_app, Form, RemoteApp
 from corehq.apps.app_manager.util import ParentCasePropertyBuilder
 from corehq.apps.cachehq.mixins import CachedCouchDocumentMixin
 from corehq.apps.domain.middleware import CCHQPRBACMiddleware
+from corehq.apps.export.models import FormQuestionSchema
 from corehq.apps.reports.display import xmlns_to_name
 from couchdbkit.ext.django.schema import *
 from corehq.apps.reports.exportfilters import form_matches_users, is_commconnect_form, default_form_filter, \
     default_case_filter
 from corehq.apps.users.models import WebUser, CommCareUser, CouchUser
-from couchexport.models import SavedExportSchema, GroupExportConfiguration, FakeSavedExportSchema
+from corehq.feature_previews import CALLCENTER
+from corehq.util.view_utils import absolute_reverse
+from couchexport.models import SavedExportSchema, GroupExportConfiguration, FakeSavedExportSchema, SplitColumn
 from couchexport.transforms import couch_to_excel_datetime, identity
 from couchexport.util import SerializableFunction
 import couchforms
@@ -159,7 +163,7 @@ class TempCommCareUser(CommCareUser):
         app_label = 'reports'
 
 
-DATE_RANGE_CHOICES = ['last7', 'last30', 'lastn', 'lastmonth', 'since', 'range']
+DATE_RANGE_CHOICES = ['last7', 'last30', 'lastn', 'lastmonth', 'since', 'range', '']
 
 
 class ReportConfig(CachedCouchDocumentMixin, Document):
@@ -237,10 +241,14 @@ class ReportConfig(CachedCouchDocumentMixin, Document):
     @property
     @memoized
     def _dispatcher(self):
+        from corehq.apps.userreports.reports.view import ConfigurableReport
 
-        dispatchers = [ProjectReportDispatcher,
-                       CustomProjectReportDispatcher,
-                       ADMSectionDispatcher]
+        dispatchers = [
+            ProjectReportDispatcher,
+            CustomProjectReportDispatcher,
+            ADMSectionDispatcher,
+            ConfigurableReport,
+        ]
 
         for dispatcher in dispatchers:
             if dispatcher.prefix == self.report_type:
@@ -294,12 +302,12 @@ class ReportConfig(CachedCouchDocumentMixin, Document):
     @property
     @memoized
     def query_string(self):
-        from urllib import urlencode
-
-        params = self.filters.copy()
+        params = {}
         if self._id != 'dummy':
             params['config_id'] = self._id
-        params.update(self.get_date_range())
+        if not self.is_configurable_report:
+            params.update(self.filters)
+            params.update(self.get_date_range())
 
         return urlencode(params, True)
 
@@ -319,9 +327,13 @@ class ReportConfig(CachedCouchDocumentMixin, Document):
     def url(self):
         try:
             from django.core.urlresolvers import reverse
+            from corehq.apps.userreports.reports.view import ConfigurableReport
 
-            return reverse(self._dispatcher.name(), kwargs=self.view_kwargs) \
-                    + '?' + self.query_string
+            if self.is_configurable_report:
+                url_base = reverse(ConfigurableReport.slug, args=[self.domain, self.subreport_slug])
+            else:
+                url_base = reverse(self._dispatcher.name(), kwargs=self.view_kwargs)
+            return url_base + '?' + self.query_string
         except Exception:
             return "#"
 
@@ -334,7 +346,9 @@ class ReportConfig(CachedCouchDocumentMixin, Document):
         case.
 
         """
-        return self._dispatcher.get_report(self.domain, self.report_slug)
+        return self._dispatcher.get_report(
+            self.domain, self.report_slug, self.subreport_slug
+        )
 
     @property
     def report_name(self):
@@ -396,33 +410,61 @@ class ReportConfig(CachedCouchDocumentMixin, Document):
         request.domain = self.domain
         request.couch_user.current_domain = self.domain
 
-        request.GET = QueryDict(self.query_string + '&filterSet=true')
+        request.GET = QueryDict(
+            self.query_string
+            + '&filterSet=true'
+            + ('&' + urlencode(self.filters, True) if self.is_configurable_report else '')
+        )
 
         # Make sure the request gets processed by PRBAC Middleware
         CCHQPRBACMiddleware.apply_prbac(request)
 
         try:
-            response = self._dispatcher.dispatch(request, render_as='email',
-                **self.view_kwargs)
+            if self.is_configurable_report:
+                response = self._dispatcher.dispatch(
+                    request,
+                    self.subreport_slug,
+                    render_as='email',
+                    **self.view_kwargs
+                )
+            else:
+                response = self._dispatcher.dispatch(
+                    request,
+                    render_as='email',
+                    permissions_check=self._dispatcher.permissions_check,
+                    **self.view_kwargs
+                )
             if attach_excel is True:
-                file_obj = self._dispatcher.dispatch(request, render_as='excel',
-                **self.view_kwargs)
+                if self.is_configurable_report:
+                    file_obj = self._dispatcher.dispatch(
+                        request, self.subreport_slug,
+                        render_as='excel',
+                        **self.view_kwargs
+                    )
+                else:
+                    file_obj = self._dispatcher.dispatch(
+                        request,
+                        render_as='excel',
+                        permissions_check=self._dispatcher.permissions_check,
+                        **self.view_kwargs
+                    )
             else:
                 file_obj = None
             return json.loads(response.content)['report'], file_obj
         except PermissionDenied:
-            return _("We are sorry, but your saved report '%(config_name)s' "
-                     "is no longer accessible because your subscription does "
-                     "not allow Custom Reporting. Please talk to your Project "
-                     "Administrator about enabling Custom Reports. If you "
-                     "want CommCare HQ to stop sending this message, please "
-                     "visit %(saved_reports_url)s to remove this "
-                     "Emailed Report.") % {
-                         'config_name': self.name,
-                         'saved_reports_url': "%s%s" % (
-                             get_url_base(), reverse(
-                                 'saved_reports', args=[request.domain])),
-                     }, None
+            return _(
+                "We are sorry, but your saved report '%(config_name)s' "
+                "is no longer accessible because your subscription does "
+                "not allow Custom Reporting. Please talk to your Project "
+                "Administrator about enabling Custom Reports. If you "
+                "want CommCare HQ to stop sending this message, please "
+                "visit %(saved_reports_url)s to remove this "
+                "Emailed Report."
+            ) % {
+                'config_name': self.name,
+                'saved_reports_url': absolute_reverse('saved_reports',
+                                                      args=[request.domain]),
+            }, None
         except Http404:
             return _("We are sorry, but your saved report '%(config_name)s' "
                      "can not be generated since you do not have the correct permissions. "
@@ -436,6 +478,11 @@ class ReportConfig(CachedCouchDocumentMixin, Document):
                 'report config': self.get_id
             })
             return _("An error occurred while generating this report."), None
+
+    @property
+    def is_configurable_report(self):
+        from corehq.apps.userreports.reports.view import ConfigurableReport
+        return isinstance(self._dispatcher, ConfigurableReport)
 
 
 class UnsupportedScheduledReportError(Exception):
@@ -608,6 +655,25 @@ class FormExportSchema(HQExportSchema):
     doc_type = 'SavedExportSchema'
     app_id = StringProperty()
     include_errors = BooleanProperty(default=False)
+    split_multiselects = BooleanProperty(default=False)
+
+    def update_schema(self):
+        super(FormExportSchema, self).update_schema()
+        if self.split_multiselects:
+            self.update_question_schema()
+            for column in [column for table in self.tables for column in table.columns]:
+                if isinstance(column, SplitColumn):
+                    question = self.question_schema.question_schema.get(column.index)
+                    column.options = question.options
+                    column.ignore_extras = True
+
+    def update_question_schema(self):
+        schema = self.question_schema
+        schema.update_schema()
+
+    @property
+    def question_schema(self):
+        return FormQuestionSchema.get_or_create(self.domain, self.app_id, self.xmlns)
 
     @property
     @memoized
@@ -638,6 +704,8 @@ class FormExportSchema(HQExportSchema):
     def filter(self):
         user_ids = set(CouchUser.ids_by_domain(self.domain))
         user_ids.update(CouchUser.ids_by_domain(self.domain, is_active=False))
+        user_ids.add('demo_user')
+
         def _top_level_filter(form):
             # careful, closures used
             return form_matches_users(form, user_ids) or is_commconnect_form(form)
@@ -709,6 +777,7 @@ class FormDeidExportSchema(FormExportSchema):
     def get_case(cls, doc, case_id):
         pass
 
+
 class CaseExportSchema(HQExportSchema):
     doc_type = 'SavedExportSchema'
 
@@ -735,9 +804,16 @@ class CaseExportSchema(HQExportSchema):
     @property
     def case_properties(self):
         props = set([])
+
+        if CALLCENTER.enabled(self.domain):
+            from corehq.apps.custom_data_fields.models import CustomDataFieldsDefinition
+            user_fields = CustomDataFieldsDefinition.get_or_create(self.domain, 'UserFields')
+            props |= {field.slug for field in user_fields.fields}
+
         for app in self.applications:
             builder = ParentCasePropertyBuilder(app, ("name",))
             props |= set(builder.get_properties(self.case_type))
+
         return props
 
 

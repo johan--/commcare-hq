@@ -2,11 +2,19 @@ import os
 import json
 from django.test import LiveServerTestCase
 from django.conf import settings
+from corehq.apps.accounting import generator
+from corehq.apps.accounting.models import (
+    BillingAccount,
+    DefaultProductPlan,
+    SoftwarePlanEdition,
+    Subscription,
+    SubscriptionAdjustment,
+)
 from corehq.apps.domain.models import Domain
 from corehq.apps.sms.test_backend import TestSMSBackend
 from corehq.apps.sms.mixin import BackendMapping
 from corehq.apps.sms.models import SMSLog, CallLog
-from corehq.apps.smsforms.models import XFormsSession
+from corehq.apps.smsforms.models import SQLXFormsSession
 from corehq.apps.groups.models import Group
 from corehq.apps.reminders.models import (SurveyKeyword, SurveyKeywordAction,
     RECIPIENT_SENDER, METHOD_SMS_SURVEY, METHOD_STRUCTURED_SMS, METHOD_SMS)
@@ -26,6 +34,7 @@ from casexml.apps.case.xml import V2
 
 def time_parser(value):
     return parse(value).time()
+
 
 class TouchformsTestCase(LiveServerTestCase):
     """
@@ -49,6 +58,23 @@ class TouchformsTestCase(LiveServerTestCase):
         domain_obj.use_default_sms_response = True
         domain_obj.default_sms_response = "Default SMS Response"
         domain_obj.save()
+
+        generator.instantiate_accounting_for_tests()
+        self.account = BillingAccount.get_or_create_account_by_domain(
+            domain_obj.name,
+            created_by="automated-test",
+        )[0]
+        plan = DefaultProductPlan.get_default_plan_by_domain(
+            domain_obj, edition=SoftwarePlanEdition.ADVANCED
+        )
+        self.subscription = Subscription.new_domain_subscription(
+            self.account,
+            domain_obj.name,
+            plan
+        )
+        self.subscription.is_active = True
+        self.subscription.save()
+
         return domain_obj
 
     def create_mobile_worker(self, username, password, phone_number, save_vn=True):
@@ -194,7 +220,8 @@ class TouchformsTestCase(LiveServerTestCase):
         return sk
 
     def create_site(self):
-        site = Site(domain=self.live_server_url, name=self.live_server_url)
+        site = Site(id=settings.SITE_ID, domain=self.live_server_url,
+            name=self.live_server_url)
         site.save()
         return site
 
@@ -257,7 +284,7 @@ class TouchformsTestCase(LiveServerTestCase):
         return call
 
     def get_open_session(self, contact):
-        return XFormsSession.get_open_sms_session(self.domain, contact._id)
+        return SQLXFormsSession.get_open_sms_session(self.domain, contact._id)
 
     def assertLastOutboundSMSEquals(self, contact, message):
         sms = self.get_last_outbound_sms(contact)
@@ -276,9 +303,9 @@ class TouchformsTestCase(LiveServerTestCase):
         self.apps = []
         self.keywords = []
         self.groups = []
+        self.site = self.create_site()
         self.domain = "test-domain"
         self.domain_obj = self.create_domain(self.domain)
-        self.site = self.create_site()
         self.create_web_user("touchforms_user", "123")
 
         self.backend = TestSMSBackend(name="TEST", is_global=True)
@@ -288,7 +315,6 @@ class TouchformsTestCase(LiveServerTestCase):
         self.backend_mapping.save()
 
         settings.DEBUG = True
-        settings.SITE_ID = self.site.pk
 
     def tearDown(self):
         for user in self.users:
@@ -304,4 +330,6 @@ class TouchformsTestCase(LiveServerTestCase):
         self.site.delete()
         self.backend.delete()
         self.backend_mapping.delete()
-
+        SubscriptionAdjustment.objects.all().delete()
+        self.subscription.delete()
+        self.account.delete()

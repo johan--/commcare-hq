@@ -1,9 +1,8 @@
 from .models import (Message, METHOD_SMS, METHOD_SMS_CALLBACK, 
-    METHOD_SMS_SURVEY, METHOD_IVR_SURVEY, METHOD_EMAIL, 
-    RECIPIENT_USER, RECIPIENT_CASE, RECIPIENT_SURVEY_SAMPLE, CaseReminder,
+    METHOD_SMS_SURVEY, METHOD_IVR_SURVEY,
     CaseReminderHandler)
 from corehq.apps.smsforms.app import submit_unfinished_form
-from corehq.apps.smsforms.models import XFormsSession
+from corehq.apps.smsforms.models import get_session_by_session_id, SQLXFormsSession
 from corehq.apps.sms.mixin import (VerifiedNumber, apply_leniency,
     CommCareMobileContactMixin, InvalidFormatException)
 from touchforms.formplayer.api import current_question
@@ -23,10 +22,9 @@ from corehq.apps.sms.models import (
 from django.conf import settings
 from corehq.apps.app_manager.models import Form
 from corehq.apps.ivr.tasks import initiate_outbound_call
-from datetime import timedelta
 from dimagi.utils.parsing import json_format_datetime
 from dimagi.utils.couch import CriticalSection
-from django.utils.translation import ugettext as _, ugettext_noop
+from django.utils.translation import ugettext_noop
 from casexml.apps.case.models import CommCareCase
 from dimagi.utils.modules import to_function
 
@@ -263,7 +261,7 @@ def fire_sms_survey_event(reminder, handler, recipients, verified_numbers):
         else:
             # Resend current question
             for session_id in reminder.xforms_session_ids:
-                session = XFormsSession.by_session_id(session_id)
+                session = get_session_by_session_id(session_id)
                 if session.end_time is None:
                     vn = VerifiedNumber.view("sms/verified_number_by_owner_id",
                                              key=session.connection_id,
@@ -286,7 +284,7 @@ def fire_sms_survey_event(reminder, handler, recipients, verified_numbers):
             form = Form.get_form(form_unique_id)
             app = form.get_app()
             module = form.get_module()
-        except Exception as e:
+        except Exception:
             raise_error(reminder, ERROR_FORM)
             return False
 
@@ -311,8 +309,7 @@ def fire_sms_survey_event(reminder, handler, recipients, verified_numbers):
             key = "start-sms-survey-for-contact-%s" % recipient.get_id
             with CriticalSection([key], timeout=60):
                 # Close all currently open sessions
-                XFormsSession.close_all_open_sms_sessions(reminder.domain,
-                    recipient.get_id)
+                SQLXFormsSession.close_all_open_sms_sessions(reminder.domain, recipient.get_id)
 
                 # Start the new session
                 if (isinstance(recipient, CommCareCase) and
@@ -419,10 +416,10 @@ def raise_error(reminder, error_msg):
 # The dictionary which maps an event type to its event handling method
 
 EVENT_HANDLER_MAP = {
-    METHOD_SMS : fire_sms_event,
-    METHOD_SMS_CALLBACK : fire_sms_callback_event,
-    METHOD_SMS_SURVEY : fire_sms_survey_event,
-    METHOD_IVR_SURVEY : fire_ivr_survey_event,
+    METHOD_SMS: fire_sms_event,
+    METHOD_SMS_CALLBACK: fire_sms_callback_event,
+    METHOD_SMS_SURVEY: fire_sms_survey_event,
+    METHOD_IVR_SURVEY: fire_ivr_survey_event,
     # METHOD_EMAIL is a placeholder at the moment; it's not implemented yet anywhere in the framework
 }
 

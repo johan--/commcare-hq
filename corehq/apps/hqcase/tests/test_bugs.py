@@ -13,12 +13,13 @@ from corehq.apps.users.util import format_username
 
 
 class OtaRestoreBugTest(TestCase):
+
     def setUp(self):
         for user in CouchUser.all():
             user.delete()
         User.objects.all().delete()
 
-    def testCrossDomainAssignments(self):
+    def test_cross_domain_assignments(self):
         good_domain = 'main-domain'
         create_domain(good_domain)
         bad_domain = 'bad-domain'
@@ -54,6 +55,6 @@ class OtaRestoreBugTest(TestCase):
         restore_config = RestoreConfig(
             user.to_casexml_user(), version=V2,
         )
-        payload = restore_config.get_payload()
+        payload = restore_config.get_payload().as_string()
         self.assertTrue(good_case._id in payload)
         self.assertFalse(bad_case._id in payload)

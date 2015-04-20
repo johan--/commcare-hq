@@ -4,14 +4,14 @@ from django.test.utils import override_settings
 from casexml.apps.case.models import CommCareCase
 from couchforms.tests.testutils import post_xform_to_couch
 from casexml.apps.case.tests.util import check_xml_line_by_line, CaseBlock, delete_all_cases
-from casexml.apps.case import process_cases
+from casexml.apps.case.xform import process_cases
 from datetime import datetime
-from casexml.apps.phone import views as phone_views
 from django.http import HttpRequest
 from casexml.apps.case.util import post_case_blocks
 from casexml.apps.case.xml import V2
 from dimagi.utils.parsing import json_format_datetime
 from casexml.apps.case import const
+from casexml.apps.phone import xml
 
 
 @override_settings(CASEXML_FORCE_DOMAIN_CHECK=False)
@@ -61,7 +61,25 @@ class Version2CaseParsingTest(TestCase):
         self.assertEqual("something dynamic", case.dynamic)
         self.assertEqual(2, len(case.actions))
         self.assertEqual("bar-user-id", case.actions[1].user_id)
-    
+
+    def testParseNoop(self):
+        self.testParseCreate()
+
+        file_path = os.path.join(os.path.dirname(__file__), "data", "v2", "basic_noop.xml")
+        with open(file_path, "rb") as f:
+            xml_data = f.read()
+
+        form = post_xform_to_couch(xml_data)
+        process_cases(form)
+        case = CommCareCase.get("foo-case-id")
+        self.assertFalse(case.closed)
+        self.assertEqual("bar-user-id", case.user_id)
+        self.assertEqual(datetime(2011, 12, 7, 13, 44, 50), case.modified_on)
+        self.assertEqual(2, len(case.actions))
+        self.assertEqual("bar-user-id", case.actions[1].user_id)
+
+        self.assertEqual(2, len(case.xform_ids))
+
     def testParseClose(self):
         self.testParseCreate()
         
@@ -125,7 +143,7 @@ class Version2CaseParsingTest(TestCase):
 
 
         # quick test for ota restore
-        v2response = phone_views.xml_for_case(HttpRequest(), case.get_id, version="2.0")
+        v2response = xml.get_case_xml(case, [const.CASE_ACTION_CREATE, const.CASE_ACTION_UPDATE], V2)
         expected_v2_response = """
         <case case_id="foo-case-id" date_modified="2011-12-07T13:42:50Z" user_id="bar-user-id" xmlns="http://commcarehq.org/case/transaction/v2">
                 <create>
@@ -138,5 +156,5 @@ class Version2CaseParsingTest(TestCase):
                     <foo_ref case_type="bar">some_referenced_id</foo_ref>
                 </index>
             </case>"""
-        check_xml_line_by_line(self, expected_v2_response, v2response.content)
+        check_xml_line_by_line(self, expected_v2_response, v2response)
         

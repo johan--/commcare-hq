@@ -17,6 +17,8 @@ from couchexport.models import SavedExportSchema, ExportSchema
 from couchexport.schema import build_latest_schema
 from dimagi.utils.decorators.memoized import memoized
 from django.utils.translation import ugettext as _, ugettext_noop, ugettext_lazy
+from dimagi.utils.logging import notify_exception
+from dimagi.utils.parsing import json_format_date
 from dimagi.utils.web import json_response
 
 require_form_export_permission = require_permission(
@@ -73,6 +75,9 @@ class BaseExportView(BaseProjectDataView):
             self.commit(request)
         except Exception, e:
             if self.is_async:
+                # todo: this can probably be removed as soon as
+                # http://manage.dimagi.com/default.asp?157713 is resolved
+                notify_exception(request, 'problem saving an export! {}'.format(str(e)))
                 response = json_response({
                     'error': str(e) or type(e).__name__
                 })
@@ -114,6 +119,10 @@ class BaseCreateCustomExportView(BaseExportView):
         if not schema and self.export_helper.export_type == "form":
             schema = create_basic_form_checkpoint(export_tag)
 
+        if request.GET.get('minimal', False):
+            messages.warning(request,
+                _("Warning you are using minimal mode, some things may not be functional"))
+
         if schema:
             app_id = request.GET.get('app_id')
             self.export_helper.custom_export = self.export_helper.ExportSchemaClass.default(
@@ -121,12 +130,15 @@ class BaseCreateCustomExportView(BaseExportView):
                 name="%s: %s" % (
                     xmlns_to_name(self.domain, export_tag[1], app_id=app_id)
                         if self.export_helper.export_type == "form" else export_tag[1],
-                    datetime.utcnow().strftime("%Y-%m-%d")
+                    json_format_date(datetime.utcnow())
                 ),
                 type=self.export_helper.export_type
             )
             if self.export_helper.export_type in ['form', 'case']:
                 self.export_helper.custom_export.app_id = app_id
+            if self.export_helper.export_type == 'form':
+                self.export_helper.custom_export.update_question_schema()
+
             return super(BaseCreateCustomExportView, self).get(request, *args, **kwargs)
 
         messages.warning(request, _("<strong>No data found for that form "

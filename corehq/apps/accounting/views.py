@@ -7,9 +7,15 @@ from django.contrib.auth.models import User
 from django.forms.forms import NON_FIELD_ERRORS
 from django.forms.util import ErrorList
 from django.core.urlresolvers import reverse
-from django.http import HttpResponseRedirect, HttpResponse, HttpResponseBadRequest
+from django.http import (
+    HttpResponse,
+    HttpResponseBadRequest,
+    HttpResponseRedirect,
+    Http404,
+)
 from django.utils.decorators import method_decorator
 from django.utils.translation import ugettext as _, ugettext_noop
+from django.views.generic import View
 from corehq.apps.hqwebapp.async_handler import AsyncHandlerMixin
 from corehq.apps.hqwebapp.encoders import LazyEncoder
 from corehq.util.translation import localize
@@ -33,9 +39,16 @@ from corehq.apps.accounting.interface import (
     InvoiceInterface
 )
 from corehq.apps.accounting.async_handlers import (
-    FeatureRateAsyncHandler, Select2RateAsyncHandler,
-    SoftwareProductRateAsyncHandler, Select2BillingInfoHandler,
+    FeatureRateAsyncHandler,
+    Select2RateAsyncHandler,
+    SoftwareProductRateAsyncHandler,
+    Select2BillingInfoHandler,
     Select2InvoiceTriggerHandler,
+    SubscriberFilterAsyncHandler,
+    SubscriptionFilterAsyncHandler,
+    AccountFilterAsyncHandler,
+    BillingContactInfoAsyncHandler,
+    SoftwarePlanAsyncHandler,
 )
 from corehq.apps.accounting.models import (
     SoftwareProductType, Invoice, BillingAccount, CreditLine, Subscription,
@@ -50,6 +63,9 @@ from corehq.apps.hqwebapp.views import BaseSectionPageView, CRUDPaginatedViewMix
 from corehq import privileges, toggles
 from django_prbac.decorators import requires_privilege_raise404
 from django_prbac.models import Role, Grant
+
+from urllib import urlencode
+
 
 logger = logging.getLogger('accounting')
 
@@ -121,7 +137,10 @@ class ManageBillingAccountView(BillingAccountsSectionView, AsyncHandlerMixin):
     @property
     @memoized
     def account(self):
-        return BillingAccount.objects.get(id=self.args[0])
+        try:
+            return BillingAccount.objects.get(id=self.args[0])
+        except BillingAccount.DoesNotExist:
+            raise Http404()
 
     @property
     @memoized
@@ -156,8 +175,8 @@ class ManageBillingAccountView(BillingAccountsSectionView, AsyncHandlerMixin):
             'basic_form': self.basic_account_form,
             'contact_form': self.contact_form,
             'subscription_list': [
-                (sub, Invoice.objects.filter(subscription=sub).latest('date_due').date_due # TODO - check query
-                      if len(Invoice.objects.filter(subscription=sub)) != 0 else 'None on record',
+                (sub, Invoice.objects.filter(subscription=sub).latest('date_due').date_due
+                      if Invoice.objects.filter(subscription=sub).count() else 'None on record',
                 ) for sub in Subscription.objects.filter(account=self.account)
             ],
         }
@@ -278,7 +297,10 @@ class EditSubscriptionView(AccountingSectionView, AsyncHandlerMixin):
     @property
     @memoized
     def subscription(self):
-        return Subscription.objects.get(id=self.subscription_id)
+        try:
+            return Subscription.objects.get(id=self.subscription_id)
+        except Subscription.DoesNotExist:
+            raise Http404()
 
     @property
     @memoized
@@ -319,8 +341,26 @@ class EditSubscriptionView(AccountingSectionView, AsyncHandlerMixin):
         return CancelForm()
 
     @property
-    def page_context(self):
+    def invoice_context(self):
+        subscriber_domain = self.subscription.subscriber.domain
+
+        invoice_report = InvoiceInterface(self.request)
+        invoice_report.filters.update(subscription__subscriber__domain=subscriber_domain)
+        # Tied to InvoiceInterface.
+        encoded_params = urlencode({'subscriber': subscriber_domain})
+        invoice_report_url = "{}?{}".format(invoice_report.get_url(), encoded_params)
+        invoice_export_url = "{}?{}".format(invoice_report.get_url(render_as='export'), encoded_params)
         return {
+            'invoice_headers': invoice_report.headers,
+            'invoice_rows': invoice_report.rows,
+            'invoice_export_url': invoice_export_url,
+            'invoice_report_url': invoice_report_url,
+            'adjust_balance_forms': invoice_report.adjust_balance_forms,
+        }
+
+    @property
+    def page_context(self):
+        context = {
             'cancel_form': self.cancel_form,
             'credit_form': self.credit_form,
             'can_change_subscription': self.subscription.is_active,
@@ -329,8 +369,12 @@ class EditSubscriptionView(AccountingSectionView, AsyncHandlerMixin):
             'disable_cancel': has_subscription_already_ended(self.subscription),
             'form': self.subscription_form,
             'subscription': self.subscription,
-            'subscription_canceled': self.subscription_canceled if hasattr(self, 'subscription_canceled') else False,
+            'subscription_canceled':
+                self.subscription_canceled if hasattr(self, 'subscription_canceled') else False,
         }
+
+        context.update(self.invoice_context)
+        return context
 
     @property
     def page_url(self):
@@ -429,7 +473,10 @@ class EditSoftwarePlanView(AccountingSectionView, AsyncHandlerMixin):
     @property
     @memoized
     def plan(self):
-        return SoftwarePlan.objects.get(id=self.args[0])
+        try:
+            return SoftwarePlan.objects.get(id=self.args[0])
+        except SoftwarePlan.DoesNotExist:
+            raise Http404()
 
     @property
     @memoized
@@ -495,10 +542,6 @@ class TriggerInvoiceView(AccountingSectionView, AsyncHandlerMixin):
         Select2InvoiceTriggerHandler,
     ]
 
-    @method_decorator(toggles.INVOICE_TRIGGER.required_decorator())
-    def dispatch(self, request, *args, **kwargs):
-        return super(TriggerInvoiceView, self).dispatch(request, *args, **kwargs)
-
     @property
     @memoized
     def trigger_form(self):
@@ -536,10 +579,6 @@ class TriggerBookkeeperEmailView(AccountingSectionView):
     page_title = "Trigger Bookkeeper Email"
     template_name = 'accounting/trigger_bookkeeper.html'
 
-    @method_decorator(toggles.INVOICE_TRIGGER.required_decorator())
-    def dispatch(self, request, *args, **kwargs):
-        return super(TriggerBookkeeperEmailView, self).dispatch(request, *args, **kwargs)
-
     @property
     @memoized
     def trigger_email_form(self):
@@ -569,10 +608,6 @@ class TestRenewalEmailView(AccountingSectionView):
     urlname = 'accocunting_test_renewal_email'
     page_title = "Test Renewal Reminder Email"
     template_name = 'accounting/test_reminder_emails.html'
-
-    @method_decorator(toggles.INVOICE_TRIGGER.required_decorator())
-    def dispatch(self, request, *args, **kwargs):
-        return super(TestRenewalEmailView, self).dispatch(request, *args, **kwargs)
 
     @property
     @memoized
@@ -631,7 +666,10 @@ class InvoiceSummaryView(AccountingSectionView):
     @property
     @memoized
     def invoice(self):
-        return Invoice.objects.get(id=self.args[0])
+        try:
+            return Invoice.objects.get(id=self.args[0])
+        except Invoice.DoesNotExist:
+            raise Http404()
 
     @property
     def page_title(self):
@@ -695,7 +733,7 @@ class InvoiceSummaryView(AccountingSectionView):
                 self.adjust_balance_form.adjust_balance(
                     web_user=self.request.user.username,
                 )
-                return HttpResponseRedirect(self.page_url)
+                return HttpResponseRedirect(request.META.get('HTTP_REFERER') or self.page_url)
         elif 'resend_email' in self.request.POST:
             if self.resend_email_form.is_valid():
                 try:
@@ -798,4 +836,22 @@ class ManageAccountingAdminsView(AccountingSectionView, CRUDPaginatedViewMixin):
         return self.paginate_crud_response
 
 
+class AccountingSingleOptionResponseView(View, AsyncHandlerMixin):
+    urlname = 'accounting_subscriber_response'
+    http_method_names = ['post']
+    async_handlers = [
+        SubscriberFilterAsyncHandler,
+        SubscriptionFilterAsyncHandler,
+        AccountFilterAsyncHandler,
+        BillingContactInfoAsyncHandler,
+        SoftwarePlanAsyncHandler,
+    ]
 
+    @method_decorator(requires_privilege_raise404(privileges.ACCOUNTING_ADMIN))
+    def dispatch(self, request, *args, **kwargs):
+        return super(AccountingSingleOptionResponseView, self).dispatch(request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
+        if self.async_response:
+            return self.async_response
+        return HttpResponseBadRequest("Please check your query.")

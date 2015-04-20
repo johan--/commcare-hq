@@ -8,14 +8,15 @@ from corehq.apps.accounting.models import (
     BillingAccountType, Subscription, SubscriptionAdjustmentMethod, Currency,
 )
 from corehq.apps.registration.models import RegistrationRequest
-from dimagi.utils.web import get_ip, get_url_base
+from dimagi.utils.web import get_ip, get_url_base, get_site_domain
 from django.conf import settings
-from django.contrib.sites.models import Site
 from django.core.urlresolvers import reverse
 from corehq.apps.domain.models import Domain
 from corehq.apps.users.models import WebUser, CouchUser
 from dimagi.utils.django.email import send_HTML_email
 from dimagi.utils.couch.database import get_safe_write_kwargs
+from corehq.feature_previews import enable_commtrack_previews
+
 
 DEFAULT_MAILCHIMP_FIRST_NAME = "CommCare User"
 
@@ -182,9 +183,13 @@ def request_new_domain(request, form, org, domain_type=None, new_user=True):
         is_active=False,
         date_created=datetime.utcnow(),
         commtrack_enabled=commtrack_enabled,
+        locations_enabled=commtrack_enabled,
         creating_user=current_user.username,
         secure_submissions=True,
     )
+
+    if commtrack_enabled:
+        enable_commtrack_previews(new_domain)
 
     if form.cleaned_data.get('domain_timezone'):
         new_domain.default_timezone = form.cleaned_data['domain_timezone']
@@ -274,7 +279,7 @@ PRICING_LINK = 'http://www.commcarehq.org/software-plans'
 
 
 def send_domain_registration_email(recipient, domain_name, guid):
-    DNS_name = Site.objects.get(id=settings.SITE_ID).domain
+    DNS_name = get_site_domain()
     registration_link = 'http://' + DNS_name + reverse('registration_confirm_domain') + guid + '/'
 
     message_plaintext = u"""
@@ -318,7 +323,7 @@ Username:  "{username}"
 
 
 def send_global_domain_registration_email(requesting_user, domain_name):
-    DNS_name = Site.objects.get(id=settings.SITE_ID).domain
+    DNS_name = get_site_domain()
     registration_link = 'http://' + DNS_name + reverse("domain_homepage", args=[domain_name])
 
     message_plaintext = u"""
@@ -386,15 +391,6 @@ You can view the %s here: %s""" % (
 
 
 def create_30_day_trial(domain_obj):
-    from corehq.apps.accounting.models import (
-        DefaultProductPlan,
-        SoftwarePlanEdition,
-        BillingAccount,
-        Currency,
-        BillingAccountType,
-        Subscription,
-        SubscriptionAdjustmentMethod,
-    )
     # Create a 30 Day Trial subscription to the Advanced Plan
     advanced_plan_version = DefaultProductPlan.get_default_plan_by_domain(
         domain_obj, edition=SoftwarePlanEdition.ADVANCED, is_trial=True

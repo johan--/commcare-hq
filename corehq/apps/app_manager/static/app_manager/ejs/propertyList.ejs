@@ -19,16 +19,12 @@
                     var value = nodeset.split('/');
                     value = value[value.length-1];
                 %]
-                [% if (casexml.edit) { %]
-                    <input class="code" type="text" name="action-update-key" value="[%= propertyName || value %]" />
-                [% } else { %]
-                    <code>[%= propertyName %]</code>
-                [% } %]
+                <input class="code" type="text" name="action-update-key" value="[%= propertyName || value %]" />
             </td>
             <td>
                 [% if (propertyName === "") { %]
                     <span class="invalid">Can't be blank</span>
-                [% } else if (!/^[a-zA-Z][\w_-]*(\/[a-zA-Z][\w_-]*)*$/.test(propertyName)) { %]
+                [% } else if (!/^[a-zA-Z][\w_-]*([\/:][a-zA-Z][\w_-]*)*$/.test(propertyName)) { %]
                     <span class="invalid">Must start with letter and contain only letters, numbers, '-', and '_': "[%= propertyName %]"</span>
                 [% } else if (reservedWords.indexOf(propertyName) !== -1) { %]
                     <span class="text-error"><strong>[%= propertyName %]</strong> is a reserved word</span>
@@ -40,13 +36,10 @@
             </td>
         </tr>
     [% }); %]
-    [% if (casexml.edit) { %]
-        <tr class="action-update">
-            <td>
-                [%= casexml.renderOptions(casexml.getQuestions("all"), "", 'action-update-value') %]
-            </td>
-            <td><input class="code" type="text" name="action-update-key" /></td>
-        </tr>
-    [% } %]
-
+    <tr class="action-update">
+        <td>
+            [%= casexml.renderOptions(casexml.getQuestions("all"), "", 'action-update-value') %]
+        </td>
+        <td><input class="code" type="text" name="action-update-key" /></td>
+    </tr>
 </table>

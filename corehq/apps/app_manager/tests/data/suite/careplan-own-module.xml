@@ -260,6 +260,9 @@
         <locale id="forms.m0f0"/>
       </text>
     </command>
+    <session>
+      <datum id="case_id_new_patient_0" function="uuid()"/>
+    </session>
   </entry>
   <entry>
     <form>http://dev.commcarehq.org/careplan/goal/create</form>
@@ -276,7 +279,7 @@
     </session>
     <stack>
       <create>
-        <command>m1</command>
+        <command value="'m1'"/>
         <datum id="case_id" value="instance('commcaresession')/session/data/case_id"/>
       </create>
     </stack>
@@ -296,7 +299,7 @@
     </session>
     <stack>
       <create>
-        <command>m1</command>
+        <command value="'m1'"/>
         <datum id="case_id" value="instance('commcaresession')/session/data/case_id"/>
       </create>
     </stack>
@@ -316,7 +319,7 @@
     </session>
     <stack>
       <create>
-        <command>m1</command>
+        <command value="'m1'"/>
         <datum id="case_id" value="instance('commcaresession')/session/data/case_id"/>
       </create>
     </stack>
@@ -337,7 +340,7 @@
     </session>
     <stack>
       <create>
-        <command>m1</command>
+        <command value="'m1'"/>
         <datum id="case_id" value="instance('commcaresession')/session/data/case_id"/>
       </create>
     </stack>

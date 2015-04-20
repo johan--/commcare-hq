@@ -1,13 +1,18 @@
 from datetime import datetime, timedelta
 import logging
-from corehq.apps.products.models import Product
+import itertools
+from celery.canvas import chain
+from celery.task import task
+from django.db import transaction
+from django.db.models import Q
+from corehq.apps.products.models import SQLProduct
 from corehq.apps.locations.models import Location, SQLLocation
+from dimagi.utils.chunked import chunked
 from dimagi.utils.dates import get_business_day_of_month, add_months, months_between
 from casexml.apps.stock.models import StockReport, StockTransaction
 from custom.ilsgateway.models import SupplyPointStatus, SupplyPointStatusTypes, DeliveryGroups, \
     OrganizationSummary, GroupSummary, SupplyPointStatusValues, Alert, ProductAvailabilityData, \
-    SupplyPointWarehouseRecord, HistoricalLocationGroup
-from custom.ilsgateway import TEST
+    SupplyPointWarehouseRecord, HistoricalLocationGroup, ILSGatewayConfig
 
 
 """
@@ -29,28 +34,38 @@ DELIVERY_NOT_RECEIVED = 'delivery_' + SupplyPointStatusValues.NOT_RECEIVED
 DELIVERY_NOT_RESPONDING = 'delivery_not_responding'
 SOH_NOT_RESPONDING = 'soh_not_responding'
 
+TEST_REGION_ID = 21
 
-def _is_valid_status(facility_id, date, status_type):
+
+def _is_valid_status(facility, date, status_type):
     if status_type not in NEEDED_STATUS_TYPES:
         return False
-    facility = Location.get(docid=facility_id)
     groups = HistoricalLocationGroup.objects.filter(
         date__month=date.month,
         date__year=date.year,
         location_id=facility.sql_location
     )
-    if (not facility.metadata.get('groups', [])) and (groups.count() == 0):
+    if (not facility.metadata.get('group', None)) and (groups.count() == 0):
         return False
 
     if groups.count() > 0:
-        code = groups[0].group
+        codes = [group.group for group in groups]
     else:
-        code = facility.metadata['groups'][0]
+        try:
+            latest_group = HistoricalLocationGroup.objects.filter(
+                location_id=facility.sql_location
+            ).latest('date')
+            if date.date() < latest_group.date:
+                return False
+            else:
+                codes = [facility.metadata['group']]
+        except HistoricalLocationGroup.DoesNotExist:
+            codes = [facility.metadata['group']]
     dg = DeliveryGroups(date.month)
     if status_type == SupplyPointStatusTypes.R_AND_R_FACILITY:
-        return code == dg.current_submitting_group()
+        return dg.current_submitting_group() in codes
     elif status_type == SupplyPointStatusTypes.DELIVERY_FACILITY:
-        return code == dg.current_delivering_group()
+        return dg.current_delivering_group() in codes
     return True
 
 
@@ -119,17 +134,15 @@ def average_lead_time(facility_id, window_date):
 
 
 def needed_status_types(org_summary):
-    return [status_type for status_type in NEEDED_STATUS_TYPES if _is_valid_status(org_summary.supply_point,
+    facility = Location.get(docid=org_summary.supply_point)
+    return [status_type for status_type in NEEDED_STATUS_TYPES if _is_valid_status(facility,
                                                                                    org_summary.date, status_type)]
 
 
 def not_responding_facility(org_summary):
-    assert Location.get(docid=org_summary.supply_point).location_type == "FACILITY"
-
     for status_type in needed_status_types(org_summary):
         group_summary, created = GroupSummary.objects.get_or_create(org_summary=org_summary,
-                                                           title=status_type)
-
+                                                                    title=status_type)
         group_summary.total = 1
         assert group_summary.responded in (0, 1)
         if group_summary.title == SupplyPointStatusTypes.SOH_FACILITY and not group_summary.responded:
@@ -151,15 +164,16 @@ def not_responding_facility(org_summary):
         group_summary.save()
 
 
+@transaction.commit_on_success
 def update_product_availability_facility_data(org_summary):
     # product availability
 
     facility = Location.get(docid=org_summary.supply_point)
     assert facility.location_type == "FACILITY"
-    prods = Product.ids_by_domain(facility.domain)
+    prods = SQLProduct.objects.filter(domain=facility.domain, is_archived=False)
     for p in prods:
         product_data, created = ProductAvailabilityData.objects.get_or_create(
-            product=p,
+            product=p.product_id,
             supply_point=facility._id,
             date=org_summary.date
         )
@@ -168,12 +182,12 @@ def update_product_availability_facility_data(org_summary):
             # set defaults
             product_data.total = 1
             previous_reports = ProductAvailabilityData.objects.filter(
-                product=p,
+                product=p.product_id,
                 supply_point=facility._id,
                 date__lt=org_summary.date
             )
             if previous_reports.count():
-                prev = previous_reports.order_by("-date")[0]
+                prev = previous_reports.latest('date')
                 product_data.with_stock = prev.with_stock
                 product_data.without_stock = prev.without_stock
                 product_data.without_data = prev.without_data
@@ -195,7 +209,7 @@ def populate_no_primary_alerts(location, date):
     # TODO Too slow. Figure out better solution.
     """
     if not filter(lambda user: user.is_active and user.location and user.location._id == org._id,
-                  CommTrackUser.by_domain(org.domain)):
+                  CommCareUser.by_domain(org.domain)):
         create_multilevel_alert(org, date, NO_PRIMARY_CONTACT, {'org': org})
     """
 
@@ -264,61 +278,91 @@ def create_alert(location_id, date, alert_type, details):
 
 
 def default_start_date():
-    return datetime(2010, 11, 1)
+    return datetime(2012, 1, 1)
 
 
 def _get_test_locations(domain):
-    from custom.ilsgateway.tasks import ILS_FACILITIES
-    sql_locations = SQLLocation.objects.filter(domain=domain, external_id__in=ILS_FACILITIES).only('location_id')
-    return [Location.get(sql_location.location_id) for sql_location in sql_locations]
+    """
+        returns test region and all its children
+    """
+    test_region = SQLLocation.objects.get(domain=domain, external_id=TEST_REGION_ID)
+    sql_locations = SQLLocation.objects.filter(
+        Q(domain=domain) & (Q(parent=test_region) | Q(parent__parent=test_region))
+    ).order_by('id').only('location_id')
+    return [sql_location.couch_location for sql_location in sql_locations] + \
+           [test_region.couch_location]
 
 
-def populate_report_data(start_date, end_date, domain=None):
+def populate_report_data(start_date, end_date, domain, runner):
     # first populate all the warehouse tables for all facilities
     # hard coded to know this is the first date with data
     start_date = max(start_date, default_start_date())
 
     # For QA purposes generate reporting data for only some small part of data.
-    if TEST:
+    if not ILSGatewayConfig.for_domain(domain).all_stock_data:
         locations = _get_test_locations(domain)
         facilities = filter(lambda location: location.location_type == 'FACILITY', locations)
         non_facilities_types = ['DISTRICT', 'REGION', 'MOHSW']
-        non_facilities = filter(lambda location: location.location_type in non_facilities_types, locations)
+        non_facilities = []
+        for location_type in non_facilities_types:
+            non_facilities.extend(filter(lambda location: location.location_type == location_type, locations))
     else:
         facilities = Location.filter_by_type(domain, 'FACILITY')
         non_facilities = list(Location.filter_by_type(domain, 'DISTRICT'))
         non_facilities += list(Location.filter_by_type(domain, 'REGION'))
         non_facilities += list(Location.filter_by_type(domain, 'MOHSW'))
 
-    for fac in facilities:
-        process_facility_warehouse_data(fac, start_date, end_date)
+    if runner.location:
+        if runner.location.location_type.name.upper() != 'FACILITY':
+            facilities = []
+            non_facilities = itertools.dropwhile(
+                lambda location: location._id != runner.location.location_id,
+                non_facilities
+            )
+        else:
+            facilities = itertools.dropwhile(
+                lambda location: location._id != runner.location.location_id,
+                facilities
+            )
 
+    facilities_chunked_list = chunked(facilities, 50)
+    for chunk in facilities_chunked_list:
+        res = chain(process_facility_warehouse_data.si(fac, start_date, end_date, runner) for fac in chunk)()
+        res.get()
+
+    non_facilities_chunked_list = chunked(non_facilities, 50)
     # then populate everything above a facility off a warehouse table
-    for org in non_facilities:
-        process_non_facility_warehouse_data(org, start_date, end_date)
-
+    for chunk in non_facilities_chunked_list:
+        res = chain(process_non_facility_warehouse_data.si(org, start_date, end_date, runner) for org in chunk)()
+        res.get()
+    runner.location = None
+    runner.save()
     # finally go back through the history and initialize empty data for any
     # newly created facilities
     update_historical_data(domain)
 
 
-def process_facility_warehouse_data(facility, start_date, end_date):
+@task(queue='background_queue')
+def process_facility_warehouse_data(facility, start_date, end_date, runner):
     """
     process all the facility-level warehouse tables
     """
     logging.info("processing facility %s (%s)" % (facility.name, str(facility._id)))
+    runner.location = facility.sql_location
+    runner.save()
     for alert_type in [SOH_NOT_RESPONDING, RR_NOT_RESPONDED, DELIVERY_NOT_RESPONDING]:
         alert = Alert.objects.filter(supply_point=facility._id, date__gte=start_date, date__lt=end_date,
                                      type=alert_type)
         alert.delete()
 
     supply_point_id = facility.linked_supply_point()._id
+    location_id = facility._id
     new_statuses = SupplyPointStatus.objects.filter(
         supply_point=facility._id,
         status_date__gte=start_date,
         status_date__lt=end_date
     ).order_by('status_date')
-    process_facility_statuses(facility, new_statuses)
+    process_facility_statuses(location_id, new_statuses)
 
     new_reports = StockReport.objects.filter(
         stocktransaction__case_id=supply_point_id,
@@ -326,20 +370,20 @@ def process_facility_warehouse_data(facility, start_date, end_date):
         date__lt=end_date,
         stocktransaction__type='stockonhand'
     ).order_by('date')
-    process_facility_product_reports(facility, new_reports)
+    process_facility_product_reports(location_id, new_reports)
 
     new_trans = StockTransaction.objects.filter(
         case_id=supply_point_id,
         report__date__gte=start_date,
-        report__date__lt=end_date
+        report__date__lt=end_date,
+        type='stockonhand'
     ).order_by('report__date')
-    process_facility_transactions(facility, new_trans)
+    process_facility_transactions(location_id, new_trans)
 
     # go through all the possible values in the date ranges
     # and make sure there are warehouse tables there
     for year, month in months_between(start_date, end_date):
         window_date = datetime(year, month, 1)
-
         # create org_summary for every fac/date combo
         org_summary, created = OrganizationSummary.objects.get_or_create(
             supply_point=facility._id,
@@ -368,19 +412,19 @@ def process_facility_warehouse_data(facility, start_date, end_date):
         populate_facility_stockout_alerts(facility, window_date)
 
 
-def process_facility_statuses(facility, statuses, alerts=True):
+@transaction.commit_on_success
+def process_facility_statuses(facility_id, statuses, alerts=True):
     """
     For a given facility and list of statuses, update the appropriate
     data warehouse tables. This should only be called on supply points
     that are facilities.
     """
-    assert facility.location_type == "FACILITY"
+    facility = Location.get(docid=facility_id)
     for status in statuses:
-        assert status.supply_point == facility._id
         warehouse_date = _get_window_date(status.status_type, status.status_date)
-        if _is_valid_status(facility._id, status.status_date, status.status_type):
+        if _is_valid_status(facility, status.status_date, status.status_type):
             org_summary = OrganizationSummary.objects.get_or_create(
-                supply_point=facility._id,
+                supply_point=facility_id,
                 date=warehouse_date
             )[0]
             group_summary = GroupSummary.objects.get_or_create(
@@ -410,16 +454,16 @@ def process_facility_statuses(facility, statuses, alerts=True):
                 if alerts:
                     if status.status_value == SupplyPointStatusValues.NOT_SUBMITTED \
                             and status.status_type == SupplyPointStatusTypes.R_AND_R_FACILITY:
-                        create_alert(facility._id, status.status_date, RR_NOT_SUBMITTED,
+                        create_alert(facility_id, status.status_date, RR_NOT_SUBMITTED,
                                      {'number': 1})
 
                     if status.status_value == SupplyPointStatusValues.NOT_RECEIVED \
                             and status.status_type == SupplyPointStatusTypes.DELIVERY_FACILITY:
-                        create_alert(facility._id, status.status_date, DELIVERY_NOT_RECEIVED,
+                        create_alert(facility_id, status.status_date, DELIVERY_NOT_RECEIVED,
                                      {'number': 1})
 
 
-def process_facility_product_reports(facility, reports):
+def process_facility_product_reports(facility_id, reports):
     """
     For a given facility and list of ProductReports, update the appropriate
     data warehouse tables. This should only be called on supply points
@@ -428,12 +472,11 @@ def process_facility_product_reports(facility, reports):
     stock on hand reports don't create valid status, but should be treated
     like valid submissions in most of the rest of the site.
     """
-    assert facility.location_type == "FACILITY"
     months_updated = {}
     for report in reports:
-        stock_transaction = report.stocktransaction_set.get(type='stockonhand')
-        assert stock_transaction.case_id == facility.linked_supply_point()._id
-        assert stock_transaction.type
+        stock_transactions = report.stocktransaction_set.filter(type='stockonhand')
+        assert stock_transactions.count() > 0
+
         warehouse_date = _get_window_date(SupplyPointStatusTypes.SOH_FACILITY, report.date)
 
         if warehouse_date in months_updated:
@@ -441,7 +484,7 @@ def process_facility_product_reports(facility, reports):
             # product report for the entire month
             continue
 
-        org_summary = OrganizationSummary.objects.get_or_create(supply_point=facility._id, date=warehouse_date)[0]
+        org_summary = OrganizationSummary.objects.get_or_create(supply_point=facility_id, date=warehouse_date)[0]
 
         group_summary = GroupSummary.objects.get_or_create(org_summary=org_summary,
                                                            title=SupplyPointStatusTypes.SOH_FACILITY)[0]
@@ -455,21 +498,19 @@ def process_facility_product_reports(facility, reports):
         months_updated[warehouse_date] = None  # update the cache of stuff we've dealt with
 
 
-def process_facility_transactions(facility, transactions):
+@transaction.commit_on_success
+def process_facility_transactions(facility_id, transactions):
     """
     For a given facility and list of transactions, update the appropriate
     data warehouse tables. This should only be called on supply points
     that are facilities.
 
     """
-    assert facility.location_type == "FACILITY"
-
     for trans in transactions:
-        assert trans.case_id == facility.linked_supply_point()._id
         date = trans.report.date
         product_data = ProductAvailabilityData.objects.get_or_create(
             product=trans.product_id,
-            supply_point=facility._id,
+            supply_point=facility_id,
             date=datetime(date.year, date.month, 1)
         )[0]
 
@@ -494,7 +535,10 @@ def get_nested_children(location):
     return children
 
 
-def process_non_facility_warehouse_data(location, start_date, end_date, strict=True):
+@task(queue='background_queue')
+def process_non_facility_warehouse_data(location, start_date, end_date, runner, strict=True):
+    runner.location = location.sql_location
+    runner.save()
     facs = get_nested_children(location)
     fac_ids = [f._id for f in facs]
     logging.info("processing non-facility %s (%s), %s children" % (location.name, str(location._id), len(facs)))
@@ -515,13 +559,13 @@ def process_non_facility_warehouse_data(location, start_date, end_date, strict=T
 
         org_summary.save()
         # product availability
-        prods = Product.ids_by_domain(location.domain)
+        prods = SQLProduct.objects.filter(domain=location.domain, is_archived=False)
         for p in prods:
-            product_data = ProductAvailabilityData.objects.get_or_create(product=p,
+            product_data = ProductAvailabilityData.objects.get_or_create(product=p.product_id,
                                                                          supply_point=location._id,
                                                                          date=window_date)[0]
 
-            sub_prods = ProductAvailabilityData.objects.filter(product=p,
+            sub_prods = ProductAvailabilityData.objects.filter(product=p.product_id,
                                                                supply_point__in=fac_ids,
                                                                date=window_date)
 
@@ -578,15 +622,21 @@ def update_historical_data(domain):
     org_summaries = OrganizationSummary.objects.order_by('date')
     if org_summaries.count() == 0:
         return
+
     start_date = org_summaries[0].date
-    locations = _get_test_locations(domain) if TEST else Location.by_domain(domain)
+
+    if not ILSGatewayConfig.for_domain(domain).all_stock_data:
+        locations = _get_test_locations(domain)
+    else:
+        locations = Location.by_domain(domain)
+
     for sp in locations:
         try:
             SupplyPointWarehouseRecord.objects.get(supply_point=sp._id)
         except SupplyPointWarehouseRecord.DoesNotExist:
             # we didn't have a record so go through and historically update
             # anything we maybe haven't touched
-            for year, month in months_between(start_date, sp.linked_supply_point().opened_on):
+            for year, month in months_between(start_date, sp.sql_location.created_at):
                 window_date = datetime(year, month, 1)
                 for cls in [OrganizationSummary, ProductAvailabilityData, GroupSummary]:
                     _init_warehouse_model(cls, sp, window_date)
@@ -608,8 +658,8 @@ def _init_default(location, date):
 
 
 def _init_with_product(location, date):
-    for p in Product.ids_by_domain(location.domain):
-        ProductAvailabilityData.objects.get_or_create(supply_point=location._id, date=date, product=p)
+    for p in SQLProduct.objects.filter(domain=location.domain, is_archived=False):
+        ProductAvailabilityData.objects.get_or_create(supply_point=location._id, date=date, product=p.product_id)
 
 
 def _init_group_summary(location, date):

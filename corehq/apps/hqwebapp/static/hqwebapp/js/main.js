@@ -139,7 +139,8 @@ var SaveButton = {
         });
 
         var beforeunload = function () {
-            var stillAttached = button.ui.parents()[button.ui.parents().length - 1].tagName.toLowerCase() == 'html';
+            var parentEl = button.ui.parents()[button.ui.parents().length - 1];
+            var stillAttached = parentEl ? parentEl.tagName.toLowerCase() == 'html' : false;
             if (button.state !== 'saved' && stillAttached) {
                 return options.unsavedMessage || "";
             }
@@ -193,11 +194,13 @@ var COMMCAREHQ = (function () {
             wrap = wrap === undefined ? true : wrap;
             var el = $(
                 '<a href="#" class="hq-help no-click">' +
-                    '<i class="icon-question-sign" data-trigger="hover"></i></a>'
-            );
-            for (var attr in {content: 0, title: 0, html: 0}) {
+                    '<i class="icon-question-sign"></i></a>'
+                ),
+                attrs = ['content', 'title', 'placement', 'trigger'];
+
+            attrs.map(function (attr) {
                 $('i', el).data(attr, opts[attr]);
-            }
+            });
             if (wrap) {
                 el.hqHelp();
             }

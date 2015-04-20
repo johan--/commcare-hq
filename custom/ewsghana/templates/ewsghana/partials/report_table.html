@@ -1,0 +1,154 @@
+{% load hq_shared_tags %}
+{% load report_tags %}
+{% load i18n %}
+
+{% if charts %}
+    <div class="row">
+        {% for chart in charts %}
+            {% if chart.title %}<h4 style="text-align: center;">{{ chart.title }}</h4>{% endif %}
+            <div id='chart_{{ report.slug }}_{{ forloop.parentloop.counter }}{{ forloop.counter }}' class="span{{ chart_span }} hide">
+            <svg style='height: {{ chart.height }}px'> </svg>
+        </div>
+        {% endfor %}
+    </div>
+{% endif %}
+{% if show_table %}
+    <table id="report_table_{{ report_table.slug }}" class="table table-nonfluid datatable" {% if pagination.filter %} data-filter="true"{% endif %}>
+        <thead>
+            {%  if report_table.headers.complex %}
+                {{ report_table.headers.render_html|safe }}
+            {% else %}
+                <tr>
+                    {% for header in report_table.headers %}
+                        <th {% if not report_table.pagination.is_on %}data-sort="{{ header.sort_type }}" data-sortdir="{{ header.sort_direction }}"{% endif %} {% if header.css_class %}class="{{ header.css_class }}"{% endif %}>
+                            <i class="icon-white"></i>
+                            {% if header.html %}{{ header.html }}{% else %}{{ header|linebreaksbr }}{% endif %}
+                            {% if header.help_text %}
+                                <i class="icon-white icon-question-sign header-tooltip" title="{{ header.help_text }}"></i>
+                            {% endif %}
+                        </th>
+                    {% endfor %}
+                </tr>
+            {% endif %}
+        </thead>
+        <tbody>
+        {% block tabular-body %}
+        {% if report_table.pagination.is_on %}
+            <tr>
+                <td colspan="{{ report_table.headers.header|length }}" class="dataTables_empty">
+                    {% trans "Fetching additional data, please wait..." %}
+                </td>
+            </tr>
+        {% endif %}
+        {% for row in report_table.rows %}
+            <tr>
+                {% for col in row %}
+                    {% include 'reports/async/partials/tabular_cell.html' %}
+                {% endfor %}
+            </tr>
+        {% endfor %}
+        {% endblock %}
+        </tbody>
+        {% if report_table.total_row and report_table.rows %}
+            <tfoot>
+            <tr>
+                {% for col in report_table.total_row %}
+                    <td>{% if col.html != None %}{{ col.html|safe }}{% else %}{{ col|safe }}{% endif %}</td>
+                {% endfor %}
+            </tr>
+            </tfoot>
+        {% endif %}
+    </table>
+{% endif %}
+
+<script type="text/javascript">
+   {% if report_table and report_table.use_datatables %}
+        var dataTablesDom = "frt<'row-fluid dataTables_control'<'span5'il><'span7'p>>";
+
+        var params = {
+                sDom: dataTablesDom,
+                "sPaginationType": "bootstrap",
+                iDisplayLength: 10,
+                iDisplayStart: 0,
+                sScrollX: "100%"
+            };
+
+        {% if report_table.slug != 'product_selection_pane' %}
+            var id = '#report_table_{{ report_table.slug }}';
+            var datatable = $(id).dataTable(params);
+        {% endif %}
+
+        {% if report_table.fix_column %}
+            new FixedColumns(datatable, {
+               iLeftColumns: 1,
+               iLeftWidth: 130
+            });
+        {% endif %}
+
+        {% if report_table.slug != 'facility_report' %}
+            var show_hide_table_columns = function (element) {
+                var col_idx = $(element).attr('data-column');
+                if (col_idx !== '-1') {
+                    var bVis = datatable.fnSettings().aoColumns[col_idx].bVisible;
+                    datatable.fnSetColumnVis(col_idx, !bVis);
+                }
+            };
+        {% endif %}
+
+        var show_hide_multibar_chart_data = function() {
+            var data =  JSON.parse(JSON.stringify(multibar_chart_data));
+            var productCodes = $("#report_table_product_selection_pane input:not(:checked)").map(function() {
+              return $(this).val();
+            });
+            for(var i = 0; i < data.length; i++) {
+                data[i].values = jQuery.grep(data[i].values, function(value) {
+                    return !_.contains(productCodes, value.x)
+                });
+            }
+            d3.select(multibar_chart_id + ' svg')
+                .datum(data)
+                .transition().duration(100).call(multibar_chart);
+         };
+
+        var show_hide_line_chart_data = function() {
+            var data = JSON.parse(JSON.stringify(line_chart_data));
+            var productCodes = [];
+            $("#report_table_product_selection_pane input:not(:checked)").each(function() {
+                productCodes.push($(this).attr('value'));
+                productCodes.push($(this).attr('name'));
+            });
+
+            for(var i = 0; i < data.length; i++) {
+                data = jQuery.grep(data, function(value) {
+                    return !_.contains(productCodes, value.key)
+                });
+            }
+            d3.select(line_chart_id + ' svg')
+                    .datum(data)
+                    .transition().duration(500).call(line_chart);
+        };
+
+        $('.toggle-column').bind('click', function() {
+            {% if report_table.slug != 'product_selection_pane' and report_table.slug != 'facility_report' %}
+                if (datatable.fnSettings().aoColumns.length > 1) {
+                    show_hide_table_columns(this);
+                }
+            {% endif %}
+
+            if (typeof multibar_chart_data !== 'undefined') {
+                show_hide_multibar_chart_data();
+            }
+            if (typeof line_chart_data !== 'undefined') {
+                show_hide_line_chart_data();
+            }
+        });
+
+        {% if report_table.slug != 'product_selection_pane' and report_table.slug != 'facility_report' %}
+            $("#report_table_product_selection_pane input:not(:checked)").each(function () {
+                if (datatable.fnSettings().aoColumns.length > 1) {
+                    show_hide_table_columns(this);
+                }
+            });
+        {% endif %}
+    {% endif %}
+</script>

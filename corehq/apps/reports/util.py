@@ -13,19 +13,18 @@ from django.utils import html, safestring
 
 from corehq.apps.announcements.models import ReportAnnouncement
 from corehq.apps.groups.models import Group
-from corehq.apps.reports.display import xmlns_to_name
 from corehq.apps.reports.models import HQUserType, TempCommCareUser
-from corehq.apps.users.models import CommCareUser, CouchUser
+from corehq.apps.users.models import CommCareUser
 from corehq.apps.users.util import user_id_to_username
+from corehq.util.dates import iso_string_to_datetime
+from corehq.util.timezones.utils import get_timezone_for_user
 from couchexport.util import SerializableFunction
 from dimagi.utils.couch.cache import cache_core
 from dimagi.utils.couch.database import get_db
 from dimagi.utils.dates import DateSpan
 from corehq.apps.domain.models import Domain
-from corehq.apps.users.models import WebUser
 from dimagi.utils.decorators.memoized import memoized
-from dimagi.utils.parsing import string_to_datetime, string_to_utc_datetime
-from dimagi.utils.timezones import utils as tz_utils
+from dimagi.utils.parsing import string_to_datetime
 from dimagi.utils.web import json_request
 
 
@@ -102,7 +101,7 @@ def get_all_users_by_domain(domain=None, group=None, user_ids=None,
         # get all the users only in this group and don't bother filtering.
         if not isinstance(group, Group):
             group = Group.get(group)
-        users = group.get_users(only_commcare=True)
+        users = group.get_users(is_active=(not include_inactive), only_commcare=True)
     elif user_ids is not None:
         try:
             users = [CommCareUser.get_by_user_id(id) for id in user_ids]
@@ -269,35 +268,12 @@ def app_export_filter(doc, app_id):
     else:
         return True
 
-def get_timezone(couch_user_or_id, domain):
-    # todo cleanup
-    timezone = None
-    if couch_user_or_id:
-        if isinstance(couch_user_or_id, CouchUser):
-            requesting_user = couch_user_or_id
-        else:
-            assert isinstance(couch_user_or_id, basestring)
-            try:
-                requesting_user = WebUser.get_by_user_id(couch_user_or_id)
-            except CouchUser.AccountTypeError:
-                return pytz.utc
-        domain_membership = requesting_user.get_domain_membership(domain)
-        if domain_membership:
-            timezone = tz_utils.coerce_timezone_value(domain_membership.timezone)
-
-    if not timezone:
-        current_domain = Domain.get_by_name(domain)
-        try:
-            timezone = tz_utils.coerce_timezone_value(current_domain.default_timezone)
-        except pytz.UnknownTimeZoneError:
-            timezone = pytz.utc
-    return timezone
 
 def datespan_export_filter(doc, datespan):
     if isinstance(datespan, dict):
         datespan = DateSpan(**datespan)
     try:
-        received_on = string_to_utc_datetime(doc['received_on']).replace(tzinfo=pytz.utc)
+        received_on = iso_string_to_datetime(doc['received_on']).replace(tzinfo=pytz.utc)
     except Exception:
         if settings.DEBUG:
             raise
@@ -348,12 +324,13 @@ def users_matching_filter(domain, user_filters):
 
 
 def create_export_filter(request, domain, export_type='form'):
+    request_obj = request.POST if request.method == 'POST' else request.GET
     from corehq.apps.reports.filters.users import UserTypeFilter
-    app_id = request.GET.get('app_id', None)
+    app_id = request_obj.get('app_id', None)
 
     user_filters, use_user_filters = UserTypeFilter.get_user_filter(request)
     use_user_filters &= bool(user_filters)
-    group = None if use_user_filters else get_group(**json_request(request.GET))
+    group = None if use_user_filters else get_group(**json_request(request_obj))
 
     if export_type == 'case':
         if use_user_filters:
@@ -366,7 +343,7 @@ def create_export_filter(request, domain, export_type='form'):
         filter = SerializableFunction(app_export_filter, app_id=app_id)
         datespan = request.datespan
         if datespan.is_valid():
-            datespan.set_timezone(get_timezone(request.couch_user, domain))
+            datespan.set_timezone(get_timezone_for_user(request.couch_user, domain))
             filter &= SerializableFunction(datespan_export_filter, datespan=datespan)
         if use_user_filters:
             filtered_users = users_matching_filter(domain, user_filters)
@@ -457,7 +434,7 @@ def stream_qs(qs, batch_size=1000):
         for item in qs:
             yield item
 
-def numcell(text, value=None, convert='int'):
+def numcell(text, value=None, convert='int', raw=None):
     if value is None:
         try:
             value = int(text) if convert == 'int' else float(text)
@@ -467,7 +444,7 @@ def numcell(text, value=None, convert='int'):
                 text = '%.f%%' % value
         except ValueError:
             value = text
-    return format_datatables_data(text=text, sort_key=value)
+    return format_datatables_data(text=text, sort_key=value, raw=raw)
 
 def datespan_from_beginning(domain, default_days, timezone):
     now = datetime.utcnow()

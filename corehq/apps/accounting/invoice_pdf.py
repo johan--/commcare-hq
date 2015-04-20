@@ -5,6 +5,7 @@ from reportlab.pdfgen.canvas import Canvas
 from reportlab.platypus import Paragraph
 from corehq.apps.accounting.exceptions import InvoiceError
 from corehq.apps.accounting.utils import get_money_str
+from corehq.const import USER_DATE_FORMAT
 import settings
 
 
@@ -32,10 +33,22 @@ class PdfLineItem(object):
 
 
 class Address(object):
-    def __init__(self, name='', first_line='', second_line='', city='',
-                 region='', postal_code='', country='', phone_number='',
-                 email='', website=''):
+    def __init__(
+        self,
+        name='',
+        company_name='',
+        first_line='',
+        second_line='',
+        city='',
+        region='',
+        postal_code='',
+        country='',
+        phone_number='',
+        email='',
+        website=''
+    ):
         self.name = name
+        self.company_name = company_name
         self.first_line = first_line
         self.second_line = second_line
         self.city = city
@@ -47,12 +60,13 @@ class Address(object):
         self.website = website
 
     def __str__(self):
-        return '''%(name)s
+        return ('''%(name)s%(company_name)s
 %(first_line)s%(second_line)s
 %(city)s%(region)s %(postal_code)s
 %(country)s%(phone_number)s%(email_address)s%(website)s
         ''' % {
             'name': self.name,
+            'company_name': prepend_newline_if_not_empty(self.company_name),
             'first_line': self.first_line,
             'second_line': prepend_newline_if_not_empty(self.second_line),
             'city': "%s, " % self.city if self.city else "",
@@ -62,7 +76,7 @@ class Address(object):
             'phone_number': prepend_newline_if_not_empty(self.phone_number),
             'email_address': prepend_newline_if_not_empty(self.email),
             'website': prepend_newline_if_not_empty(self.website),
-        }
+        }).lstrip()
 
 
 LIGHT_GRAY = (0.7, 0.7, 0.7)
@@ -88,7 +102,8 @@ class InvoiceTemplate(object):
                  bank_name=settings.BANK_NAME,
                  bank_address=Address(**settings.BANK_ADDRESS),
                  account_number=settings.BANK_ACCOUNT_NUMBER,
-                 routing_number=settings.BANK_ROUTING_NUMBER,
+                 routing_number_ach=settings.BANK_ROUTING_NUMBER_ACH,
+                 routing_number_wire=settings.BANK_ROUTING_NUMBER_WIRE,
                  swift_code=settings.BANK_SWIFT_CODE,
                  applied_credit=None,
                  subtotal=None, tax_rate=None, applied_tax=None, total=None):
@@ -107,7 +122,8 @@ class InvoiceTemplate(object):
         self.bank_name = bank_name
         self.bank_address = bank_address
         self.account_number = account_number
-        self.routing_number = routing_number
+        self.routing_number_ach = routing_number_ach
+        self.routing_number_wire = routing_number_wire
         self.swift_code = swift_code
         self.applied_credit = applied_credit
         self.subtotal = subtotal
@@ -207,9 +223,9 @@ class InvoiceTemplate(object):
 
         self.canvas.drawString(
             0, 0, "Statement period from %s to %s" %
-                  (self.date_start.strftime("%d %B %Y")
+                  (self.date_start.strftime(USER_DATE_FORMAT)
                    if self.date_start is not None else "",
-                   self.date_end.strftime("%d %B %Y")
+                   self.date_end.strftime(USER_DATE_FORMAT)
                    if self.date_end is not None else ""))
 
         self.canvas.translate(-origin_x, -origin_y)
@@ -360,8 +376,6 @@ class InvoiceTemplate(object):
         self.canvas.translate(-origin_x, -origin_y)
 
     def draw_footer(self):
-        self.canvas.rect(inches(0.75), inches(1.3), inches(4), inches(0.5))
-
         self.canvas.setFillColorRGB(*LIGHT_GRAY)
         self.canvas.rect(inches(5), inches(1.05), inches(3), inches(0.5),
                          fill=1)
@@ -388,20 +402,41 @@ class InvoiceTemplate(object):
         self.canvas.drawString(inches(5), inches(0.8),
                                "Thank you for using CommCare HQ.")
 
-        footer_text = ("Payable by check or wire transfer. "
-                       "Wire transfer is preferred: "
-                       "Bank: %(bank_name)s "
-                       "Bank Address: %(bank_address)s "
-                       "Account Number: %(account_number)s "
-                       "Routing Number or ABA: %(routing_number)s "
-                       "Swift Code: %(swift_code)s") % {
+        payment_description = """Payable by credit card, check, wire or ACH transfer.<br />
+For all payments, include "Invoice #" (displayed in top right corner).<br />
+<strong>Credit card payments</strong> are preferred and can be made online.<br />
+"""
+        ach_payment_text = (
+            "<strong>ACH payment</strong> (preferred over wire payment for transfer in the US):<br />"
+            "Bank: %(bank_name)s "
+            "Bank Address: %(bank_address)s "
+            "Account Number: %(account_number)s "
+            "Routing Number or ABA: %(routing_number_ach)s<br />"
+        ) % {
             'bank_name': self.bank_name,
             'bank_address': self.bank_address,
             'account_number': self.account_number,
-            'routing_number': self.routing_number,
+            'routing_number_ach': self.routing_number_ach,
+        }
+        wire_payment_text = (
+            "<strong>Wire payment</strong>:<br />"
+            "Bank: %(bank_name)s "
+            "Bank Address: %(bank_address)s "
+            "Account Number: %(account_number)s "
+            "Routing Number or ABA: %(routing_number_wire)s "
+            "Swift Code: %(swift_code)s<br/>"
+        ) % {
+            'bank_name': self.bank_name,
+            'bank_address': self.bank_address,
+            'account_number': self.account_number,
+            'routing_number_wire': self.routing_number_wire,
             'swift_code': self.swift_code,
         }
 
-        payment_info = Paragraph(footer_text, ParagraphStyle(''))
-        payment_info.wrapOn(self.canvas, inches(4), inches(0.9))
-        payment_info.drawOn(self.canvas, inches(0.75), inches(0.6))
+        payment_info = Paragraph('\n'.join([
+            payment_description,
+            ach_payment_text,
+            wire_payment_text,
+        ]), ParagraphStyle(''))
+        payment_info.wrapOn(self.canvas, inches(4.25), inches(0.9))
+        payment_info.drawOn(self.canvas, inches(0.5), inches(0.6))

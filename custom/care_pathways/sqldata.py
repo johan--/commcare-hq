@@ -238,13 +238,15 @@ class AdoptionDisaggregatedSqlData(CareSqlData):
     def columns(self):
         return [
             DatabaseColumn('', AliasColumn('gender'), format_fn=self._to_display),
-            AggregateColumn('All', lambda x:x,
-                            [CareCustomColumn('all', filters=self.filters + [EQ("maxmin", 'all')])]),
+            AggregateColumn('None', lambda x:x,
+                            [CareCustomColumn('none', filters=self.filters + [EQ("maxmin", 'none')])]),
             AggregateColumn('Some', lambda x:x,
                             [CareCustomColumn('some', filters=self.filters + [EQ("maxmin", 'some')])]),
-            AggregateColumn('None', lambda x:x,
-                            [CareCustomColumn('none', filters=self.filters + [EQ("maxmin", 'none')])])
+            AggregateColumn('All', lambda x:x,
+                            [CareCustomColumn('all', filters=self.filters + [EQ("maxmin", 'all')])])
+
         ]
+
 
 class TableCardSqlData(CareSqlData):
 
@@ -342,8 +344,10 @@ class TableCardReportGrouppedPercentSqlData(TableCardSqlData):
         return headers
 
     def format_rows(self, rows):
+        formatter = TableCardDataIndividualFormatter(TableDataFormat(self.columns, no_value=self.no_value))
+        formatted_rows = formatter.format(rows, keys=self.keys, group_by=self.group_by, domain=self.domain)
         formatter = TableCardDataGroupsFormatter(TableDataFormat(self.columns, no_value=self.no_value))
-        return formatter.format(rows, keys=self.keys, group_by=self.group_by)
+        return formatter.format(list(formatted_rows), keys=self.keys, group_by=self.group_by)
 
 
 class TableCardReportIndividualPercentSqlData(TableCardSqlData):

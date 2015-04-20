@@ -1,5 +1,7 @@
+import base64
 from collections import defaultdict, namedtuple
 from datetime import datetime, timedelta
+import logging
 import urllib
 import urlparse
 
@@ -11,7 +13,7 @@ import hashlib
 
 from casexml.apps.case.models import CommCareCase
 from casexml.apps.case.xml import V2, LEGAL_VERSIONS
-from corehq.apps.receiverwrapper.exceptions import DuplicateFormatException
+from corehq.apps.receiverwrapper.exceptions import DuplicateFormatException, IgnoreDocument
 
 from couchforms.models import XFormInstance
 from dimagi.utils.decorators.memoized import memoized
@@ -147,6 +149,7 @@ class RegisterGenerator(object):
             generator_class,
             is_default=self.is_default
         )
+        return generator_class
 
     @classmethod
     def generator_class_by_repeater_format(cls, repeater_class, format_name):
@@ -173,6 +176,10 @@ class Repeater(Document, UnicodeMixIn):
     domain = StringProperty()
     url = StringProperty()
     format = StringProperty()
+
+    use_basic_auth = BooleanProperty(default=False)
+    username = StringProperty()
+    password = StringProperty()
 
     def format_or_default_format(self):
         return self.format or RegisterGenerator.default_format_by_repeater(self.__class__)
@@ -236,7 +243,7 @@ class Repeater(Document, UnicodeMixIn):
             if doc_type in repeater_types:
                 return repeater_types[doc_type].wrap(data)
             else:
-                raise ResourceNotFound('Unknown repeater type: %s', data)
+                raise ResourceNotFound('Unknown repeater type: %s' % data)
         else:
             return super(Repeater, cls).wrap(data)
 
@@ -253,7 +260,14 @@ class Repeater(Document, UnicodeMixIn):
 
     def get_headers(self, repeat_record):
         # to be overridden
-        return {}
+        generator = self.get_payload_generator(self.format_or_default_format())
+        headers = generator.get_headers(repeat_record, self.payload_doc(repeat_record))
+        if self.use_basic_auth:
+            user_pass = base64.encodestring(':'.join((self.username, self.password))).replace('\n', '')
+            headers.update({'Authorization': 'Basic ' + user_pass})
+
+        return headers
+
 
 @register_repeater_type
 class FormRepeater(Repeater):
@@ -263,6 +277,7 @@ class FormRepeater(Repeater):
     """
 
     exclude_device_reports = BooleanProperty(default=False)
+    include_app_id_param = BooleanProperty(default=True)
 
     @memoized
     def payload_doc(self, repeat_record):
@@ -270,17 +285,22 @@ class FormRepeater(Repeater):
 
     def get_url(self, repeat_record):
         url = super(FormRepeater, self).get_url(repeat_record)
-        # adapted from http://stackoverflow.com/a/2506477/10840
-        url_parts = list(urlparse.urlparse(url))
-        query = urlparse.parse_qsl(url_parts[4])
-        query.append(("app_id", self.payload_doc(repeat_record).app_id))
-        url_parts[4] = urllib.urlencode(query)
-        return urlparse.urlunparse(url_parts)
+        if not self.include_app_id_param:
+            return url
+        else:
+            # adapted from http://stackoverflow.com/a/2506477/10840
+            url_parts = list(urlparse.urlparse(url))
+            query = urlparse.parse_qsl(url_parts[4])
+            query.append(("app_id", self.payload_doc(repeat_record).app_id))
+            url_parts[4] = urllib.urlencode(query)
+            return urlparse.urlunparse(url_parts)
 
     def get_headers(self, repeat_record):
-        return {
+        headers = super(FormRepeater, self).get_headers(repeat_record)
+        headers.update({
             "received-on": self.payload_doc(repeat_record).received_on.isoformat()+"Z"
-        }
+        })
+        return headers
 
     def __unicode__(self):
         return "forwarding forms to: %s" % self.url
@@ -300,9 +320,11 @@ class CaseRepeater(Repeater):
         return CommCareCase.get(repeat_record.payload_id)
 
     def get_headers(self, repeat_record):
-        return {
+        headers = super(CaseRepeater, self).get_headers(repeat_record)
+        headers.update({
             "server-modified-on": self.payload_doc(repeat_record).server_modified_on.isoformat()+"Z"
-        }
+        })
+        return headers
 
     def __unicode__(self):
         return "forwarding cases to: %s" % self.url
@@ -322,9 +344,11 @@ class ShortFormRepeater(Repeater):
         return XFormInstance.get(repeat_record.payload_id)
 
     def get_headers(self, repeat_record):
-        return {
+        headers = super(ShortFormRepeater, self).get_headers(repeat_record)
+        headers.update({
             "received-on": self.payload_doc(repeat_record).received_on.isoformat()+"Z"
-        }
+        })
+        return headers
 
     def __unicode__(self):
         return "forwarding short form to: %s" % self.url
@@ -361,7 +385,6 @@ class RepeatRecord(Document, LockableMixIn):
             try:
                 dt = datetime.strptime(value, '%Y-%m-%dT%H:%M:%SZ')
                 data[attr] = dt.isoformat() + '.000000Z'
-                print data[attr]
             except ValueError:
                 pass
         return super(RepeatRecord, cls).wrap(data)
@@ -426,23 +449,40 @@ class RepeatRecord(Document, LockableMixIn):
         return self.repeater.get_payload(self)
 
     def fire(self, max_tries=3, post_fn=None):
-        payload = self.get_payload()
-        post_fn = post_fn or simple_post_with_cached_timeout
-        headers = self.repeater.get_headers(self)
-        if self.try_now():
-            # we don't use celery's version of retry because
-            # we want to override the success/fail each try
-            for i in range(max_tries):
-                try:
-                    resp = post_fn(payload, self.url, headers=headers)
-                    if 200 <= resp.status < 300:
-                        self.update_success()
-                        break
-                except Exception, e:
-                    pass # some other connection issue probably
-            if not self.succeeded:
-                # mark it failed for later and give up
-                self.update_failure()
+        try:
+            payload = self.get_payload()
+        except ResourceNotFound:
+            # this repeater is pointing at a missing document
+            # quarantine it and tell it to stop trying.
+            logging.exception('Repeater {} in domain {} references a missing or deleted document!'.format(
+                self._id, self.domain,
+            ))
+            self.doc_type = self.doc_type + '-Failed'
+            self.save()
+        except IgnoreDocument:
+            # this repeater is pointing at a document with no payload
+            logging.info('Repeater {} in domain {} references a document with no payload'.format(
+                self._id, self.domain,
+            ))
+            # Mark it succeeded so that we don't try again
+            self.update_success()
+        else:
+            post_fn = post_fn or simple_post_with_cached_timeout
+            headers = self.repeater.get_headers(self)
+            if self.try_now():
+                # we don't use celery's version of retry because
+                # we want to override the success/fail each try
+                for i in range(max_tries):
+                    try:
+                        resp = post_fn(payload, self.url, headers=headers)
+                        if 200 <= resp.status < 300:
+                            self.update_success()
+                            break
+                    except Exception:
+                        pass  # some other connection issue probably
+                if not self.succeeded:
+                    # mark it failed for later and give up
+                    self.update_failure()
 
 # import signals
 from corehq.apps.receiverwrapper import signals

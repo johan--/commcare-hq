@@ -31,9 +31,11 @@ tmp.sh
 \#*\#
 .DS_Store
 app_builder_live_test/*/
+app_builder_live_test/*-performance.txt
 dump.rdb
 **/less/*.css
 /staticmedia*
+.transifexrc
 
 submodules/formdesigner
 submodules/vellum/Vellum

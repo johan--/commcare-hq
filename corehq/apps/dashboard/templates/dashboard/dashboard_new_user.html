@@ -1,6 +1,23 @@
 {% extends 'dashboard/base.html' %}
 {% load i18n %}{% load hq_shared_tags %}
 
+{% block js-inline %}{{ block.super }}
+<script>
+    $(function () {
+        gaTrackLink($('#appstore-link'), 'Dashboard', 'Welcome Tile', 'exchange');
+        gaTrackLink($('#help-link'), 'Dashboard', 'Welcome Tile', 'help');
+        gaTrackLink($('#new-app-link'), 'Dashboard', 'Welcome Tile', 'app');
+
+        // analytics.trackLink adds timeout, respects cmd-click
+        analytics.track("Visited Welcome Dashboard");
+        analytics.trackLink($('#appstore-link'), "Clicked on Exchange in Dashboard");
+        analytics.trackLink($('#help-link'), "Clicked on Help-site in Dashboard");
+        analytics.trackLink($('#new-app-link'), "Clicked on Applications in Dashboard");
+
+    });
+</script>
+{% endblock js-inline %}
+
 {% block dashboard-content %}
 <div class="page-header">
     <h1>
@@ -18,7 +35,7 @@
                 {% trans 'Exchange' %}
             </div>
             <div class="panel-body">
-                <p class="text-center"><a href="{% url 'appstore' %}" class="dashboard-link">
+                <p class="text-center"><a href="{% url 'appstore' %}" class="dashboard-link" id="appstore-link">
                     <i class="fcc fcc-exchange dashboard-icon dashboard-icon-large"></i>
                     <span class="lead">{% blocktrans %}
                         Start with an existing application
@@ -39,7 +56,8 @@
             <div class="panel-body">
                 <p class="text-center">
                     <a href="{% url 'default_new_app' domain %}"
-                       class="dashboard-link">
+                       class="dashboard-link"
+                       id="new-app-link">
                         <i class="fcc dashboard-icon dashboard-icon-large fcc-applications"></i>
                         <span class="lead">
                             Build a new application
@@ -55,6 +73,7 @@
             <div class="panel-body">
                 <p class="text-center"><a href="http://help.commcarehq.org/"
                       class="dashboard-link"
+                      id="help-link"
                       target="_blank">
                     <i class="fcc fcc-help dashboard-icon dashboard-icon-large"></i>
                     <span class="lead">{% blocktrans %}

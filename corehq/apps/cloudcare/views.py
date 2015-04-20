@@ -3,8 +3,8 @@ from django.utils.decorators import method_decorator
 from casexml.apps.stock.models import StockTransaction
 from casexml.apps.stock.utils import get_current_ledger_transactions
 from corehq.apps.accounting.decorators import requires_privilege_for_commcare_user, requires_privilege_with_fallback
-from corehq.apps.app_manager.exceptions import FormNotFoundException, \
-    ModuleNotFoundException
+from corehq.apps.app_manager.exceptions import FormNotFoundException, ModuleNotFoundException
+from corehq.apps.app_manager.util import is_usercase_enabled, get_cloudcare_session_data
 from corehq.util.couch import get_document_or_404
 from couchforms.const import ATTACHMENT_NAME
 from couchforms.models import XFormInstance
@@ -172,14 +172,16 @@ def form_context(request, domain, app_id, module_id, form_id):
     case_id = request.GET.get('case_id')
     instance_id = request.GET.get('instance_id')
     try:
-        form = app.get_module(module_id).get_form(form_id).name.values()[0]
+        form = app.get_module(module_id).get_form(form_id)
     except (FormNotFoundException, ModuleNotFoundException):
         raise Http404()
+
+    form_name = form.name.values()[0]
 
     # make the name for the session we will use with the case and form
     session_name = u'{app} > {form}'.format(
         app=app.name,
-        form=form,
+        form=form_name,
     )
     if case_id:
         session_name = u'{0} - {1}'.format(session_name, CommCareCase.get(case_id).name)
@@ -191,12 +193,17 @@ def form_context(request, domain, app_id, module_id, form_id):
         root_context['instance_xml'] = XFormInstance.get_db().fetch_attachment(
             instance_id, ATTACHMENT_NAME
         )
+
+    session_extras = {'session_name': session_name, 'app_id': app._id}
+    suite_gen = SuiteGenerator(app, is_usercase_enabled(domain))
+    session_extras.update(get_cloudcare_session_data(suite_gen, domain, form, request.couch_user))
+
     delegation = request.GET.get('task-list') == 'true'
     offline = request.GET.get('offline') == 'true'
     session_helper = SessionDataHelper(domain, request.couch_user, case_id, delegation=delegation, offline=offline)
     return json_response(session_helper.get_full_context(
         root_context,
-        {'session_name': session_name, 'app_id': app._id}
+        session_extras
     ))
 
 
@@ -270,7 +277,7 @@ def filter_cases(request, domain, app_id, module_id, parent_id=None):
     delegation = request.GET.get('task-list') == 'true'
     auth_cookie = request.COOKIES.get('sessionid')
 
-    suite_gen = SuiteGenerator(app)
+    suite_gen = SuiteGenerator(app, is_usercase_enabled(domain))
     xpath = suite_gen.get_filter_xpath(module, delegation=delegation)
     extra_instances = [{'id': inst.id, 'src': inst.src}
                        for inst in suite_gen.get_instances_for_module(module, additional_xpaths=[xpath])]
@@ -365,7 +372,9 @@ def get_fixtures(request, domain, user_id, fixture_id=None):
     else:
         for fixture in generator.get_fixtures(casexml_user, version=V2):
             if fixture.attrib.get("id") == fixture_id:
-                assert len(fixture.getchildren()) == 1
+                assert len(fixture.getchildren()) == 1, 'fixture {} expected 1 child but found {}'.format(
+                    fixture_id, len(fixture.getchildren())
+                )
                 return HttpResponse(ElementTree.tostring(fixture.getchildren()[0]), content_type="text/xml")
         raise Http404
 
@@ -456,7 +465,7 @@ class EditCloudcareUserPermissionsView(BaseUserSettingsView):
         }
 
     def put(self, request, *args, **kwargs):
-        j = json.loads(request.raw_post_data)
+        j = json.loads(request.body)
         old = ApplicationAccess.get_by_domain(self.domain)
         new = ApplicationAccess.wrap(j)
         old.restrict = new.restrict

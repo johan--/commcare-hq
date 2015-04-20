@@ -1,4 +1,11 @@
+from django.utils.datastructures import SortedDict
+from sqlagg import (
+    ColumnNotFoundException,
+    TableNotFoundException,
+)
+from sqlalchemy.exc import ProgrammingError
 from corehq.apps.reports.sqlreport import SqlData
+from corehq.apps.userreports.exceptions import UserReportsError
 from corehq.apps.userreports.models import DataSourceConfiguration
 from corehq.apps.userreports.sql import get_table_name
 from dimagi.utils.decorators.memoized import memoized
@@ -19,7 +26,18 @@ class ConfigurableReportDataSource(SqlData):
         self._filters = {f.slug: f for f in filters}
         self._filter_values = {}
         self.aggregation_columns = aggregation_columns
-        self.column_configs = columns
+        self._column_configs = SortedDict()
+        for column in columns:
+            # should be caught in validation prior to reaching this
+            assert column.column_id not in self._column_configs, \
+                'Report {} in domain {} has more than one {} column defined!'.format(
+                    self._config_id, self.domain, column.column_id,
+                )
+            self._column_configs[column.column_id] = column
+
+    @property
+    def column_configs(self):
+        return self._column_configs.values()
 
     @property
     def config(self):
@@ -45,19 +63,50 @@ class ConfigurableReportDataSource(SqlData):
 
     @property
     def group_by(self):
-        return self.aggregation_columns
+        def _contributions(column_id):
+            # ask each column for its group_by contribution and combine to a single list
+            # if the column isn't found just treat it as a normal field
+            if column_id in self._column_configs:
+                return self._column_configs[col_id].get_group_by_columns()
+            else:
+                return [column_id]
+
+        return [
+            group_by for col_id in self.aggregation_columns
+            for group_by in _contributions(col_id)
+        ]
+
+    @property
+    def columns(self):
+        return [c for sql_conf in self.sql_column_configs for c in sql_conf.columns]
 
     @property
     @memoized
-    def columns(self):
-        return [col.get_sql_column() for col in self.column_configs]
+    def sql_column_configs(self):
+        return [col.get_sql_column_config(self.config) for col in self.column_configs]
+
+    @property
+    def column_warnings(self):
+        return [w for sql_conf in self.sql_column_configs for w in sql_conf.warnings]
 
     @memoized
     def get_data(self, slugs=None):
-        ret = super(ConfigurableReportDataSource, self).get_data(slugs)
+        try:
+            ret = super(ConfigurableReportDataSource, self).get_data(slugs)
+            for report_column in self.column_configs:
+                report_column.format_data(ret)
+        except (
+            ColumnNotFoundException,
+            TableNotFoundException,
+            ProgrammingError,
+        ) as e:
+            raise UserReportsError(e.message)
         # arbitrarily sort by the first column in memory
         # todo: should get pushed to the database but not currently supported in sqlagg
-        return sorted(ret, key=lambda x: x[self.column_configs[0].field])
+        return sorted(ret, key=lambda x: x.get(
+            self.column_configs[0].column_id,
+            next(x.itervalues())
+        ))
 
     def get_total_records(self):
         return len(self.get_data())

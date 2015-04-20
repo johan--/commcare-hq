@@ -3,22 +3,36 @@ from datetime import timedelta, datetime, time
 from django.db.models import Q
 from django.template.defaultfilters import floatformat
 from corehq.apps.commtrack.models import SQLProduct, StockState
-from corehq.apps.locations.models import Location, SQLLocation
-from corehq.apps.reports.commtrack.util import get_relevant_supply_point_ids
+from corehq.apps.locations.models import SQLLocation
 from corehq.apps.reports.datatables import DataTablesHeader, DataTablesColumn
 from corehq.apps.reports.filters.fixtures import AsyncLocationFilter
-from corehq.apps.reports.filters.select import MonthFilter, YearFilter
+from corehq.apps.reports.filters.select import YearFilter
 from django.utils import html
-from custom.ilsgateway.models import GroupSummary, SupplyPointStatusTypes, ProductAvailabilityData, \
+from custom.ilsgateway.filters import ProductByProgramFilter, MSDZoneFilter, MonthAndQuarterFilter, ProgramFilter
+from custom.ilsgateway.models import SupplyPointStatusTypes, ProductAvailabilityData, \
     OrganizationSummary, SupplyPointStatus, SupplyPointStatusValues
 from custom.ilsgateway.tanzania import ILSData, DetailsReport
-from custom.ilsgateway.tanzania.reports.facility_details import FacilityDetailsReport
+from custom.ilsgateway.tanzania.reports.facility_details import FacilityDetailsReport, InventoryHistoryData, \
+    RegistrationData, RandRHistory, RecentMessages, Notes
 from custom.ilsgateway.tanzania.reports.mixins import ProductAvailabilitySummary, SohSubmissionData
 from django.utils.translation import ugettext as _
 from custom.ilsgateway.tanzania.reports.utils import link_format, format_percent, make_url
 from dimagi.utils.dates import get_business_day_of_month, get_day_of_month
 from dimagi.utils.decorators.memoized import memoized
+from django.db.models.aggregates import Avg, Max
 
+
+def get_facilities(location, domain):
+
+    if location.location_type.name.upper() == 'DISTRICT':
+        locations = SQLLocation.objects.filter(parent=location, is_archived=False)
+    elif location.location_type.name.upper() == 'REGION':
+        locations = SQLLocation.objects.filter(parent__parent=location, is_archived=False)
+    elif location.location_type.name.upper() == 'FACILITY':
+        locations = SQLLocation.objects.filter(id=location.id, is_archived=False)
+    else:
+        locations = SQLLocation.objects.filter(domain=domain, is_archived=False)
+    return locations
 
 def product_format(ret, srs, month):
     NO_DATA = -1
@@ -70,8 +84,12 @@ class SohPercentageTableData(ILSData):
             DataTablesColumn(_('% Facilities With 1 Or More Stockouts This Month')),
         ])
 
+        month = 'month'
+        if self.config['month'] < 0:
+            month = 'quarter'
+
         for p in products:
-            headers.add_column(DataTablesColumn(_('%s stock outs this month') % p.code))
+            headers.add_column(DataTablesColumn(_('%s stock outs this %s') % (p.code, month)))
 
         return headers
 
@@ -79,55 +97,58 @@ class SohPercentageTableData(ILSData):
     def rows(self):
         rows = []
         if not self.config['products']:
-            prd_id = [p.product_id for p in
-                      SQLProduct.objects.filter(domain=self.config['domain']).order_by('code')]
+            prd_id = SQLProduct.objects.filter(domain=self.config['domain'])\
+                .order_by('code').values_list('product_id', flat=True)
         else:
             prd_id = self.config['products']
 
         if self.config['location_id']:
 
-            location = Location.get(self.config['location_id'])
-            for loc in location.children:
+            locations = SQLLocation.objects.filter(parent__location_id=self.config['location_id'],
+                                                   site_code__icontains=self.config['msd_code'])
+            for loc in locations:
                 org_summary = OrganizationSummary.objects.filter(date__range=(self.config['startdate'],
                                                                  self.config['enddate']),
-                                                                 supply_point=loc._id)[0]
+                                                                 supply_point=loc.location_id)
+                self.config['org_summary'] = org_summary
+                soh_data = SohSubmissionData(config=self.config).rows[0]
 
-                soh_data = GroupSummary.objects.get(title=SupplyPointStatusTypes.SOH_FACILITY,
-                                                    org_summary=org_summary)
-                facs = Location.filter_by_type(self.config['domain'], 'FACILITY', loc)
-                facs_count = (float(len(list(facs))) or 1)
+                facs = get_facilities(loc, self.config['domain'])
+                facs_count = facs.count()
                 soh_on_time = soh_data.on_time * 100 / facs_count
                 soh_late = soh_data.late * 100 / facs_count
                 soh_not_responding = soh_data.not_responding * 100 / facs_count
-                fac_ids = get_relevant_supply_point_ids(self.config['domain'], loc)
-                stockouts = (StockTransaction.objects.filter(
-                    case_id__in=fac_ids, quantity__lte=0,
-                    report__date__month=int(self.config['month']),
-                    report__date__year=int(self.config['year'])).count() or 0) / facs_count
+                fac_ids = facs.exclude(supply_point_id__isnull=True).values_list(*['supply_point_id'], flat=True)
+                stockouts = StockTransaction.objects.filter(
+                    case_id__in=list(fac_ids), stock_on_hand__lte=0,
+                    report__date__month=self.config['enddate'].month,
+                    report__date__year=self.config['enddate'].year,
+                    type='stockonhand').order_by('case_id').distinct('case_id').count()
+                percent_stockouts = (stockouts or 0) * 100 / float(facs_count)
 
-                url = make_url(
-                    StockOnHandReport,
-                    self.config['domain'],
-                    '?location_id=%s&month=%s&year=%s',
-                    (loc._id, self.config['month'], self.config['year']))
+                url = make_url(StockOnHandReport, self.config['domain'],
+                               '?location_id=%s&month=%s&year=%s&filter_by_program=%s&msd=%s&soh_month=',
+                               (loc.location_id, self.config['month'], self.config['year'],
+                               self.config['program'], self.config['msd_code']))
 
                 row_data = [
                     link_format(loc.name, url),
                     format_percent(soh_on_time),
                     format_percent(soh_late),
                     format_percent(soh_not_responding),
-                    format_percent(stockouts)
+                    format_percent(percent_stockouts)
                 ]
 
                 for product in prd_id:
                     ps = ProductAvailabilityData.objects.filter(
-                        supply_point=loc._id,
+                        supply_point=org_summary[0].supply_point,
                         product=product,
-                        date=self.config['startdate'])
-                    if ps:
-                        row_data.append(format_percent(ps[0].without_stock * 100 / float(ps[0].total)))
+                        date__range=(self.config['startdate'], self.config['enddate']))\
+                        .aggregate(without_stock=Avg('without_stock'), total=Max('total'))
+                    if ps['without_stock'] and ps['total']:
+                        row_data.append(format_percent(ps['without_stock'] * 100 / float(ps['total'])))
                     else:
-                        row_data.append("<span class='no_data'>None</span>")
+                        row_data.append("<span class='no_data'>No Data</span>")
                 rows.append(row_data)
 
         return rows
@@ -182,13 +203,10 @@ class DistrictSohPercentageTableData(ILSData):
         soh_month = True
         if self.config['soh_month']:
             soh_month = False
-        return html.escape(make_url(StockOnHandReport,
-                                    self.config['domain'],
-                                    '?location_id=%s&month=%s&year=%s&soh_month=%s',
-                                    (self.config['location_id'],
-                                     self.config['month'],
-                                     self.config['year'],
-                                    soh_month)))
+        return html.escape(make_url(StockOnHandReport, self.config['domain'],
+                           '?location_id=%s&month=%s&year=%s&filter_by_program=%s&msd=%s&soh_month=%s',
+                           (self.config['location_id'], self.config['month'], self.config['year'],
+                           self.config['program'], self.config['msd_code'], soh_month)))
 
     @property
     def title_url_name(self):
@@ -219,20 +237,19 @@ class DistrictSohPercentageTableData(ILSData):
     @property
     def rows(self):
         rows = []
+        enddate = self.config['enddate']
 
         def get_last_reported(supplypoint):
-            last_bd_of_the_month = get_business_day_of_month(int(self.config['year']),
-                                                             int(self.config['month']),
+
+            last_bd_of_the_month = get_business_day_of_month(enddate.year,
+                                                             enddate.month,
                                                              -1)
             st = StockTransaction.objects.filter(
                 case_id=supplypoint,
                 type='stockonhand',
                 report__date__lte=last_bd_of_the_month
             ).order_by('-report__date')
-
-            last_of_last_month = datetime(int(self.config['year']),
-                                          int(self.config['month']),
-                                          1) - timedelta(days=1)
+            last_of_last_month = datetime(enddate.year, enddate.month, 1) - timedelta(days=1)
             last_bd_of_last_month = datetime.combine(get_business_day_of_month(last_of_last_month.year,
                                                      last_of_last_month.month,
                                                      -1), time())
@@ -263,25 +280,29 @@ class DistrictSohPercentageTableData(ILSData):
             return float(num) / float(denom), num, denom
 
         if not self.config['products']:
-            products = SQLProduct.objects.filter(domain=self.config['domain']).order_by('code')
+            products = SQLProduct.objects.filter(domain=self.config['domain'], is_archived=False).order_by('code')
         else:
             products = SQLProduct.objects.filter(product_id__in=self.config['products'],
                                                  domain=self.config['domain']).order_by('code')
 
         if self.config['location_id']:
-            locations = SQLLocation.objects.filter(parent__location_id=self.config['location_id'])
+            locations = SQLLocation.objects.filter(parent__location_id=self.config['location_id'],
+                                                   site_code__icontains=self.config['msd_code'])
             for loc in locations:
                 supply_point = loc.supply_point_id
 
                 status, last_reported = get_last_reported(supply_point)
                 hisp = get_hisp_resp_rate(loc)
 
-                url = make_url(FacilityDetailsReport, self.config['domain'], '?location_id=%s', (loc.location_id,))
+                url = make_url(FacilityDetailsReport, self.config['domain'],
+                               '?location_id=%s&month=%s&year=%s&filter_by_program=%s&msd=%s',
+                               (loc.location_id, self.config['month'], self.config['year'],
+                               self.config['program'], self.config['msd_code']))
 
                 row_data = [
                     loc.site_code,
                     link_format(loc.name, url),
-                    loc.metadata['groups'][0] if 'groups' in loc.metadata else '?',
+                    loc.metadata.get('group', None),
                     icon_format(status, last_reported),
                     "<span title='%d of %d'>%s%%</span>" % (hisp[1],
                                                             hisp[2],
@@ -289,7 +310,7 @@ class DistrictSohPercentageTableData(ILSData):
                 ]
 
                 for product in products:
-                    last_of_the_month = get_day_of_month(int(self.config['year']), int(self.config['month']), -1)
+                    last_of_the_month = get_day_of_month(enddate.year, enddate.month, -1)
                     first_of_the_next_month = last_of_the_month + timedelta(days=1)
                     try:
                         srs = StockTransaction.objects.filter(
@@ -300,8 +321,6 @@ class DistrictSohPercentageTableData(ILSData):
                         srs = None
 
                     if srs:
-                        ss = StockState.objects.get(case_id=supply_point, product_id=product.product_id)
-
                         def calculate_months_remaining(stock_state, quantity):
                             consumption = stock_state.get_monthly_consumption()
                             if consumption is not None and consumption > 0 and quantity is not None:
@@ -309,9 +328,12 @@ class DistrictSohPercentageTableData(ILSData):
                             elif quantity == 0:
                                 return 0
                             return None
-
-                        val = calculate_months_remaining(ss, srs.stock_on_hand)
-                        ret = _months_or_default(val, -1)
+                        try:
+                            ss = StockState.objects.get(case_id=supply_point, product_id=product.product_id)
+                            val = calculate_months_remaining(ss, srs.stock_on_hand)
+                            ret = _months_or_default(val, -1)
+                        except StockState.DoesNotExist:
+                            ret = -1
                     else:
                         ret = -1
 
@@ -322,20 +344,46 @@ class DistrictSohPercentageTableData(ILSData):
         return rows
 
 
+class ProductSelectionPane(ILSData):
+    slug = 'product_selection_pane'
+    show_table = True
+    show_chart = False
+    title = 'Select Products'
+
+    @property
+    def rows(self):
+        products = SQLProduct.objects.filter(product_id__in=self.config['products'],
+                                             is_archived=False).order_by('code')
+        result = [
+            [
+                '<input class=\"toggle-column\" data-column={2} value=\"{0}\" type=\"checkbox\"'
+                '{3}>{1} ({0})</input>'
+                .format(p.code, p.name, idx, 'checked' if 5 <= idx <= 14 else 'disabled')
+            ] for idx, p in enumerate(products, start=5)
+        ]
+        return result
+
+
 class StockOnHandReport(DetailsReport):
     slug = "stock_on_hand"
     name = 'Stock On Hand'
-    title = 'Stock On Hand'
     use_datatables = True
 
-    fields = [AsyncLocationFilter, MonthFilter, YearFilter]
+    @property
+    def title(self):
+        title = _('Stock On Hand {0}'.format(self.title_month))
+        if self.location and self.location.location_type.name.upper() == 'FACILITY':
+            return "{0} ({1}) Group {2}".format(self.location.name,
+                                                self.location.site_code,
+                                                self.location.metadata.get('group', '---'))
+        return title
 
     @property
-    def report_config(self):
-        config = super(StockOnHandReport, self).report_config
-        # TODO add support for product filter
-        config.update(dict(products=[]))
-        return config
+    def fields(self):
+        fields = [AsyncLocationFilter, MonthAndQuarterFilter, YearFilter, ProgramFilter, MSDZoneFilter]
+        if self.location and self.location.location_type.name.upper() == 'FACILITY':
+            fields = []
+        return fields
 
     @property
     @memoized
@@ -343,15 +391,26 @@ class StockOnHandReport(DetailsReport):
         config = self.report_config
         data_providers = []
         if config['org_summary']:
-            location = SQLLocation.objects.get(location_id=config['org_summary'].supply_point)
+            location = SQLLocation.objects.get(location_id=config['org_summary'][0].supply_point)
 
             data_providers = [
-                SohSubmissionData(config=config, css_class='row_chart_all'),
+                SohSubmissionData(config=config, css_class='row_chart'),
+                ProductSelectionPane(config=config, css_class='row_chart'),
                 ProductAvailabilitySummary(config=config, css_class='row_chart_all', chart_stacked=False),
             ]
 
-            if location.location_type.upper() == 'DISTRICT':
+            if location.location_type.name.upper() == 'DISTRICT':
                 data_providers.append(DistrictSohPercentageTableData(config=config, css_class='row_chart_all'))
+            elif location.location_type.name.upper() == 'FACILITY':
+                return [
+                    InventoryHistoryData(config=config),
+                    RandRHistory(config=config),
+                    Notes(config=config),
+                    RecentMessages(config=config),
+                    RegistrationData(config=dict(loc_type='FACILITY', **config), css_class='row_chart_all'),
+                    RegistrationData(config=dict(loc_type='DISTRICT', **config), css_class='row_chart_all'),
+                    RegistrationData(config=dict(loc_type='REGION', **config), css_class='row_chart_all')
+                ]
             else:
                 data_providers.append(SohPercentageTableData(config=config, css_class='row_chart_all'))
         return data_providers

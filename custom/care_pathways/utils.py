@@ -81,14 +81,14 @@ class CareDataFormatter(DataFormatter):
             for k, v in missing_rows.iteritems():
                 for missing_val in v:
                     dict_key = k + (missing_val,)
-                    tmp_missing.update({dict_key:dict(all=0, some=0, none=0, gender=missing_val)})
+                    tmp_missing.update({dict_key: dict(all=0, some=0, none=0, gender=missing_val)})
             data.update(tmp_missing)
-        if len(group_by)-1 == 1:
-            f = lambda x: (x[0][0])
-        elif len(group_by)-1 == 2:
+        if len(group_by) - 1 == 1:
             f = lambda x: (x[0][0], x[0][1])
-        elif len(group_by)-1 == 3:
+        elif len(group_by) - 1 == 2:
             f = lambda x: (x[0][0], x[0][1], x[0][2])
+        elif len(group_by) - 1 == 3:
+            f = lambda x: (x[0][0], x[0][1], x[0][2], x[0][3])
         else:
             f = lambda x: x
         chunks = _chunks(sorted(data.items(), key=f), chunk_size)
@@ -117,7 +117,8 @@ class CareDataFormatter(DataFormatter):
             for value in chunk:
                 formatted_row = self._format.format_row(value[1])
                 if self.filter_row(value[0], formatted_row):
-                    yield [formatted_row[0]['html'], formatted_row[1]['html'], formatted_row[2]['html'], formatted_row[3]['html']]
+                    yield [formatted_row[0]['html'], formatted_row[1]['html'], formatted_row[2]['html'],
+                           formatted_row[3]['html']]
 
 
 class TableCardDataGroupsFormatter(DataFormatter):
@@ -146,30 +147,22 @@ class TableCardDataGroupsFormatter(DataFormatter):
             ['C'],
             ['D'],
         ]
-        rows_dict = dict()
-        for key, row in data.items():
-            formatted_row = self._format.format_row(row)
-            if not rows_dict.has_key(formatted_row[0]):
-                rows_dict[formatted_row[0]] = []
-            rows_dict[formatted_row[0]].append(formatted_row[1])
 
-        for i in xrange(0, len(rows_dict[rows_dict.keys()[0]])):
+        for i in xrange(0, len(data[0]) - 2):
             range_groups[0].append(0)
             range_groups[1].append(0)
             range_groups[2].append(0)
             range_groups[3].append(0)
 
-        min_length = min([len(group) for group in rows_dict])
-
-        for key, row in rows_dict.items():
-             for idx, practice in enumerate(row, 1):
-                if idx <= min_length:
-                    range_groups[self.group_level(practice)][idx] += 1
-        all_rows = len(rows_dict)
+        for row in data:
+            for idx, practice in enumerate(row[2:], 1):
+                group = self.group_level(practice)
+                if idx < len(row) - 1:
+                    range_groups[group][idx] += 1
 
         for group in range_groups:
             for idx, row in enumerate(group[1:], 1):
-                percent = 100 * float(group[idx]) / float(all_rows)
+                percent = 100 * float(group[idx]) / float(len(data))
                 group[idx] = "%.2f%%" % percent
         return range_groups
 

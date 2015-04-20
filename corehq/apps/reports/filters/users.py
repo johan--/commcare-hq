@@ -3,6 +3,7 @@ from django.utils.translation import ugettext_noop
 from django.utils.translation import ugettext as _
 
 from corehq.apps.es import users as user_es, filters
+from corehq.apps.locations.models import LOCATION_SHARING_PREFIX, LOCATION_REPORTING_PREFIX
 from corehq.apps.domain.models import Domain
 from corehq.apps.groups.hierarchy import get_user_data_from_hierarchy
 from corehq.apps.groups.models import Group
@@ -11,6 +12,7 @@ from corehq.apps.users.models import CommCareUser
 from corehq.elastic import es_query, ES_URLS
 from corehq.util import remove_dups
 from dimagi.utils.decorators.memoized import memoized
+from corehq.apps.commtrack.models import SQLLocation
 
 from .. import util
 from ..models import HQUserType, HQUserToggle
@@ -241,6 +243,22 @@ class EmwfMixin(object):
             user_type_tuples = [("all_data", "[All Data]")] + user_type_tuples
         return user_type_tuples
 
+    def get_location_groups(self):
+        locations = SQLLocation.objects.filter(
+            name__icontains=self.q.lower(),
+            domain=self.domain,
+        )
+        for loc in locations:
+            group = loc.reporting_group_object()
+            yield (group._id, group.name + ' [group]')
+
+        if self.include_share_groups:
+            # filter out any non case share type locations for this part
+            locations = locations.filter(location_type__shares_cases=True)
+            for loc in locations:
+                group = loc.case_sharing_group_object()
+                yield (group._id, group.name + ' [case sharing]')
+
 
 _UserData = namedtupledict('_UserData', (
     'users',
@@ -296,6 +314,20 @@ class ExpandedMobileWorkerFilter(EmwfMixin, BaseMultipleOptionFilter):
         emws = request.GET.getlist(cls.slug)
         return [g[4:] for g in emws if g.startswith("sg__")]
 
+    @classmethod
+    def selected_location_sharing_group_ids(cls, request):
+        emws = request.GET.getlist(cls.slug)
+        return [
+            g for g in emws if g.startswith(LOCATION_SHARING_PREFIX)
+        ]
+
+    @classmethod
+    def selected_location_reporting_group_ids(cls, request):
+        emws = request.GET.getlist(cls.slug)
+        return [
+            g for g in emws if g.startswith(LOCATION_REPORTING_PREFIX)
+        ]
+
     @property
     @memoized
     def selected(self):
@@ -316,6 +348,8 @@ class ExpandedMobileWorkerFilter(EmwfMixin, BaseMultipleOptionFilter):
         user_ids = self.selected_user_ids(self.request)
         user_types = self.selected_user_types(self.request)
         group_ids = self.selected_group_ids(self.request)
+        location_sharing_ids = self.selected_location_sharing_group_ids(self.request)
+        location_reporting_ids = self.selected_location_reporting_group_ids(self.request)
 
         selected = [t for t in self.user_types
                     if t[0][3:].isdigit() and int(t[0][3:]) in user_types]
@@ -333,6 +367,25 @@ class ExpandedMobileWorkerFilter(EmwfMixin, BaseMultipleOptionFilter):
                     selected.append(self.reporting_group_tuple(group['fields']))
                 if group['fields'].get("case_sharing", False):
                     selected.append(self.sharing_group_tuple(group['fields']))
+
+        if location_sharing_ids:
+            from corehq.apps.commtrack.models import SQLLocation
+            for loc_group_id in location_sharing_ids:
+                loc = SQLLocation.objects.get(
+                    location_id=loc_group_id.replace(LOCATION_SHARING_PREFIX, '')
+                )
+                loc_group = loc.case_sharing_group_object()
+                selected.append((loc_group._id, loc_group.name + ' [case sharing]'))
+
+        if location_reporting_ids:
+            from corehq.apps.commtrack.models import SQLLocation
+            for loc_group_id in location_reporting_ids:
+                loc = SQLLocation.objects.get(
+                    location_id=loc_group_id.replace(LOCATION_REPORTING_PREFIX, '')
+                )
+                loc_group = loc.reporting_group_object()
+                selected.append((loc_group._id, loc_group.name + ' [group]'))
+
         if user_ids:
             q = {"query": {"filtered": {"filter": {
                 "ids": {"values": user_ids}
@@ -340,12 +393,13 @@ class ExpandedMobileWorkerFilter(EmwfMixin, BaseMultipleOptionFilter):
             res = es_query(
                 es_url=ES_URLS["users"],
                 q=q,
-                fields = ['_id', 'username', 'first_name', 'last_name', 'doc_type'],
+                fields=['_id', 'username', 'first_name', 'last_name', 'doc_type'],
             )
             selected += [self.user_tuple(hit['fields']) for hit in res['hits']['hits']]
 
         known_ids = dict(selected)
-        return [{'id': id, 'text': known_ids[id]}
+        return [
+            {'id': id, 'text': known_ids[id]}
             for id in selected_ids
             if id in known_ids
         ]
@@ -402,7 +456,7 @@ class ExpandedMobileWorkerFilter(EmwfMixin, BaseMultipleOptionFilter):
     @classmethod
     @memoized
     def pull_users_and_groups(cls, domain, request, simplified_users=False,
-            combined=False, CommCareUser=CommCareUser):
+            combined=False, CommCareUser=CommCareUser, include_inactive=False):
         user_ids = cls.selected_user_ids(request)
         user_types = cls.selected_user_types(request)
         group_ids = cls.selected_group_ids(request)
@@ -416,7 +470,7 @@ class ExpandedMobileWorkerFilter(EmwfMixin, BaseMultipleOptionFilter):
             )
         user_filter = tuple([HQUserToggle(id, id in user_types) for id in range(4)])
         other_users = util.get_all_users_by_domain(domain=domain, user_filter=user_filter, simplified=simplified_users,
-                                                   CommCareUser=CommCareUser)
+                                                   CommCareUser=CommCareUser, include_inactive=include_inactive)
         groups = [Group.get(g) for g in group_ids]
         all_users = users + other_users
         if combined:
@@ -485,10 +539,11 @@ class ExpandedMobileWorkerFilterWithAllData(ExpandedMobileWorkerFilter):
 def get_user_toggle(request):
     ufilter = group = individual = show_commtrack = None
     try:
-        if request.GET.get('ufilter', ''):
-            ufilter = request.GET.getlist('ufilter')
-        group = request.GET.get('group', '')
-        individual = request.GET.get('individual', '')
+        request_obj = request.POST if request.method == 'POST' else request.GET
+        if request_obj.get('ufilter', ''):
+            ufilter = request_obj.getlist('ufilter')
+        group = request_obj.get('group', '')
+        individual = request_obj.get('individual', '')
         show_commtrack = request.project.commtrack_enabled
     except (KeyError, AttributeError):
         pass

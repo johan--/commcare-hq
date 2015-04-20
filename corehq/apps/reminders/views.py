@@ -8,24 +8,24 @@ from django.core.urlresolvers import reverse
 from django.http import HttpResponseRedirect, Http404, HttpResponse
 from django.shortcuts import render
 from corehq.apps.translations.models import StandaloneTranslationDoc
+from corehq.const import SERVER_DATETIME_FORMAT
+from corehq.util.timezones.conversions import ServerTime
 from dimagi.utils.couch.cache.cache_core import get_redis_client
 from dimagi.utils.couch import CriticalSection
 from django.utils.translation import ugettext as _, ugettext_noop
 from corehq import privileges
 from corehq.apps.accounting.decorators import requires_privilege_with_fallback
-from corehq.apps.app_manager.models import Application
+from corehq.apps.app_manager.models import Application, Form
 from corehq.apps.app_manager.util import (get_case_properties,
     get_correct_app_class)
 from corehq.apps.hqwebapp.views import CRUDPaginatedViewMixin
+from dimagi.utils.logging import notify_exception
 
 from corehq.apps.reminders.forms import (
-    CaseReminderForm,
-    ComplexCaseReminderForm,
     SurveyForm,
     SurveySampleForm,
     EditContactForm,
     RemindersInErrorForm,
-    KeywordForm,
     OneTimeReminderForm,
     SimpleScheduleCaseReminderForm,
     CaseReminderEventForm,
@@ -33,7 +33,8 @@ from corehq.apps.reminders.forms import (
     KEYWORD_CONTENT_CHOICES,
     KEYWORD_RECIPIENT_CHOICES,
     ComplexScheduleCaseReminderForm,
-    NewKeywordForm,
+    KeywordForm,
+    NO_RESPONSE,
 )
 from corehq.apps.reminders.models import (
     CaseReminderHandler,
@@ -52,6 +53,7 @@ from corehq.apps.reminders.models import (
     QUESTION_RETRY_CHOICES,
     REMINDER_TYPE_ONE_TIME,
     REMINDER_TYPE_DEFAULT,
+    REMINDER_TYPE_SURVEY_MANAGEMENT,
     SEND_NOW, SEND_LATER,
     METHOD_SMS,
     METHOD_SMS_SURVEY,
@@ -59,6 +61,7 @@ from corehq.apps.reminders.models import (
     RECIPIENT_USER_GROUP,
     RECIPIENT_SENDER,
     METHOD_IVR_SURVEY,
+    get_events_scheduling_info,
 )
 from corehq.apps.sms.views import BaseMessagingSectionView
 from corehq.apps.users.decorators import require_permission
@@ -73,9 +76,12 @@ from corehq.apps.groups.models import Group
 from casexml.apps.case.models import CommCareCase, CommCareCaseGroup
 from dateutil.parser import parse
 from corehq.apps.sms.util import close_task
-from dimagi.utils.timezones import utils as tz_utils
-from corehq.apps.reports import util as report_utils
+from corehq.util.timezones.utils import get_timezone_for_user
 from dimagi.utils.couch.database import is_bigcouch, bigcouch_quorum_count, iter_docs
+
+ACTION_ACTIVATE = 'activate'
+ACTION_DEACTIVATE = 'deactivate'
+ACTION_DELETE = 'delete'
 
 reminders_framework_permission = lambda *args, **kwargs: (
     require_permission(Permissions.edit_data)(
@@ -90,18 +96,16 @@ survey_reminders_permission = lambda *args, **kwargs: (
 )
 
 def get_project_time_info(domain):
-    timezone = report_utils.get_timezone(None, domain)
+    timezone = get_timezone_for_user(None, domain)
     now = pytz.utc.localize(datetime.utcnow())
     timezone_now = now.astimezone(timezone)
     return (timezone, now, timezone_now)
 
-@reminders_framework_permission
-def default(request, domain):
-    return HttpResponseRedirect(reverse('list_reminders', args=[domain]))
 
 @reminders_framework_permission
 def list_reminders(request, domain, reminder_type=REMINDER_TYPE_DEFAULT):
-    all_handlers = CaseReminderHandler.get_handlers(domain=domain).all()
+    # We need to keep this until the broadcast ui gets updated
+    all_handlers = CaseReminderHandler.get_handlers(domain)
     all_handlers = filter(lambda x : x.reminder_type == reminder_type, all_handlers)
     if reminder_type == REMINDER_TYPE_ONE_TIME:
         all_handlers.sort(key=lambda handler : handler.start_datetime)
@@ -145,7 +149,7 @@ def list_reminders(request, domain, reminder_type=REMINDER_TYPE_DEFAULT):
             "recipients" : recipients,
             "content" : content,
             "sent" : sent,
-            "start_datetime" : tz_utils.adjust_datetime_to_timezone(handler.start_datetime, pytz.utc.zone, timezone.zone) if handler.start_datetime is not None else None,
+            "start_datetime" : ServerTime(handler.start_datetime).user_time(timezone).done() if handler.start_datetime is not None else None,
         })
     
     return render(request, "reminders/partial/list_reminders.html", {
@@ -157,53 +161,6 @@ def list_reminders(request, domain, reminder_type=REMINDER_TYPE_DEFAULT):
         'timezone_now' : timezone_now,
     })
 
-@reminders_framework_permission
-def add_reminder(request, domain, handler_id=None, template="reminders/partial/add_reminder.html"):
-
-    if handler_id:
-        handler = CaseReminderHandler.get(handler_id)
-        if handler.doc_type != 'CaseReminderHandler' or handler.domain != domain:
-            raise Http404
-    else:
-        handler = None
-        
-    if request.method == "POST":
-        reminder_form = CaseReminderForm(request.POST)
-        if reminder_form.is_valid():
-            if not handler:
-                handler = CaseReminderHandler(domain=domain)
-                handler.ui_type = UI_SIMPLE_FIXED
-            for key, value in reminder_form.cleaned_data.items():
-                if (key != "frequency") and (key != "message"):
-                    handler[key] = value
-            handler.max_iteration_count = REPEAT_SCHEDULE_INDEFINITELY
-            handler.schedule_length = reminder_form.cleaned_data["frequency"]
-            handler.event_interpretation = EVENT_AS_OFFSET
-            handler.events = [
-                CaseReminderEvent(
-                    day_num = 0
-                   ,fire_time = time(hour=0,minute=0,second=0)
-                   ,message = reminder_form.cleaned_data["message"]
-                   ,callback_timeout_intervals = []
-               )
-            ]
-            handler.save()
-            return HttpResponseRedirect(reverse('list_reminders', args=[domain]))
-    elif handler:
-        initial = {}
-        for key in handler.to_json():
-            if (key != "max_iteration_count") and (key != "schedule_length") and (key != "events") and (key != "event_interpretation"):
-                initial[key] = handler[key]
-        initial["message"] = json.dumps(handler.events[0].message)
-        initial["frequency"] = handler.schedule_length
-        reminder_form = CaseReminderForm(initial=initial)
-    else:
-        reminder_form = CaseReminderForm()
-
-    return render(request, template, {
-        'reminder_form': reminder_form,
-        'domain': domain
-    })
 
 def render_one_time_reminder_form(request, domain, form, handler_id):
     timezone, now, timezone_now = get_project_time_info(domain)
@@ -231,7 +188,7 @@ def add_one_time_reminder(request, domain, handler_id=None):
     else:
         handler = None
 
-    timezone = report_utils.get_timezone(None, domain) # Use project timezone only
+    timezone = get_timezone_for_user(None, domain) # Use project timezone only
 
     if request.method == "POST":
         form = OneTimeReminderForm(request.POST, can_use_survey=can_use_survey_reminders(request))
@@ -268,17 +225,26 @@ def add_one_time_reminder(request, domain, handler_id=None):
             return HttpResponseRedirect(reverse('one_time_reminders', args=[domain]))
     else:
         if handler is not None:
-            start_datetime = tz_utils.adjust_datetime_to_timezone(handler.start_datetime, pytz.utc.zone, timezone.zone)
+            start_date_user_time = (ServerTime(handler.start_datetime)
+                                    .user_time(timezone))
             initial = {
-                "send_type" : SEND_LATER,
-                "date" : start_datetime.strftime("%Y-%m-%d"),
-                "time" : start_datetime.strftime("%H:%M"),
-                "recipient_type" : handler.recipient,
-                "case_group_id" : handler.sample_id,
-                "user_group_id" : handler.user_group_id,
-                "content_type" : handler.method,
-                "message" : handler.events[0].message[handler.default_lang] if handler.default_lang in handler.events[0].message else None,
-                "form_unique_id" : handler.events[0].form_unique_id if handler.events[0].form_unique_id is not None else None,
+                "send_type": SEND_LATER,
+                "date": start_date_user_time.ui_string("%Y-%m-%d"),
+                "time": start_date_user_time.ui_string("%H:%M"),
+                "recipient_type": handler.recipient,
+                "case_group_id": handler.sample_id,
+                "user_group_id": handler.user_group_id,
+                "content_type": handler.method,
+                "message": (
+                    handler.events[0].message[handler.default_lang]
+                    if handler.default_lang in handler.events[0].message
+                    else None
+                ),
+                "form_unique_id": (
+                    handler.events[0].form_unique_id
+                    if handler.events[0].form_unique_id is not None
+                    else None
+                ),
             }
         else:
             initial = {}
@@ -305,6 +271,7 @@ def copy_one_time_reminder(request, domain, handler_id):
 
 @reminders_framework_permission
 def delete_reminder(request, domain, handler_id):
+    # We need to keep this until the broadcast ui gets updated
     handler = CaseReminderHandler.get(handler_id)
     if handler.doc_type != 'CaseReminderHandler' or handler.domain != domain:
         raise Http404
@@ -316,18 +283,18 @@ def delete_reminder(request, domain, handler_id):
     view_name = "one_time_reminders" if handler.reminder_type == REMINDER_TYPE_ONE_TIME else "list_reminders"
     return HttpResponseRedirect(reverse(view_name, args=[domain]))
 
+
 @reminders_framework_permission
 def scheduled_reminders(request, domain, template="reminders/partial/scheduled_reminders.html"):
-    timezone = Domain.get_by_name(domain).default_timezone
+    timezone = Domain.get_by_name(domain).get_default_timezone()
     reminders = CaseReminderHandler.get_all_reminders(domain)
     dates = []
     now = datetime.utcnow()
-    timezone_now = datetime.now(pytz.timezone(timezone))
+    timezone_now = datetime.now(timezone)
     today = timezone_now.date()
 
     def adjust_next_fire_to_timezone(reminder_utc):
-        return tz_utils.adjust_datetime_to_timezone(
-            reminder_utc.next_fire, pytz.utc.zone, timezone)
+        return ServerTime(reminder_utc.next_fire).user_time(timezone).done()
 
     if reminders:
         start_date = adjust_next_fire_to_timezone(reminders[0]).date()
@@ -369,162 +336,6 @@ def scheduled_reminders(request, domain, template="reminders/partial/scheduled_r
         'timezone_now': timezone_now,
     })
 
-def get_events_scheduling_info(events):
-    """
-    Return a list of events as dictionaries, only with information pertinent to scheduling changes.
-    """
-    result = []
-    for e in events:
-        result.append({
-            "day_num" : e.day_num,
-            "fire_time" : e.fire_time,
-            "fire_time_aux" : e.fire_time_aux,
-            "fire_time_type" : e.fire_time_type,
-            "time_window_length" : e.time_window_length,
-            "callback_timeout_intervals" : e.callback_timeout_intervals,
-            "form_unique_id" : e.form_unique_id,
-        })
-    return result
-
-@reminders_framework_permission
-def add_complex_reminder_schedule(request, domain, handler_id=None):
-    if handler_id:
-        h = CaseReminderHandler.get(handler_id)
-        if h.doc_type != 'CaseReminderHandler' or h.domain != domain:
-            raise Http404
-    else:
-        h = None
-    
-    form_list = get_form_list(domain)
-    sample_list = get_sample_list(domain)
-    
-    if request.method == "POST":
-        if h and h.locked:
-            messages.error(request, _("Could not save changes. This reminder "
-                "has been updated by someone else."))
-            return HttpResponseRedirect(reverse('list_reminders', args=[domain]))
-        form = ComplexCaseReminderForm(request.POST, can_use_survey=can_use_survey_reminders(request))
-        form._cchq_is_superuser = request.couch_user.is_superuser
-        form._cchq_use_custom_content_handler = (h is not None and h.custom_content_handler is not None)
-        form._cchq_custom_content_handler = h.custom_content_handler if h is not None else None
-        form._cchq_domain = domain
-        if form.is_valid():
-            if h is None:
-                h = CaseReminderHandler(domain=domain)
-                h.ui_type = UI_COMPLEX
-            else:
-                if h.start_condition_type != form.cleaned_data["start_condition_type"]:
-                    for reminder in h.get_reminders():
-                        reminder.retire()
-            h.active = form.cleaned_data["active"]
-            h.case_type = form.cleaned_data["case_type"]
-            h.nickname = form.cleaned_data["nickname"]
-            h.default_lang = form.cleaned_data["default_lang"]
-            h.method = form.cleaned_data["method"]
-            h.recipient = form.cleaned_data["recipient"]
-            h.start_property = form.cleaned_data["start_property"]
-            h.start_value = form.cleaned_data["start_value"]
-            h.start_date = form.cleaned_data["start_date"]
-            old_start_offset = h.start_offset
-            h.start_offset = form.cleaned_data["start_offset"]
-            h.start_match_type = form.cleaned_data["start_match_type"]
-            old_schedule_length = h.schedule_length
-            h.schedule_length = form.cleaned_data["schedule_length"]
-            h.event_interpretation = form.cleaned_data["event_interpretation"]
-            h.max_iteration_count = form.cleaned_data["max_iteration_count"]
-            h.until = form.cleaned_data["until"]
-            old_events = h.events
-            h.events = form.cleaned_data["events"]
-            h.submit_partial_forms = form.cleaned_data["submit_partial_forms"]
-            h.include_case_side_effects = form.cleaned_data["include_case_side_effects"]
-            h.ui_frequency = form.cleaned_data["frequency"]
-            h.start_condition_type = form.cleaned_data["start_condition_type"]
-            h.max_question_retries = form.cleaned_data["max_question_retries"]
-            h.recipient_case_match_property = form.cleaned_data["recipient_case_match_property"]
-            h.recipient_case_match_type = form.cleaned_data["recipient_case_match_type"]
-            h.recipient_case_match_value = form.cleaned_data["recipient_case_match_value"]
-            h.custom_content_handler = form.cleaned_data["custom_content_handler"]
-            h.force_surveys_to_use_triggered_case = form.cleaned_data["force_surveys_to_use_triggered_case"]
-            h.user_group_id = form.cleaned_data["user_group_id"]
-            if form.cleaned_data["start_condition_type"] == "ON_DATETIME":
-                dt = parse(form.cleaned_data["start_datetime_date"]).date()
-                tm = parse(form.cleaned_data["start_datetime_time"]).time()
-                h.start_datetime = datetime.combine(dt, tm)
-            else:
-                h.start_datetime = None
-            h.sample_id = form.cleaned_data["sample_id"]
-            
-            if get_events_scheduling_info(old_events) != get_events_scheduling_info(h.events) or old_start_offset != h.start_offset or old_schedule_length != h.schedule_length:
-                save_kwargs = {
-                    "schedule_changed" : True,
-                    "prev_definition" : CaseReminderHandler.get(handler_id) if handler_id is not None else None,
-                }
-            else:
-                save_kwargs = {}
-            
-            h.save(**save_kwargs)
-            return HttpResponseRedirect(reverse('list_reminders', args=[domain]))
-    else:
-        if h is not None:
-            if h.locked:
-                messages.error(request, _("Please wait until the rule finishes "
-                    "processing before making further changes."))
-                return HttpResponseRedirect(reverse('list_reminders', args=[domain]))
-            initial = {
-                "active"                : h.active,
-                "case_type"             : h.case_type,
-                "nickname"              : h.nickname,
-                "default_lang"          : h.default_lang,
-                "method"                : h.method,
-                "recipient"             : h.recipient,
-                "start_property"        : h.start_property,
-                "start_value"           : h.start_value,
-                "start_date"            : h.start_date,
-                "start_match_type"      : h.start_match_type,
-                "start_offset"          : h.start_offset,
-                "schedule_length"       : h.schedule_length,
-                "event_interpretation"  : h.event_interpretation,
-                "max_iteration_count"   : h.max_iteration_count,
-                "until"                 : h.until,
-                "events"                : h.events,
-                "submit_partial_forms"  : h.submit_partial_forms,
-                "include_case_side_effects" : h.include_case_side_effects,
-                "start_condition_type"  : h.start_condition_type,
-                "start_datetime_date"   : str(h.start_datetime.date()) if isinstance(h.start_datetime, datetime) else None,
-                "start_datetime_time"   : str(h.start_datetime.time()) if isinstance(h.start_datetime, datetime) else None,
-                "frequency"             : h.ui_frequency,
-                "sample_id"             : h.sample_id,
-                "use_until"             : "Y" if h.until is not None else "N",
-                "max_question_retries"  : h.max_question_retries,
-                "recipient_case_match_property" : h.recipient_case_match_property,
-                "recipient_case_match_type" : h.recipient_case_match_type,
-                "recipient_case_match_value" : h.recipient_case_match_value,
-                "use_custom_content_handler" : h.custom_content_handler is not None,
-                "custom_content_handler" : h.custom_content_handler,
-                "force_surveys_to_use_triggered_case" : h.force_surveys_to_use_triggered_case,
-                "user_group_id": h.user_group_id,
-            }
-        else:
-            initial = {
-                "events"    : [CaseReminderEvent(day_num=0, fire_time=time(0,0), message={"":""}, callback_timeout_intervals=[], form_unique_id=None)],
-                "use_until" : "N",
-                "max_question_retries" : QUESTION_RETRY_CHOICES[-1],
-                "active" : True,
-            }
-        
-        form = ComplexCaseReminderForm(initial=initial, can_use_survey=can_use_survey_reminders(request))
-    
-    return render(request, "reminders/partial/add_complex_reminder.html", {
-        "domain":       domain,
-        "form":         form,
-        "form_list":    form_list,
-        "handler_id":   handler_id,
-        "sample_list":  sample_list,
-        "is_superuser" : request.couch_user.is_superuser,
-        "user_groups": Group.by_domain(domain),
-        'can_use_survey': can_use_survey_reminders(request),
-    })
-
 
 class CreateScheduledReminderView(BaseMessagingSectionView):
     urlname = 'create_reminder_schedule'
@@ -559,14 +370,14 @@ class CreateScheduledReminderView(BaseMessagingSectionView):
 
     @property
     def available_languages(self):
-        default_langs = ['en']
-        try:
-            translation_doc = StandaloneTranslationDoc.get_obj(self.domain, "sms")
-            return (translation_doc.langs or default_langs
-                    if translation_doc is not None else default_langs)
-        except ResourceNotFound:
-            pass
-        return default_langs
+        """
+        Returns a the list of language codes available for the domain, or
+        [] if no languages are specified.
+        """
+        translation_doc = StandaloneTranslationDoc.get_obj(self.domain, "sms")
+        if translation_doc and translation_doc.langs:
+            return translation_doc.langs
+        return []
 
     @property
     def is_previewer(self):
@@ -643,6 +454,22 @@ class CreateScheduledReminderView(BaseMessagingSectionView):
         for key in dict_list:
             result[key] = list(set(dict_list[key]))
         return result
+
+    @property
+    def search_form_by_id_response(self):
+        """
+        Returns a dict of {"id": [form unique id], "text": [full form path]}
+        """
+        form_unique_id = self.search_term
+        try:
+            form = Form.get_form(form_unique_id)
+            assert form.get_app().domain == self.domain
+            return {
+                'text': form.full_path_name,
+                'id': form_unique_id,
+            }
+        except:
+            return {}
 
     @property
     def search_case_property_response(self):
@@ -730,6 +557,7 @@ class CreateScheduledReminderView(BaseMessagingSectionView):
             'search_case_property',
             'search_subcase_property',
             'search_forms',
+            'search_form_by_id',
         ]:
             return HttpResponse(json.dumps(getattr(self, '%s_response' % self.action)))
         if self.schedule_form.is_valid():
@@ -765,6 +593,26 @@ class EditScheduledReminderView(CreateScheduledReminderView):
         return self.page_title
 
     @property
+    def available_languages(self):
+        """
+        When editing a reminder, add in any languages that are used by the
+        reminder but that are not in the result from
+        CreateScheduledReminderView's available_languages property.
+
+        This is needed to be backwards-compatible with reminders created
+        with the old ui that would let you specify any language, regardless
+        of whether it was in the domain's list of languages or not.
+        """
+        result = super(EditScheduledReminderView, self).available_languages
+        handler = self.reminder_handler
+        for event in handler.events:
+            if event.message:
+                for (lang, text) in event.message.items():
+                    if lang not in result:
+                        result.append(lang)
+        return result
+
+    @property
     @memoized
     def schedule_form(self):
         initial = self.reminder_form_class.compute_initial(
@@ -797,8 +645,11 @@ class EditScheduledReminderView(CreateScheduledReminderView):
     @memoized
     def reminder_handler(self):
         try:
-            return CaseReminderHandler.get(self.handler_id)
-        except ResourceNotFound:
+            handler = CaseReminderHandler.get(self.handler_id)
+            assert handler.domain == self.domain
+            assert handler.doc_type == "CaseReminderHandler"
+            return handler
+        except (ResourceNotFound, AssertionError):
             raise Http404()
 
     @property
@@ -819,6 +670,23 @@ class EditScheduledReminderView(CreateScheduledReminderView):
 
     def process_schedule_form(self):
         self.schedule_form.save(self.reminder_handler)
+
+    def rule_in_progress(self):
+        messages.error(self.request, _("Please wait until the rule finishes "
+            "processing before making further changes."))
+        return HttpResponseRedirect(reverse(RemindersListView.urlname, args=[self.domain]))
+
+    def get(self, *args, **kwargs):
+        if self.reminder_handler.locked:
+            return self.rule_in_progress()
+        else:
+            return super(EditScheduledReminderView, self).get(*args, **kwargs)
+
+    def post(self, *args, **kwargs):
+        if self.reminder_handler.locked:
+            return self.rule_in_progress()
+        else:
+            return super(EditScheduledReminderView, self).post(*args, **kwargs)
 
 
 class AddStructuredKeywordView(BaseMessagingSectionView):
@@ -858,11 +726,11 @@ class AddStructuredKeywordView(BaseMessagingSectionView):
     @memoized
     def keyword_form(self):
         if self.request.method == 'POST':
-            return NewKeywordForm(
+            return KeywordForm(
                 self.request.POST, domain=self.domain,
                 process_structured=self.process_structured_message,
             )
-        return NewKeywordForm(
+        return KeywordForm(
             domain=self.domain,
             process_structured=self.process_structured_message,
         )
@@ -881,7 +749,7 @@ class AddStructuredKeywordView(BaseMessagingSectionView):
                 self.keyword.initiator_doc_type_filter.append('CommCareCase')
 
             self.keyword.actions = []
-            if self.keyword_form.cleaned_data['sender_content_type'] != 'none':
+            if self.keyword_form.cleaned_data['sender_content_type'] != NO_RESPONSE:
                 self.keyword.actions.append(
                     SurveyKeywordAction(
                         recipient=RECIPIENT_SENDER,
@@ -901,7 +769,7 @@ class AddStructuredKeywordView(BaseMessagingSectionView):
                         named_args_separator=self.keyword_form.cleaned_data['named_args_separator'],
                     )
                 )
-            if self.keyword_form.cleaned_data['other_recipient_content_type'] != 'none':
+            if self.keyword_form.cleaned_data['other_recipient_content_type'] != NO_RESPONSE:
                 self.keyword.actions.append(
                     SurveyKeywordAction(
                         recipient=self.keyword_form.cleaned_data['other_recipient_type'],
@@ -950,13 +818,13 @@ class EditStructuredKeywordView(AddStructuredKeywordView):
     def keyword_form(self):
         initial = self.get_initial_values()
         if self.request.method == 'POST':
-            form = NewKeywordForm(
+            form = KeywordForm(
                 self.request.POST, domain=self.domain, initial=initial,
                 process_structured=self.process_structured_message,
             )
             form._sk_id = self.keyword_id
             return form
-        return NewKeywordForm(
+        return KeywordForm(
             domain=self.domain, initial=initial,
             process_structured=self.process_structured_message,
         )
@@ -967,6 +835,7 @@ class EditStructuredKeywordView(AddStructuredKeywordView):
             'description': self.keyword.description,
             'delimiter': self.keyword.delimiter,
             'override_open_sessions': self.keyword.override_open_sessions,
+            'sender_content_type': NO_RESPONSE,
         }
         is_case_filter = "CommCareCase" in self.keyword.initiator_doc_type_filter
         is_user_filter = "CommCareUser" in self.keyword.initiator_doc_type_filter
@@ -1019,143 +888,6 @@ class EditNormalKeywordView(EditStructuredKeywordView):
         if METHOD_STRUCTURED_SMS in [a.action for a in sk.actions]:
             raise Http404()
         return sk
-
-
-@reminders_framework_permission
-def manage_keywords(request, domain):
-    context = {
-        "domain" : domain,
-        "keywords" : SurveyKeyword.get_all(domain)
-    }
-    return render(request, "reminders/partial/manage_keywords.html", context)
-
-
-@survey_reminders_permission
-def add_keyword(request, domain, keyword_id=None):
-    sk = None
-    if keyword_id is not None:
-        sk = SurveyKeyword.get(keyword_id)
-        if sk.domain != domain:
-            raise Http404
-    
-    if request.method == "POST":
-        form = KeywordForm(request.POST)
-        form._cchq_domain = domain
-        form._sk_id = sk._id if sk is not None else None
-        if form.is_valid():
-            if sk is None:
-                sk = SurveyKeyword(domain=domain)
-            sk.keyword = form.cleaned_data.get("keyword")
-            sk.description = form.cleaned_data.get("description")
-            sk.delimiter = form.cleaned_data.get("delimiter")
-            sk.override_open_sessions = form.cleaned_data.get("override_open_sessions")
-            sk.initiator_doc_type_filter = []
-            if form.cleaned_data.get("restrict_keyword_initiation"):
-                if form.cleaned_data.get("allow_initiation_by_case"):
-                    sk.initiator_doc_type_filter.append("CommCareCase")
-                if form.cleaned_data.get("allow_initiation_by_mobile_worker"):
-                    sk.initiator_doc_type_filter.append("CommCareUser")
-            sk.actions = [SurveyKeywordAction(
-                recipient = RECIPIENT_SENDER,
-                action = form.cleaned_data.get("sender_content_type"),
-                message_content = form.cleaned_data.get("sender_message"),
-                form_unique_id = form.cleaned_data.get("sender_form_unique_id"),
-            )]
-            if form.cleaned_data.get("process_structured_sms"):
-                sk.actions.append(SurveyKeywordAction(
-                    recipient = RECIPIENT_SENDER,
-                    action = METHOD_STRUCTURED_SMS,
-                    form_unique_id = form.cleaned_data.get("structured_sms_form_unique_id"),
-                    use_named_args = form.cleaned_data.get("use_named_args"),
-                    named_args = form.cleaned_data.get("named_args"),
-                    named_args_separator = form.cleaned_data.get("named_args_separator"),
-                ))
-            if form.cleaned_data.get("notify_others"):
-                sk.actions.append(SurveyKeywordAction(
-                    recipient = form.cleaned_data.get("other_recipient_type"),
-                    recipient_id = form.cleaned_data.get("other_recipient_id"),
-                    action = form.cleaned_data.get("other_recipient_content_type"),
-                    message_content = form.cleaned_data.get("other_recipient_message"),
-                    form_unique_id = form.cleaned_data.get("other_recipient_form_unique_id"),
-                ))
-            sk.save()
-            return HttpResponseRedirect(reverse("manage_keywords", args=[domain]))
-    else:
-        initial = {
-            "keyword" : None,
-            "description" : None,
-            "override_open_sessions" : False,
-            "sender_content_type" : None,
-            "sender_message" : None,
-            "sender_form_unique_id" : None,
-            "notify_others" : False,
-            "other_recipient_type" : None,
-            "other_recipient_id" : None,
-            "other_recipient_content_type" : None,
-            "other_recipient_message" : None,
-            "other_recipient_form_unique_id" : None,
-            "process_structured_sms" : False,
-            "structured_sms_form_unique_id" : None,
-            "use_custom_delimiter" : False,
-            "delimiter" : None,
-            "use_named_args_separator" : False,
-            "use_named_args" : False,
-            "named_args_separator" : None,
-            "named_args" : [],
-            "restrict_keyword_initiation" : False,
-            "allow_initiation_by_case" : False,
-            "allow_initiation_by_mobile_worker" : False,
-        }
-        if sk is not None:
-            initial["keyword"] = sk.keyword
-            initial["description"] = sk.description
-            initial["delimiter"] = sk.delimiter
-            initial["override_open_sessions"] = sk.override_open_sessions
-            initial["restrict_keyword_initiation"] = len(sk.initiator_doc_type_filter) > 0
-            initial["allow_initiation_by_case"] = "CommCareCase" in sk.initiator_doc_type_filter
-            initial["allow_initiation_by_mobile_worker"] = "CommCareUser" in sk.initiator_doc_type_filter
-            for action in sk.actions:
-                if action.action == METHOD_STRUCTURED_SMS:
-                    initial["process_structured_sms"] = True
-                    initial["structured_sms_form_unique_id"] = action.form_unique_id
-                    initial["use_custom_delimiter"] = sk.delimiter is not None
-                    initial["use_named_args_separator"] = action.named_args_separator is not None
-                    initial["use_named_args"] = action.use_named_args
-                    initial["named_args_separator"] = action.named_args_separator
-                    initial["named_args"] = [{"name" : k, "xpath" : v} for k, v in action.named_args.items()]
-                elif action.recipient == RECIPIENT_SENDER:
-                    initial["sender_content_type"] = action.action
-                    initial["sender_message"] = action.message_content
-                    initial["sender_form_unique_id"] = action.form_unique_id
-                else:
-                    initial["notify_others"] = True
-                    initial["other_recipient_type"] = action.recipient
-                    initial["other_recipient_id"] = action.recipient_id
-                    initial["other_recipient_content_type"] = action.action
-                    initial["other_recipient_message"] = action.message_content
-                    initial["other_recipient_form_unique_id"] = action.form_unique_id
-        form = KeywordForm(initial=initial)
-    
-    context = {
-        "domain" : domain,
-        "form_list" : get_form_list(domain),
-        "form" : form,
-        "keyword" : sk,
-        "content_type_choices" : [{"code" : a[0], "desc" : a[1]} for a in KEYWORD_CONTENT_CHOICES],
-        "recipient_type_choices" : [{"code" : a[0], "desc" : a[1]} for a in KEYWORD_RECIPIENT_CHOICES],
-        "groups" : [{"code" : g._id, "desc" : g.name} for g in Group.by_domain(domain)],
-    }
-    
-    return render(request, "reminders/partial/add_keyword.html", context)
-
-
-@reminders_framework_permission
-def delete_keyword(request, domain, keyword_id):
-    s = SurveyKeyword.get(keyword_id)
-    if s.domain != domain or s.doc_type != "SurveyKeyword":
-        raise Http404
-    s.retire()
-    return HttpResponseRedirect(reverse("manage_keywords", args=[domain]))
 
 
 @survey_reminders_permission
@@ -1224,6 +956,7 @@ def add_survey(request, domain, survey_id=None):
                                     sample_id = sample["sample_id"],
                                     survey_incentive = sample["incentive"],
                                     submit_partial_forms = True,
+                                    reminder_type=REMINDER_TYPE_SURVEY_MANAGEMENT,
                                 )
                                 handler.save()
                                 wave.reminder_definitions[sample["sample_id"]] = handler._id
@@ -1326,6 +1059,7 @@ def add_survey(request, domain, survey_id=None):
                                 sample_id = sample_id,
                                 survey_incentive = sample_data[sample_id]["incentive"],
                                 submit_partial_forms = True,
+                                reminder_type=REMINDER_TYPE_SURVEY_MANAGEMENT,
                             )
                             handler.save()
                             wave.reminder_definitions[sample_id] = handler._id
@@ -1562,7 +1296,7 @@ def reminders_in_error(request, domain):
                 handler.set_next_fire(reminder, current_timestamp)
                 reminder.save(**kwargs)
     
-    timezone = report_utils.get_timezone(request.couch_user, domain)
+    timezone = get_timezone_for_user(request.couch_user, domain)
     reminders = []
     for reminder in CaseReminder.view("reminders/reminders_in_error", startkey=[domain], endkey=[domain, {}], include_docs=True).all():
         if reminder.handler_id in handler_map:
@@ -1579,7 +1313,7 @@ def reminders_in_error(request, domain):
             "handler_name" : handler.nickname,
             "case_id" : case.get_id if case is not None else None,
             "case_name" : case.name if case is not None else None,
-            "next_fire" : tz_utils.adjust_datetime_to_timezone(reminder.next_fire, pytz.utc.zone, timezone.zone).strftime("%Y-%m-%d %H:%M:%S"),
+            "next_fire" : ServerTime(reminder.next_fire).user_time(timezone).ui_string(SERVER_DATETIME_FORMAT),
             "error_msg" : reminder.error_msg or "-",
             "recipient_name" : get_recipient_name(recipient),
         })
@@ -1607,8 +1341,8 @@ class RemindersListView(BaseMessagingSectionView):
 
     @property
     def reminders(self):
-        all_handlers = CaseReminderHandler.get_handlers(domain=self.domain).all()
-        all_handlers = filter(lambda x : x.reminder_type == REMINDER_TYPE_DEFAULT, all_handlers)
+        all_handlers = CaseReminderHandler.get_handlers(self.domain,
+            reminder_type_filter=REMINDER_TYPE_DEFAULT)
         if not self.can_use_survey:
             all_handlers = filter(
                 lambda x: x.method not in [METHOD_IVR_SURVEY, METHOD_SMS_SURVEY],
@@ -1641,27 +1375,40 @@ class RemindersListView(BaseMessagingSectionView):
             'url': reverse(EditScheduledReminderView.urlname, args=[self.domain, reminder._id]),
         }
 
-    def get_action_response(self, active):
+    def get_action_response(self, action):
         try:
-            self.reminder.active = active
-            self.reminder.save()
+            assert self.reminder.domain == self.domain
+            assert self.reminder.doc_type == "CaseReminderHandler"
+            if self.reminder.locked:
+                return {
+                    'success': False,
+                    'locked': True,
+                }
+
+            if action in [ACTION_ACTIVATE, ACTION_DEACTIVATE]:
+                self.reminder.active = (action == ACTION_ACTIVATE)
+                self.reminder.save()
+            elif action == ACTION_DELETE:
+                self.reminder.retire()
             return {
                 'success': True,
-                'reminder': self._fmt_reminder_data(self.reminder),
             }
         except Exception as e:
+            msg = ("Couldn't process action '%s' for reminder definition"
+                % action)
+            notify_exception(None, message=msg, details={
+                'domain': self.domain,
+                'handler_id': self.reminder_id,
+            })
             return {
                 'success': False,
-                'error': e,
             }
 
     def post(self, *args, **kwargs):
         action = self.request.POST.get('action')
-        if action in ['activate', 'deactivate']:
-            return HttpResponse(json.dumps(self.get_action_response(action == 'activate')))
-        raise {
-            'success': False,
-        }
+        if action in [ACTION_ACTIVATE, ACTION_DEACTIVATE, ACTION_DELETE]:
+            return HttpResponse(json.dumps(self.get_action_response(action)))
+        return HttpResponse(status=400)
 
 
 class KeywordsListView(BaseMessagingSectionView, CRUDPaginatedViewMixin):

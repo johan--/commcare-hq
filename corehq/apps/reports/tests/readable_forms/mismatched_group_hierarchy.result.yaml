@@ -1,4 +1,5 @@
 - group: null
+  calculate: null
   label: You first need to log a facility before you can record information.
   options:
   - {label: Go back and exit form, value: exit_form}
@@ -7,8 +8,11 @@
   tag: select1
   type: Select
   value: /data/need_facility_trigger
+  relevant: "/data/fada_facility_id = ''"
+  required: true
 - children:
   - group: /data/whole_form
+    calculate: null
     label: 'Registering birth at facility: ____ (____)'
     options:
     - {label: 'Yes', value: '1'}
@@ -18,11 +22,30 @@
     tag: select1
     type: Select
     value: /data/current_site_confirm
-  - {group: /data/whole_form, label: Yearly Number, repeat: null, response: '7', tag: input,
-    type: Int, value: /data/fada_yearly_number}
-  - {group: /data/whole_form, label: Monthly Number, repeat: null, response: '36',
-    tag: input, type: Int, value: /data/fada_monthly_number}
+    relevant: null
+    required: true
   - group: /data/whole_form
+    calculate: null
+    label: Yearly Number
+    repeat: null
+    response: '7'
+    tag: input
+    type: Int
+    value: /data/fada_yearly_number
+    relevant: null
+    required: true
+  - group: /data/whole_form
+    calculate: null
+    label: Monthly Number
+    repeat: null
+    response: '36'
+    tag: input
+    type: Int
+    value: /data/fada_monthly_number
+    relevant: null
+    required: true
+  - group: /data/whole_form
+    calculate: null
     label: "A patient with this ID (____) has already been registered.\_ Are you sure\
       \ the entered information is correct?"
     options:
@@ -33,9 +56,20 @@
     tag: select1
     type: Select
     value: /data/already_registered
-  - {group: /data/whole_form, label: Date of Admission, repeat: null, response: '2014-01-01',
-    tag: input, type: Date, value: /data/fada_date_admission}
+    relevant: "count(instance('casedb')/casedb/case[@case_type='fada_patient'][@status='open'][case_name= /data/fada_patient_id]) > 0"
+    required: true
   - group: /data/whole_form
+    calculate: null
+    label: Date of Admission
+    repeat: null
+    response: '2014-01-01'
+    tag: input
+    type: Date
+    value: /data/fada_date_admission
+    relevant: null
+    required: true
+  - group: /data/whole_form
+    calculate: null
     label: 'Observation Points Observed:'
     options:
     - {label: '1', value: '1'}
@@ -47,7 +81,10 @@
     tag: select
     type: MSelect
     value: /data/fada_observation_points_observed
+    relevant: null
+    required: true
   - group: /data/whole_form
+    calculate: null
     label: Was the mother referred out at any point during your observation?
     options:
     - {label: Yes before delivery, value: '2'}
@@ -58,7 +95,10 @@
     tag: select1
     type: Select
     value: /data/fada_mother_referred
+    relevant: null
+    required: true
   - group: /data/whole_form
+    calculate: null
     label: Was there a maternal death at any point during your observation?
     options:
     - {label: 'Yes', value: '1'}
@@ -68,7 +108,10 @@
     tag: select1
     type: Select
     value: /data/fada_maternal_death
+    relevant: null
+    required: true
   - group: /data/whole_form
+    calculate: null
     label: 'Was there a stillbirth or neonatal death any point during your observation? '
     options:
     - {label: 'Yes', value: '1'}
@@ -78,7 +121,10 @@
     tag: select1
     type: Select
     value: /data/fada_stillbirth_neonatal_death
+    relevant: null
+    required: true
   - group: /data/whole_form
+    calculate: null
     label: Was a cesarean section performed?
     options:
     - {label: 'Yes', value: '1'}
@@ -88,7 +134,10 @@
     tag: select1
     type: Select
     value: /data/fada_csection
+    relevant: null
+    required: true
   - group: /data/whole_form
+    calculate: null
     label: Did health care worker assent to observation?
     options:
     - {label: 'Yes', value: '1'}
@@ -98,8 +147,11 @@
     tag: select1
     type: Select
     value: /data/fada_healthworker_assent
+    relevant: null
+    required: true
   - children:
     - group: /data/fada_obv1
+      calculate: null
       label: ' Assisted with woman''s care (check all that apply)'
       options:
       - {label: Doctor, value: '1'}
@@ -111,7 +163,10 @@
       tag: select
       type: MSelect
       value: /data/fada_obv1/fada_assisted_by_obv1
+      relevant: null
+      required: true
     - group: /data/fada_obv1
+      calculate: null
       label: Maternal temperature obtained?
       options:
       - {label: 'Yes', value: '1'}
@@ -121,7 +176,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv1/fada_maternal_temp
+      relevant: null
+      required: true
     - group: /data/fada_obv1
+      calculate: null
       label: Maternal blood pressure obtained?
       options:
       - {label: 'Yes', value: '1'}
@@ -131,7 +189,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv1/fada_maternal_bp
+      relevant: null
+      required: true
     - group: /data/fada_obv1
+      calculate: null
       label: Was partograph started?
       options:
       - {label: 'Yes', value: '1'}
@@ -141,7 +202,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv1/fada_partograph
+      relevant: null
+      required: true
     - group: /data/fada_obv1
+      calculate: null
       label: Was the paper checklist picked up during care ?
       options:
       - {label: 'Yes', value: '1'}
@@ -151,7 +215,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv1/fada_checklist_picked_up_obv1
+      relevant: null
+      required: true
     - group: /data/fada_obv1
+      calculate: null
       label: Was the paper checklist picked up after the care was given?
       options:
       - {label: 'Yes', value: '1'}
@@ -161,7 +228,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv1/fada_checklist_used_after_care_obv1
+      relevant: null
+      required: true
     - group: /data/fada_obv1
+      calculate: null
       label: Was the checklist poster observed during care?
       options:
       - {label: 'Yes', value: 'yes'}
@@ -171,7 +241,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv1/fada_checklist_poster_used_obv1
+      relevant: null
+      required: true
     - group: /data/fada_obv1
+      calculate: null
       label: Was a birth companion present?
       options:
       - {label: 'Yes', value: '1'}
@@ -181,15 +254,21 @@
       tag: select1
       type: Select
       value: /data/fada_obv1/fada_birth_companion_present_obv1
+      relevant: null
+      required: true
     group: /data/whole_form
+    calculate: null
     label: 1. On Admission
     repeat: null
     response: true
     tag: group
     type: Group
     value: /data/fada_obv1
+    relevant: "selected(/data/fada_observation_points_observed, '1')"
+    required: false
   - children:
     - group: /data/fada_obv2
+      calculate: null
       label: ' Assisted with woman''s care (check all that apply)'
       options:
       - {label: Doctor, value: '1'}
@@ -201,7 +280,10 @@
       tag: select
       type: MSelect
       value: /data/fada_obv2/fada_assisted_by_obv2
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Was Oxytocin administered?
       options:
       - {label: 'Yes', value: '1'}
@@ -211,7 +293,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_oxycotin_administered_obv2
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Where was oxytocin administered?
       options:
       - {label: Intramuscular (IM), value: '1'}
@@ -221,7 +306,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_oxycotin_administration_location
+      relevant: "/data/fada_obv2/fada_oxycotin_administered_obv2 = '1'"
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: "Was water used to clean hands\_ just before delivery?"
       options:
       - {label: 'Yes', value: '1'}
@@ -231,7 +319,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_water_usage
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Was soap used to clean hands just before delivery?
       options:
       - {label: 'Yes', value: '1'}
@@ -241,7 +332,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_soap_usage
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Was alcohol rub used just before delivery?
       options:
       - {label: 'Yes', value: '1'}
@@ -251,7 +345,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_alcohol_rub
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Were clean gloves used at the time of delivery?
       options:
       - {label: 'Yes', value: '1'}
@@ -261,7 +358,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_clean_gloves
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Was clean towel available at the bedside?
       options:
       - {label: 'Yes', value: '1'}
@@ -271,7 +371,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_clean_towel
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Were sterile scissors/blade to cut cord available at the bedside?
       options:
       - {label: 'Yes', value: '1'}
@@ -281,7 +384,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_scissors_blade
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Was a cord ligature/tie available at the bedside?
       options:
       - {label: 'Yes', value: '1'}
@@ -291,7 +397,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_cord_tie
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Was an aspiration bulb or mucus extractor available at the bedside?
       options:
       - {label: 'Yes', value: '1'}
@@ -301,7 +410,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_mucus_extractor
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Was a neonatal bag and mask available at the bedside?
       options:
       - {label: 'Yes', value: '1'}
@@ -311,7 +423,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_neonatal_bag
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Were pads for the mother available at the bedside?
       options:
       - {label: 'Yes', value: '1'}
@@ -321,7 +436,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_pads
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Was the paper checklist picked up during care ?
       options:
       - {label: 'Yes', value: '1'}
@@ -331,7 +449,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_checklist_picked_up_obv2
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Was the paper checklist picked up after the care was given?
       options:
       - {label: 'Yes', value: '1'}
@@ -341,7 +462,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_checklist_used_after_care_obv2
+      relevant: null
+      required: true
     - group: /data/fada_obv2
+      calculate: null
       label: Was the checklist poster observed during care?
       options:
       - {label: 'Yes', value: 'yes'}
@@ -351,15 +475,21 @@
       tag: select1
       type: Select
       value: /data/fada_obv2/fada_checklist_poster_used_obv2
+      relevant: null
+      required: true
     group: /data/whole_form
+    calculate: null
     label: 2. Just before delivery
     repeat: null
     response: true
     tag: group
     type: Group
     value: /data/fada_obv2
+    relevant: "selected(/data/fada_observation_points_observed, '2')"
+    required: false
   - children:
     - group: /data/fada_obv3
+      calculate: null
       label: Assisted with woman's care (check all that apply)
       options:
       - {label: Doctor, value: '1'}
@@ -371,7 +501,10 @@
       tag: select
       type: MSelect
       value: /data/fada_obv3/fada_assisted_by_obv3
+      relevant: null
+      required: true
     - group: /data/fada_obv3
+      calculate: null
       label: Was Oxytocin administered?
       options:
       - {label: 'Yes', value: '1'}
@@ -381,7 +514,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv3/fada_oxycotin_administered_obv3
+      relevant: null
+      required: true
     - group: /data/fada_obv3
+      calculate: null
       label: Was neonatal bag and mask used on baby?
       options:
       - {label: 'Yes', value: '1'}
@@ -391,7 +527,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv3/fada_neonatal_bag_usage
+      relevant: null
+      required: true
     - group: /data/fada_obv3
+      calculate: null
       label: Was a birth companion present?
       options:
       - {label: 'Yes', value: '1'}
@@ -401,15 +540,21 @@
       tag: select1
       type: Select
       value: /data/fada_obv3/fada_birth_companion_present_obv3
+      relevant: null
+      required: true
     group: /data/whole_form
+    calculate: null
     label: 3. At one minute after delivery
     repeat: null
     response: true
     tag: group
     type: Group
     value: /data/fada_obv3
+    relevant: "selected(/data/fada_observation_points_observed, '3')"
+    required: false
   - children:
     - group: /data/fada_obv4
+      calculate: null
       label: Assisted with woman's care (check all that apply)
       options:
       - {label: Doctor, value: '1'}
@@ -421,7 +566,10 @@
       tag: select
       type: MSelect
       value: /data/fada_obv4/fada_assisted_by_obv4
+      relevant: null
+      required: true
     - group: /data/fada_obv4
+      calculate: null
       label: Was newborn weight taken?
       options:
       - {label: 'Yes', value: '1'}
@@ -431,7 +579,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv4/fada_baby_wt
+      relevant: null
+      required: true
     - group: /data/fada_obv4
+      calculate: null
       label: Was newborn temperature taken?
       options:
       - {label: 'Yes', value: '1'}
@@ -441,7 +592,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv4/fada_baby_temp
+      relevant: null
+      required: true
     - group: /data/fada_obv4
+      calculate: null
       label: Was baby placed skin-to-skin on mother's abdomen?
       options:
       - {label: 'Yes', value: '1'}
@@ -451,7 +605,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv4/fada_baby_skin_to_skin
+      relevant: null
+      required: true
     - group: /data/fada_obv4
+      calculate: null
       label: Was the baby still skin-to-skin after 1 hour?
       options:
       - {label: 'Yes', value: '1'}
@@ -461,7 +618,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv4/fada_baby_skin_to_skin_for_1_hour
+      relevant: "/data/fada_obv4/fada_baby_skin_to_skin = '1'"
+      required: true
     - group: /data/fada_obv4
+      calculate: null
       label: Was breastfeeding initiated?
       options:
       - {label: 'Yes', value: '1'}
@@ -471,7 +631,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv4/fada_breastfeeding
+      relevant: "/data/fada_obv4/fada_baby_skin_to_skin = '1'"
+      required: true
     - group: /data/fada_obv4
+      calculate: null
       label: Was the paper checklist picked up during care ?
       options:
       - {label: 'Yes', value: '1'}
@@ -481,7 +644,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv4/fada_checklist_picked_up_obv4
+      relevant: null
+      required: true
     - group: /data/fada_obv4
+      calculate: null
       label: Was the paper checklist picked up after the care was given?
       options:
       - {label: 'Yes', value: '1'}
@@ -491,7 +657,10 @@
       tag: select1
       type: Select
       value: /data/fada_obv4/fada_checklist_used_after_care_obv4
+      relevant: null
+      required: true
     - group: /data/fada_obv4
+      calculate: null
       label: Was the checklist poster observed during care?
       options:
       - {label: 'Yes', value: 'yes'}
@@ -501,15 +670,21 @@
       tag: select1
       type: Select
       value: /data/fada_obv4/fada_checklist_poster_used_obv4
+      relevant: null
+      required: true
     group: /data/whole_form
+    calculate: null
     label: 4. At one hour after delivery
     repeat: null
     response: true
     tag: group
     type: Group
     value: /data/fada_obv4
+    relevant: "selected(/data/fada_observation_points_observed, '4')"
+    required: false
   - children:
     - group: /data/fada_other_observations
+      calculate: null
       label: Was maternal temperature obtained at any time?
       options:
       - {label: 'Yes', value: '1'}
@@ -519,7 +694,10 @@
       tag: select1
       type: Select
       value: /data/fada_other_observations/fada_maternal_temp_anytime
+      relevant: null
+      required: true
     - group: /data/fada_other_observations
+      calculate: null
       label: Was maternal blood pressure obtained at any time?
       options:
       - {label: 'Yes', value: '1'}
@@ -529,7 +707,10 @@
       tag: select1
       type: Select
       value: /data/fada_other_observations/fada_maternal_bp_anytime
+      relevant: null
+      required: true
     - group: /data/fada_other_observations
+      calculate: null
       label: Was magnesium Sulphate given to mother at any time?
       options:
       - {label: 'Yes', value: '1'}
@@ -539,7 +720,10 @@
       tag: select1
       type: Select
       value: /data/fada_other_observations/fada_magnesium
+      relevant: null
+      required: true
     - group: /data/fada_other_observations
+      calculate: null
       label: Was antibiotics given to mother at any time?
       options:
       - {label: 'Yes', value: '1'}
@@ -549,7 +733,10 @@
       tag: select1
       type: Select
       value: /data/fada_other_observations/fada_ab_mother
+      relevant: null
+      required: true
     - group: /data/fada_other_observations
+      calculate: null
       label: Was antibiotics given to baby at any time?
       options:
       - {label: 'Yes', value: '1'}
@@ -559,7 +746,10 @@
       tag: select1
       type: Select
       value: /data/fada_other_observations/fada_ab_baby
+      relevant: null
+      required: true
     - group: /data/fada_other_observations
+      calculate: null
       label: Was antiretroviral to mother at any time?
       options:
       - {label: 'Yes', value: '1'}
@@ -569,7 +759,10 @@
       tag: select1
       type: Select
       value: /data/fada_other_observations/fada_arv_mother
+      relevant: null
+      required: true
     - group: /data/fada_other_observations
+      calculate: null
       label: Was antiretroviral to baby at any time?
       options:
       - {label: 'Yes', value: '1'}
@@ -579,14 +772,20 @@
       tag: select1
       type: Select
       value: /data/fada_other_observations/fada_arv_baby
+      relevant: null
+      required: true
     group: /data/whole_form
+    calculate: null
     label: 5.Were any of the following observed at any time?
     repeat: null
     response: true
     tag: group
     type: FieldList
     value: /data/fada_other_observations
+    relevant: null
+    required: false
   - group: /data/whole_form
+    calculate: null
     label: Would you like to highlight this record for your team leader?
     options:
     - {label: 1. Yes, value: 'yes'}
@@ -596,26 +795,95 @@
     tag: select1
     type: Select
     value: /data/fada_highlight_record
-  - {group: /data/whole_form, label: Comment to supervisor, repeat: null, response: null,
-    tag: input, type: Text, value: /data/fada_highlight_comment}
-  - {group: /data/whole_form, label: GPS Capture, repeat: null, response: 8.8888888
-      -9.9999999 0.0 30.000, tag: input, type: Geopoint, value: /data/fada_gps_location}
+    relevant: null
+    required: true
+  - group: /data/whole_form
+    calculate: null
+    label: Comment to supervisor
+    repeat: null
+    response: null
+    tag: input
+    type: Text
+    value: /data/fada_highlight_comment
+    relevant: "/data/fada_highlight_record = 'yes'"
+    required: true
+  - group: /data/whole_form
+    calculate: null
+    label: GPS Capture
+    repeat: null
+    response: 8.8888888 -9.9999999 0.0 30.000
+    tag: input
+    type: Geopoint
+    value: /data/fada_gps_location
+    relevant: null
+    required: false
   group: null
+  calculate: null
   label: ''
   repeat: null
   response: true
   tag: group
   type: Group
   value: /data/whole_form
-- {group: null, label: fada_facility_id, repeat: null, response: '600', tag: hidden,
-  type: DataBindOnly, value: /data/fada_facility_id}
-- {group: null, label: fada_patient_id, repeat: null, response: '2093402934', tag: hidden,
-  type: DataBindOnly, value: /data/fada_patient_id}
-- {group: null, label: facility_number_usage, repeat: null, response: '1', tag: hidden,
-  type: DataBindOnly, value: /data/facility_number_usage}
-- {group: null, label: patient_number, repeat: null, response: '1234', tag: hidden,
-  type: DataBindOnly, value: /data/patient_number}
-- {group: null, label: patient_number_padded, repeat: null, response: '01225', tag: hidden,
-  type: DataBindOnly, value: /data/patient_number_padded}
-- {group: null, label: facility_owner_id, repeat: null, response: '', tag: hidden,
-  type: DataBindOnly, value: /data/facility_owner_id}
+  relevant: "/data/fada_facility_id != ''"
+  required: false
+- group: null
+  calculate: "instance('casedb')/casedb/case[@case_type='current_user_data']/facility_id"
+  label: fada_facility_id
+  repeat: null
+  response: '600'
+  tag: hidden
+  type: DataBindOnly
+  value: /data/fada_facility_id
+  relevant: null
+  required: null
+- group: null
+  calculate: "concat(/data/fada_facility_id, format-date(/data/fada_date_admission, '%Y%m'), /data/patient_number_padded)"
+  label: fada_patient_id
+  repeat: null
+  response: '2093402934'
+  tag: hidden
+  type: DataBindOnly
+  value: /data/fada_patient_id
+  relevant: null
+  required: null
+- group: null
+  calculate: "instance('casedb')/casedb/case[@case_type='facility'][@status='open'][facility_id = /data/fada_facility_id]/number_usage"
+  label: facility_number_usage
+  repeat: null
+  response: '1'
+  tag: hidden
+  type: DataBindOnly
+  value: /data/facility_number_usage
+  relevant: null
+  required: null
+- group: null
+  calculate: "if(/data/facility_number_usage = 1, /data/fada_monthly_number, /data/fada_yearly_number)"
+  label: patient_number
+  repeat: null
+  response: '1234'
+  tag: hidden
+  type: DataBindOnly
+  value: /data/patient_number
+  relevant: null
+  required: null
+- group: null
+  calculate: "if(/data/patient_number >= 10000, string(/data/patient_number), if(/data/patient_number >= 1000, concat('0', string(/data/patient_number)), if(/data/patient_number >= 100, concat('00', string(/data/patient_number)), if(/data/patient_number >= 10, concat('000', string(/data/patient_number)), concat('0000', string(/data/patient_number))))))"
+  label: patient_number_padded
+  repeat: null
+  response: '01225'
+  tag: hidden
+  type: DataBindOnly
+  value: /data/patient_number_padded
+  relevant: null
+  required: null
+- group: null
+  calculate: "instance('casedb')/casedb/case[@case_type='facility'][@status='open'][facility_id = /data/fada_facility_id]/owner_id"
+  label: facility_owner_id
+  repeat: null
+  response: ''
+  tag: hidden
+  type: DataBindOnly
+  value: /data/facility_owner_id
+  relevant: null
+  required: null

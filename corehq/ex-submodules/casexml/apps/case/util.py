@@ -1,23 +1,13 @@
 from __future__ import absolute_import
 
 from xml.etree import ElementTree
-from couchdbkit.schema.properties import LazyDict
 from django.conf import settings
 from casexml.apps.case import const
 from casexml.apps.case.sharedmodels import CommCareCaseIndex
 from casexml.apps.phone.models import SyncLogAssertionError, SyncLog
 from casexml.apps.stock.models import StockReport
 from couchforms.models import XFormInstance
-
-
-def couchable_property(prop):
-    """
-    Sometimes properties that come from couch can't be put back in
-    without some modification.
-    """
-    if isinstance(prop, LazyDict):
-        return dict(prop)
-    return prop
+from dimagi.utils.couch.database import iter_docs
 
 
 def post_case_blocks(case_blocks, form_extras=None, domain=None):
@@ -60,7 +50,7 @@ def reprocess_form_cases(form, config=None, case_db=None):
     correctly inject the update into the case history if the form was NOT
     successfully processed.
     """
-    from casexml.apps.case import process_cases, process_cases_with_casedb
+    from casexml.apps.case.xform import process_cases, process_cases_with_casedb
 
     if case_db:
         process_cases_with_casedb(form, case_db, config=config)
@@ -115,14 +105,28 @@ def update_sync_log_with_checks(sync_log, xform, cases, case_db,
                                         case_id_blacklist=case_id_blacklist)
 
 
-def reverse_indices(db, case):
-    return db.view("case/related",
-        key=[case.domain, case._id, "reverse_index"],
+def reverse_indices(db, case, wrap=True):
+    kwargs = {
+        'wrapper': lambda r: CommCareCaseIndex.wrap(r['value']) if wrap else r['value']
+    }
+    return db.view(
+        "case/related",
+        key=[case['domain'], case['_id'], "reverse_index"],
         reduce=False,
-        wrapper=lambda r: CommCareCaseIndex.wrap(r['value'])
+        **kwargs
     ).all()
 
 
 def primary_actions(case):
     return filter(lambda a: a.action_type != const.CASE_ACTION_REBUILD,
                   case.actions)
+
+
+def iter_cases(case_ids, strip_history=False, wrap=True):
+    from casexml.apps.case.models import CommCareCase
+    if not strip_history:
+        for doc in iter_docs(CommCareCase.get_db(), case_ids):
+            yield CommCareCase.wrap(doc) if wrap else doc
+    else:
+        for case in CommCareCase.bulk_get_lite(case_ids, wrap=wrap):
+            yield case

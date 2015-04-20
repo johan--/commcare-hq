@@ -1,10 +1,10 @@
 from crispy_forms.bootstrap import FormActions, StrictButton
 from crispy_forms.helper import FormHelper
 from crispy_forms import layout as crispy
-from crispy_forms.layout import ButtonHolder, Div, Fieldset, HTML, Layout, Submit
+from crispy_forms.layout import Div, Fieldset, HTML, Layout, Submit
 import datetime
 from django import forms
-from django.core.validators import EmailValidator, email_re
+from django.core.validators import EmailValidator
 from django.core.urlresolvers import reverse
 from django.forms.widgets import PasswordInput, HiddenInput
 from django.utils.safestring import mark_safe
@@ -13,15 +13,20 @@ from django.template.loader import get_template
 from django.template import Context
 from django_countries.countries import COUNTRIES
 from corehq.apps.domain.forms import EditBillingAccountInfoForm
+from corehq.apps.domain.models import Domain
 from corehq.apps.locations.models import Location
 from corehq.apps.registration.utils import handle_changed_mailchimp_email
 from corehq.apps.users.models import CouchUser
 from corehq.apps.users.util import format_username
 from corehq.apps.app_manager.models import validate_lang
-from corehq.apps.commtrack.models import CommTrackUser, SupplyPointCase
 from corehq.apps.programs.models import Program
+
+# Bootstrap 3 Crispy Forms
 from bootstrap3_crispy import layout as cb3_layout
 from bootstrap3_crispy import helper as cb3_helper
+from bootstrap3_crispy import bootstrap as twbscrispy
+from corehq.apps.style import crispy as hqcrispy
+
 import re
 import settings
 
@@ -29,6 +34,7 @@ import settings
 from django.utils.functional import lazy
 import six  # Python 3 compatibility
 mark_safe_lazy = lazy(mark_safe, six.text_type)
+
 
 def wrapped_language_validation(value):
     try:
@@ -157,7 +163,8 @@ class BaseUserInfoForm(forms.Form):
         help_text=mark_safe_lazy(
             ugettext_lazy(
                 "<i class=\"icon-info-sign\"></i> "
-                "Becomes default language seen in CloudCare and reports (if applicable). "
+                "Becomes default language seen in CloudCare and reports (if applicable), "
+                "but does not affect mobile applications. "
                 "Supported languages for reports are en, fr (partial), and hin (partial)."
             )
         )
@@ -172,25 +179,48 @@ class BaseUserInfoForm(forms.Form):
 class UpdateMyAccountInfoForm(BaseUpdateUserForm, BaseUserInfoForm):
     email_opt_out = forms.BooleanField(
         required=False,
-        label="",
-        help_text=ugettext_lazy(
-            "Opt out of emails about CommCare updates."
-        ),
+        label=ugettext_noop("Opt out of emails about CommCare updates."),
     )
 
     def __init__(self, *args, **kwargs):
+        self.username = kwargs.pop('username') if 'username' in kwargs else None
         super(UpdateMyAccountInfoForm, self).__init__(*args, **kwargs)
+
+        username_controls = []
+        if self.username:
+            username_controls.append(hqcrispy.StaticField(
+                _('Username'), self.username)
+            )
+
+        self.fields['language'].label = _("My Language")
 
         self.new_helper = cb3_helper.FormHelper()
         self.new_helper.form_method = 'POST'
         self.new_helper.form_class = 'form-horizontal'
-        self.new_helper.label_class = 'col-lg-2'
-        self.new_helper.field_class = 'col-lg-8'
+        self.new_helper.attrs = {
+            'name': 'user_information',
+        }
+        self.new_helper.label_class = 'col-sm-3 col-md-2 col-lg-2'
+        self.new_helper.field_class = 'col-sm-9 col-md-8 col-lg-6'
         self.new_helper.layout = cb3_layout.Layout(
             cb3_layout.Fieldset(
                 _("Basic"),
-                cb3_layout.Field('email'),
-                cb3_layout.Field('first_name'),
+                cb3_layout.Div(*username_controls),
+                hqcrispy.Field('first_name'),
+                hqcrispy.Field('last_name'),
+                hqcrispy.Field('email'),
+                hqcrispy.Field('email_opt_out'),
+            ),
+            cb3_layout.Fieldset(
+                _("Other Options"),
+                hqcrispy.Field('language'),
+            ),
+            hqcrispy.FormActions(
+                twbscrispy.StrictButton(
+                    _("Update My Information"),
+                    type='submit',
+                    css_class='btn-primary',
+                )
             )
         )
 
@@ -200,6 +230,15 @@ class UpdateMyAccountInfoForm(BaseUpdateUserForm, BaseUserInfoForm):
 
 
 class UpdateCommCareUserInfoForm(BaseUserInfoForm, UpdateUserRoleForm):
+
+    def __init__(self, *args, **kwargs):
+        super(UpdateCommCareUserInfoForm, self).__init__(*args, **kwargs)
+        self.fields['role'].help_text = _(mark_safe(
+            "<i class=\"icon-info-sign\"></i> "
+            "Only applies to mobile workers that will be entering data using "
+            "<a href='https://help.commcarehq.org/display/commcarepublic/CloudCare+-+Web+Data+Entry'>"
+            "CloudCare</a>"
+        ))
 
     @property
     def direct_properties(self):
@@ -317,7 +356,12 @@ class CommCareAccountForm(forms.Form):
             self.cleaned_data['username'] = username
         return self.cleaned_data
 
-validate_username = EmailValidator(email_re, _(u'Username contains invalid characters.'), 'invalid')
+import django
+if django.VERSION < (1, 6):
+    from django.core.validators import email_re
+    validate_username = EmailValidator(email_re, _(u'Username contains invalid characters.'), 'invalid')
+else:
+    validate_username = EmailValidator(message=_(u'Username contains invalid characters.'))
 
 
 class MultipleSelectionForm(forms.Form):
@@ -332,7 +376,8 @@ class MultipleSelectionForm(forms.Form):
     def __init__(self, *args, **kwargs):
         self.helper = FormHelper()
         self.helper.form_tag = False
-        self.helper.add_input(Submit('submit', 'Update'))
+        submit_label = kwargs.pop('submit_label', "Update")
+        self.helper.add_input(Submit('submit', submit_label))
         super(MultipleSelectionForm, self).__init__(*args, **kwargs)
 
 
@@ -341,22 +386,18 @@ class SupplyPointSelectWidget(forms.Widget):
         super(SupplyPointSelectWidget, self).__init__(attrs)
         self.domain = domain
         self.id = id
-        if attrs:
-            self.is_admin = attrs.get('is_admin', False)
-        else:
-            self.is_admin = False
 
     def render(self, name, value, attrs=None):
         return get_template('locations/manage/partials/autocomplete_select_widget.html').render(Context({
-                    'id': self.id,
-                    'name': name,
-                    'value': value or '',
-                    'is_admin': self.is_admin,
-                    'query_url': reverse('corehq.apps.commtrack.views.api_query_supply_point', args=[self.domain]),
-                }))
+            'id': self.id,
+            'name': name,
+            'value': value or '',
+            'query_url': reverse('corehq.apps.commtrack.views.api_query_supply_point', args=[self.domain]),
+        }))
+
 
 class CommtrackUserForm(forms.Form):
-    supply_point = forms.CharField(label='Supply Point:', required=False)
+    location = forms.CharField(label='Location:', required=False)
     program_id = forms.ChoiceField(label="Program", choices=(), required=False)
 
     def __init__(self, *args, **kwargs):
@@ -364,31 +405,26 @@ class CommtrackUserForm(forms.Form):
         if 'domain' in kwargs:
             domain = kwargs['domain']
             del kwargs['domain']
-        if 'is_admin' in kwargs:
-            attrs = {'is_admin': kwargs['is_admin']}
-            del kwargs['is_admin']
-        else:
-            attrs = {'is_admin': False}
         super(CommtrackUserForm, self).__init__(*args, **kwargs)
-        self.fields['supply_point'].widget = SupplyPointSelectWidget(domain=domain, attrs=attrs)
-        programs = Program.by_domain(domain, wrap=False)
-        choices = list((prog['_id'], prog['name']) for prog in programs)
-        choices.insert(0, ('', ''))
-        self.fields['program_id'].choices = choices
+        self.fields['location'].widget = SupplyPointSelectWidget(domain=domain)
+        if Domain.get_by_name(domain).commtrack_enabled:
+            programs = Program.by_domain(domain, wrap=False)
+            choices = list((prog['_id'], prog['name']) for prog in programs)
+            choices.insert(0, ('', ''))
+            self.fields['program_id'].choices = choices
+        else:
+            self.fields['program_id'].widget = forms.HiddenInput()
 
     def save(self, user):
-        commtrack_user = CommTrackUser.wrap(user.to_json())
-        location_id = self.cleaned_data['supply_point']
+        location_id = self.cleaned_data['location']
+        # This means it will clear the location associations set in a domain
+        # with multiple locations configured. It is acceptable for now because
+        # multi location config is a not really supported special flag for IPM.
         if location_id:
-            loc = Location.get(location_id)
-
-            commtrack_user.clear_locations()
-            commtrack_user.add_location(loc, create_sp_if_missing=True)
-
-            # add the supply point case id to user data fields
-            # so that the phone can auto select
-            supply_point = SupplyPointCase.get_by_location(loc)
-            user.user_data['commtrack-supply-point'] = supply_point._id
+            if location_id != user.location_id:
+                user.set_location(Location.get(location_id))
+        else:
+            user.unset_location()
 
 
 class ConfirmExtraUserChargesForm(EditBillingAccountInfoForm):

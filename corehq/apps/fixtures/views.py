@@ -5,13 +5,14 @@ from collections import OrderedDict
 from django.contrib import messages
 from django.core.urlresolvers import reverse
 from django.http import HttpResponseBadRequest, HttpResponseRedirect, Http404, HttpResponse
+from django.http.response import HttpResponseServerError
 from django.shortcuts import render
 from django.utils.decorators import method_decorator
 from django.utils.translation import ugettext as _, ugettext_noop
 from django.views.decorators.http import require_POST
 from django.views.generic.base import TemplateView
 
-from corehq.apps.domain.decorators import login_or_digest
+from corehq.apps.domain.decorators import login_or_digest, login_and_domain_required
 from corehq.apps.domain.views import BaseDomainView
 from corehq.apps.fixtures.tasks import fixture_upload_async, fixture_download_async
 from corehq.apps.fixtures.dispatcher import require_can_edit_fixtures
@@ -25,17 +26,20 @@ from corehq.apps.fixtures.exceptions import (
 )
 from corehq.apps.fixtures.models import FixtureDataType, FixtureDataItem, FieldList, FixtureTypeField
 from corehq.apps.fixtures.upload import run_upload, validate_file_format, get_workbook
+from corehq.apps.fixtures.fixturegenerators import item_lists_by_domain
 from corehq.apps.reports.datatables import DataTablesHeader, DataTablesColumn
 from corehq.apps.reports.util import format_datatables_data
 from corehq.apps.users.models import Permissions
 from dimagi.utils.couch.bulk import CouchTransaction
-from dimagi.utils.excel import WorksheetNotFound
+from dimagi.utils.excel import WorksheetNotFound, JSONReaderError, \
+    HeaderValueError
 from dimagi.utils.logging import notify_exception
 from dimagi.utils.web import json_response
 from dimagi.utils.decorators.view import get_file
 
 from copy import deepcopy
 from soil import CachedDownload, DownloadBase
+from soil.exceptions import TaskFailedError
 from soil.util import expose_download, get_download_context
 
 
@@ -67,7 +71,7 @@ def tables(request, domain):
         return json_response([strip_json(x) for x in FixtureDataType.by_domain(domain)])
 
 @require_can_edit_fixtures
-def update_tables(request, domain, data_type_id, test_patch={}):
+def update_tables(request, domain, data_type_id, test_patch=None):
     """
     receives a JSON-update patch like following
     {
@@ -78,6 +82,8 @@ def update_tables(request, domain, data_type_id, test_patch={}):
         "fields":{"genderr":{"update":"gender"},"grade":{}}
     }
     """
+    if test_patch is None:
+        test_patch = {}
     if data_type_id:
         try:
             data_type = FixtureDataType.get(data_type_id)
@@ -223,7 +229,7 @@ def download_item_lists(request, domain):
     download = DownloadBase()
     download.set_task(fixture_download_async.delay(
         prepare_fixture_download,
-        table_ids=request.GET.getlist("table_id"),
+        table_ids=request.POST.getlist("table_ids[]", []),
         domain=domain,
         download_id=download.download_id,
     ))
@@ -279,8 +285,8 @@ class UploadItemLists(TemplateView):
         # catch basic validation in the synchronous UI
         try:
             validate_file_format(file_ref.get_filename())
-        except FixtureUploadError as e:
-            messages.error(request, unicode(e))
+        except (FixtureUploadError, JSONReaderError, HeaderValueError) as e:
+            messages.error(request, _(u'Upload unsuccessful: %s') % e)
             return HttpResponseRedirect(fixtures_home(self.domain))
 
         # hand off to async
@@ -325,7 +331,11 @@ class FixtureUploadStatusView(FixtureViewMixIn, BaseDomainView):
 
 @require_can_edit_fixtures
 def fixture_upload_job_poll(request, domain, download_id, template="fixtures/partials/fixture_upload_status.html"):
-    context = get_download_context(download_id, check_state=True)
+    try:
+        context = get_download_context(download_id, check_state=True)
+    except TaskFailedError:
+        return HttpResponseServerError()
+
     context.update({
         'on_complete_short': _('Upload complete.'),
         'on_complete_long': _('Lookup table upload has finished'),
@@ -413,3 +423,11 @@ def upload_fixture_api(request, domain, **kwargs):
         resp_json["message"] += "%s%s%s" % (("and following " if num_unknown_groups else ""), warn_users, upload_resp.unknown_users)
 
     return HttpResponse(json.dumps(resp_json), mimetype="application/json")
+
+
+@login_and_domain_required
+def fixture_metadata(request, domain):
+    """
+    Returns list of fixtures and metadata needed for itemsets in vellum
+    """
+    return json_response(item_lists_by_domain(domain))

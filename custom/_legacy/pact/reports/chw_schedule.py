@@ -1,10 +1,11 @@
-from datetime import datetime, timedelta
-import time
+from datetime import datetime, timedelta, time
 from dateutil.parser import parser
 from django.core.cache import cache
-import simplejson
+import json
 from casexml.apps.case.models import CommCareCase
 from corehq.apps.api.es import ReportXFormES, get_report_script_field
+from corehq.util.dates import iso_string_to_date
+from dimagi.utils.parsing import json_format_date
 from pact.enums import PACT_DOMAIN
 from pact.lib.quicksect import IntervalNode
 from pact.utils import get_patient_display_cache
@@ -13,6 +14,7 @@ import logging
 cached_schedules = {}
 
 def get_seconds(d):
+    import time
     return time.mktime(d.utctimetuple())
 
 
@@ -48,7 +50,7 @@ class CHWPatientSchedule(object):
         cached_schedules = None
 
         if override_date == None:
-            nowdate = datetime.now()
+            nowdate = datetime.utcnow()
         else:
             nowdate = override_date
 
@@ -61,10 +63,10 @@ class CHWPatientSchedule(object):
             for item in chw_schedules:
                 single_sched = item['value']
                 to_cache.append(single_sched)
-            cache.set("%s_schedule" % (chw_username), simplejson.dumps(to_cache), 3600)
+            cache.set("%s_schedule" % (chw_username), json.dumps(to_cache), 3600)
             cached_arr = to_cache
         else:
-            cached_arr = simplejson.loads(cached_schedules)
+            cached_arr = json.loads(cached_schedules)
 
         for single_sched in cached_arr:
             day_of_week = int(single_sched['day_of_week'])
@@ -124,7 +126,7 @@ def dots_submissions_by_case(case_id, query_date, username=None):
     query['size'] = 1
     query['from'] = 0
     res = xform_es.run_query(query)
-    print simplejson.dumps(res, indent=2)
+    print json.dumps(res, indent=2)
     return res
 
 
@@ -137,7 +139,7 @@ def get_schedule_tally(username, total_interval, override_date=None):
     where visit = XFormInstance
     """
     if override_date is None:
-        nowdate = datetime.now()
+        nowdate = datetime.utcnow()
         chw_schedule = CHWPatientSchedule.get_schedule(username)
     else:
         nowdate = override_date
@@ -175,7 +177,7 @@ def get_schedule_tally(username, total_interval, override_date=None):
                 #calculate if pillbox checked
                 pillbox_check_str = submissions[0]['fields']['pillbox_check']
                 if len(pillbox_check_str) > 0:
-                    pillbox_check_data = simplejson.loads(pillbox_check_str)
+                    pillbox_check_data = json.loads(pillbox_check_str)
                     anchor_date = dp.parse(pillbox_check_data.get('anchor'))
                 else:
                     pillbox_check_data = {}
@@ -211,15 +213,15 @@ def chw_calendar_submit_report(request, username, interval=7):
 
     #secret date ranges
     if 'enddate' in request.GET:
-        end_date_str = request.GET.get('enddate', datetime.utcnow().strftime('%Y-%m-%d'))
-        end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+        end_date_str = request.GET.get('enddate', json_format_date(datetime.utcnow()))
+        end_date = iso_string_to_date(end_date_str)
     else:
-        end_date = datetime.utcnow()
+        end_date = datetime.utcnow().date()
 
     if 'startdate' in request.GET:
         #if there's a startdate, trump interval
-        start_date_str = request.GET.get('startdate', datetime.utcnow().strftime('%Y-%m-%d'))
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+        start_date_str = request.GET.get('startdate', json_format_date(datetime.utcnow()))
+        start_date = iso_string_to_date(start_date_str)
         total_interval = (end_date - start_date).days
 
     ret, patients, total_scheduled, total_visited = get_schedule_tally(username,

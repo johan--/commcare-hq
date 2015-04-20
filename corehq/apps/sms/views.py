@@ -12,6 +12,7 @@ from django.core.urlresolvers import reverse
 from django.http import HttpResponse, HttpResponseRedirect, HttpResponseBadRequest, Http404
 from django.shortcuts import render
 from django.utils.decorators import method_decorator
+from casexml.apps.case.models import CommCareCase
 from corehq import privileges
 from corehq.apps.hqwebapp.utils import get_bulk_upload_form
 from corehq.apps.reminders.util import can_use_survey_reminders
@@ -29,7 +30,7 @@ from corehq.apps.sms.api import (
 from corehq.apps.domain.views import BaseDomainView
 from corehq.apps.hqwebapp.views import CRUDPaginatedViewMixin
 from corehq.apps.users.decorators import require_permission
-from corehq.apps.users.models import CouchUser, Permissions
+from corehq.apps.users.models import CouchUser, Permissions, CommCareUser
 from corehq.apps.users import models as user_models
 from corehq.apps.users.views.mobile.users import EditCommCareUserView
 from corehq.apps.sms.models import (
@@ -39,18 +40,24 @@ from corehq.apps.sms.models import (
 from corehq.apps.sms.mixin import (SMSBackend, BackendMapping, VerifiedNumber,
     SMSLoadBalancingMixin)
 from corehq.apps.sms.forms import (ForwardingRuleForm, BackendMapForm,
-    InitiateAddSMSBackendForm, SMSSettingsForm, SubscribeSMSForm,
+    InitiateAddSMSBackendForm, SubscribeSMSForm,
     SettingsForm, SHOW_ALL, SHOW_INVALID, HIDE_ALL, ENABLED, DISABLED,
     DEFAULT, CUSTOM)
 from corehq.apps.sms.util import get_available_backends, get_contact
 from corehq.apps.sms.messages import _MESSAGES
+from corehq.apps.smsbillables.utils import country_name_from_isd_code_or_empty as country_name_from_code
 from corehq.apps.groups.models import Group
-from corehq.apps.domain.decorators import login_and_domain_required, login_or_digest, domain_admin_required, require_superuser
+from corehq.apps.domain.decorators import (
+    login_and_domain_required,
+    login_or_digest_ex,
+    domain_admin_required,
+    require_superuser,
+)
 from corehq.apps.translations.models import StandaloneTranslationDoc
+from corehq.util.timezones.conversions import ServerTime, UserTime
 from dimagi.utils.couch.database import get_db
 from django.contrib import messages
-from corehq.apps.reports import util as report_utils
-from dimagi.utils.timezones import utils as tz_utils
+from corehq.util.timezones.utils import get_timezone_for_user
 from django.views.decorators.csrf import csrf_exempt
 from corehq.apps.domain.models import Domain
 from django.utils.translation import ugettext as _, ugettext_noop
@@ -61,14 +68,14 @@ from dimagi.utils.decorators.view import get_file
 from dimagi.utils.logging import notify_exception
 from dimagi.utils.web import json_response
 from dimagi.utils.excel import WorkbookJSONReader
+from dimagi.utils.couch.database import iter_docs
+from dimagi.utils.couch.cache import cache_core
 from django.conf import settings
 from couchdbkit.resource import ResourceNotFound
 from couchexport.models import Format
 from couchexport.export import export_raw
 from couchexport.shortcuts import export_response
 
-
-DEFAULT_MESSAGE_COUNT_THRESHOLD = 50
 
 # Tuple of (description, days in the past)
 SMS_CHAT_HISTORY_CHOICES = (
@@ -101,7 +108,7 @@ def messaging(request, domain, template="sms/default.html"):
     context['domain'] = domain
     context['messagelog'] = SMSLog.by_domain_dsc(domain)
     context['now'] = datetime.utcnow()
-    tz = report_utils.get_timezone(request.couch_user, domain)
+    tz = get_timezone_for_user(request.couch_user, domain)
     context['timezone'] = tz
     context['timezone_now'] = datetime.now(tz=tz)
     context['layout_flush_content'] = True
@@ -114,7 +121,7 @@ def compose_message(request, domain, template="sms/compose.html"):
     context = get_sms_autocomplete_context(request, domain)
     context['domain'] = domain
     context['now'] = datetime.utcnow()
-    tz = report_utils.get_timezone(request.couch_user, domain)
+    tz = get_timezone_for_user(request.couch_user, domain)
     context['timezone'] = tz
     context['timezone_now'] = datetime.now(tz=tz)
     return render(request, template, context)
@@ -145,12 +152,11 @@ def post(request, domain):
                  #couch_recipient=id, 
                  phone_number=to,
                  direction=INCOMING,
-                 date = datetime.now(),
+                 date = datetime.utcnow(),
                  text = text)
     msg.save()
     return HttpResponse('OK')
 
-@requires_privilege_plaintext_response(privileges.OUTBOUND_SMS)
 @require_api_user_permission(PERMISSION_POST_SMS)
 def sms_in(request):
     """
@@ -301,7 +307,7 @@ def send_to_recipients(request, domain):
     )
 
 @domain_admin_required
-@requires_privilege_with_fallback(privileges.OUTBOUND_SMS)
+@requires_privilege_with_fallback(privileges.INBOUND_SMS)
 def message_test(request, domain, phone_number):
     if request.method == "POST":
         message = request.POST.get("message", "")
@@ -328,7 +334,7 @@ def message_test(request, domain, phone_number):
     context['domain'] = domain
     context['messagelog'] = SMSLog.by_domain_dsc(domain)
     context['now'] = datetime.utcnow()
-    tz = report_utils.get_timezone(request.couch_user, domain)
+    tz = get_timezone_for_user(request.couch_user, domain)
     context['timezone'] = tz
     context['timezone_now'] = datetime.now(tz=tz)
     context['layout_flush_content'] = True
@@ -336,7 +342,7 @@ def message_test(request, domain, phone_number):
     return render(request, "sms/message_tester.html", context)
 
 @csrf_exempt
-@login_or_digest
+@login_or_digest_ex(allow_cc_users=True)
 @requires_privilege_plaintext_response(privileges.OUTBOUND_SMS)
 def api_send_sms(request, domain):
     """
@@ -526,14 +532,12 @@ def _add_backend(request, backend_class_name, is_global, domain=None, backend_id
     }
     return render(request, backend_class.get_template(), context)
 
-@domain_admin_required
-@requires_privilege_with_fallback(privileges.OUTBOUND_SMS)
-def add_domain_backend(request, domain, backend_class_name, backend_id=None):
-    return _add_backend(request, backend_class_name, False, domain, backend_id)
 
 @require_superuser
 def add_backend(request, backend_class_name, backend_id=None):
+    # We need to keep this until we move over the admin sms gateway UIs
     return _add_backend(request, backend_class_name, True, backend_id=backend_id)
+
 
 def _list_backends(request, show_global=False, domain=None):
     backend_classes = get_available_backends()
@@ -586,58 +590,27 @@ def _list_backends(request, show_global=False, domain=None):
     }
     return render(request, "sms/list_backends.html", context)
 
-@domain_admin_required
-@requires_privilege_with_fallback(privileges.OUTBOUND_SMS)
-def list_domain_backends(request, domain):
-    return _list_backends(request, False, domain)
 
 @require_superuser
 def list_backends(request):
+    # We need to keep this until we move over the admin sms gateway UIs
     return _list_backends(request, True)
+
 
 @require_superuser
 def default_sms_admin_interface(request):
     return HttpResponseRedirect(reverse("list_backends"))
 
-@domain_admin_required
-@requires_privilege_with_fallback(privileges.OUTBOUND_SMS)
-def delete_domain_backend(request, domain, backend_id):
-    backend = SMSBackend.get(backend_id)
-    if backend.domain != domain or backend.base_doc != "MobileBackend":
-        raise Http404
-    domain_obj = Domain.get_by_name(domain, strict=True)
-    if domain_obj.default_sms_backend_id == backend._id:
-        domain_obj.default_sms_backend_id = None
-        domain_obj.save()
-    backend.retire() # Do not actually delete so that linkage always exists between SMSLog and MobileBackend
-    return HttpResponseRedirect(reverse("list_domain_backends", args=[domain]))
 
 @require_superuser
 def delete_backend(request, backend_id):
+    # We need to keep this until we move over the admin sms gateway UIs
     backend = SMSBackend.get(backend_id)
     if not backend.is_global or backend.base_doc != "MobileBackend":
         raise Http404
     backend.retire() # Do not actually delete so that linkage always exists between SMSLog and MobileBackend
     return HttpResponseRedirect(reverse("list_backends"))
 
-def _set_default_domain_backend(request, domain, backend_id, unset=False):
-    backend = SMSBackend.get(backend_id)
-    if not backend.domain_is_authorized(domain):
-        raise Http404
-    domain_obj = Domain.get_by_name(domain, strict=True)
-    domain_obj.default_sms_backend_id = None if unset else backend._id
-    domain_obj.save()
-    return HttpResponseRedirect(reverse("list_domain_backends", args=[domain]))
-
-@domain_admin_required
-@requires_privilege_with_fallback(privileges.OUTBOUND_SMS)
-def set_default_domain_backend(request, domain, backend_id):
-    return _set_default_domain_backend(request, domain, backend_id)
-
-@domain_admin_required
-@requires_privilege_with_fallback(privileges.OUTBOUND_SMS)
-def unset_default_domain_backend(request, domain, backend_id):
-    return _set_default_domain_backend(request, domain, backend_id, True)
 
 @require_superuser
 def global_backend_map(request):
@@ -694,41 +667,134 @@ def global_backend_map(request):
     }
     return render(request, "sms/backend_map.html", context)
 
+
 @require_permission(Permissions.edit_data)
 @requires_privilege_with_fallback(privileges.OUTBOUND_SMS)
 def chat_contacts(request, domain):
-    domain_obj = Domain.get_by_name(domain, strict=True)
-    verified_numbers = VerifiedNumber.by_domain(domain)
-    contacts = []
-    for vn in verified_numbers:
-        owner = vn.owner
-        if owner is not None and owner.doc_type in ('CommCareCase','CommCareUser'):
-            if owner.doc_type == "CommCareUser":
-                url = reverse(EditCommCareUserView.urlname, args=[domain, owner._id])
-                name = owner.raw_username
-            else:
-                url = reverse("case_details", args=[domain, owner._id])
-                if domain_obj.custom_case_username:
-                    name = owner.get_case_property(domain_obj.custom_case_username) or _("(unknown)")
-                else:
-                    name = owner.name
-            contacts.append({
-                "id" : owner._id,
-                "doc_type" : owner.doc_type,
-                "url" : url,
-                "name" : name,
-            })
     context = {
         "domain" : domain,
-        "contacts" : contacts,
     }
     return render(request, "sms/chat_contacts.html", context)
+
+
+def get_case_contact_info(domain_obj, case_ids):
+    data = {}
+    for doc in iter_docs(CommCareCase.get_db(), case_ids):
+        if domain_obj.custom_case_username:
+            name = doc.get(domain_obj.custom_case_username, _('unknown'))
+        else:
+            name = doc.get('name', _('unknown'))
+        data[doc['_id']] = [name]
+    return data
+
+
+def get_mobile_worker_contact_info(domain_obj, user_ids):
+    data = {}
+    for doc in iter_docs(CommCareUser.get_db(), user_ids):
+        user = CommCareUser.wrap(doc)
+        data[user.get_id] = [user.raw_username]
+    return data
+
+
+def get_contact_info(domain):
+    # If the data has been cached, just retrieve it from there
+    cache_key = 'sms-chat-contact-list-%s' % domain
+    cache_expiration = 30 * 60
+    try:
+        client = cache_core.get_redis_client()
+        cached_data = client.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data)
+    except:
+        pass
+
+    verified_number_ids = VerifiedNumber.by_domain(domain, ids_only=True)
+    domain_obj = Domain.get_by_name(domain, strict=True)
+    case_ids = []
+    mobile_worker_ids = []
+    data = []
+    for doc in iter_docs(VerifiedNumber.get_db(), verified_number_ids):
+        owner_id = doc['owner_id']
+        if doc['owner_doc_type'] == 'CommCareCase':
+            case_ids.append(owner_id)
+            data.append([
+                None,
+                'case',
+                doc['phone_number'],
+                owner_id,
+            ])
+        elif doc['owner_doc_type'] == 'CommCareUser':
+            mobile_worker_ids.append(owner_id)
+            data.append([
+                None,
+                'mobile_worker',
+                doc['phone_number'],
+                owner_id,
+            ])
+    contact_data = get_case_contact_info(domain_obj, case_ids)
+    contact_data.update(get_mobile_worker_contact_info(domain_obj, mobile_worker_ids))
+    for row in data:
+        contact_info = contact_data.get(row[3])
+        row[0] = contact_info[0] if contact_info else _('(unknown)')
+
+    # Save the data to the cache for faster lookup next time
+    try:
+        client.set(cache_key, json.dumps(data))
+        client.expire(cache_key, cache_expiration)
+    except:
+        pass
+
+    return data
+
+
+def format_contact_data(domain, data):
+    for row in data:
+        contact_id = row[3]
+        if row[1] == 'case':
+            row[1] = _('Case')
+            row.append(reverse('case_details', args=[domain, contact_id]))
+        elif row[1] == 'mobile_worker':
+            row[1] = _('Mobile Worker')
+            row.append(reverse(EditCommCareUserView.urlname, args=[domain, contact_id]))
+        else:
+            row.append('#')
+        row.append(reverse('sms_chat', args=[domain, contact_id]))
+
+
+@require_permission(Permissions.edit_data)
+@requires_privilege_with_fallback(privileges.OUTBOUND_SMS)
+def chat_contact_list(request, domain):
+    sEcho = request.GET.get('sEcho')
+    iDisplayStart = int(request.GET.get('iDisplayStart'))
+    iDisplayLength = int(request.GET.get('iDisplayLength'))
+    sSearch = request.GET.get('sSearch', '').strip()
+
+    data = get_contact_info(domain)
+    total_records = len(data)
+
+    if sSearch:
+        regex = re.compile('^.*%s.*$' % sSearch)
+        data = filter(lambda row: regex.match(row[0]) or regex.match(row[2]), data)
+    filtered_records = len(data)
+
+    data.sort(key=lambda row: row[0])
+    data = data[iDisplayStart:iDisplayStart + iDisplayLength]
+    format_contact_data(domain, data)
+    result = {
+        'sEcho': sEcho,
+        'aaData': data,
+        'iTotalRecords': total_records,
+        'iTotalDisplayRecords': filtered_records,
+    }
+
+    return HttpResponse(json.dumps(result))
+
 
 @require_permission(Permissions.edit_data)
 @requires_privilege_with_fallback(privileges.OUTBOUND_SMS)
 def chat(request, domain, contact_id):
     domain_obj = Domain.get_by_name(domain, strict=True)
-    timezone = report_utils.get_timezone(None, domain)
+    timezone = get_timezone_for_user(None, domain)
 
     # floored_utc_timestamp is the datetime in UTC representing
     # midnight today in local time. This is used to calculate
@@ -736,11 +802,10 @@ def chat(request, domain, contact_id):
     # "Yesterday", for example, gives you data from yesterday at
     # midnight local time.
     local_date = datetime.now(timezone).date()
-    floored_utc_timestamp = tz_utils.adjust_datetime_to_timezone(
-        datetime.combine(local_date, time(0,0)),
-        timezone.zone,
-        pytz.utc.zone
-    ).replace(tzinfo=None)
+    floored_utc_timestamp = UserTime(
+        datetime.combine(local_date, time(0, 0)),
+        timezone
+    ).server_time().done()
 
     def _fmt(d):
         return json_format_datetime(floored_utc_timestamp - timedelta(days=d))
@@ -750,12 +815,13 @@ def chat(request, domain, contact_id):
     )
 
     context = {
-        "domain" : domain,
-        "contact_id" : contact_id,
-        "contact" : get_contact(contact_id),
-        "message_count_threshold" : domain_obj.chat_message_count_threshold or DEFAULT_MESSAGE_COUNT_THRESHOLD,
-        "custom_case_username" : domain_obj.custom_case_username,
-        "history_choices" : history_choices,
+        "domain": domain,
+        "contact_id": contact_id,
+        "contact": get_contact(contact_id),
+        "use_message_counter": domain_obj.chat_message_count_threshold is not None,
+        "message_count_threshold": domain_obj.chat_message_count_threshold or 0,
+        "custom_case_username": domain_obj.custom_case_username,
+        "history_choices": history_choices,
     }
     template = settings.CUSTOM_CHAT_TEMPLATES.get(domain_obj.custom_chat_template) or "sms/chat.html"
     return render(request, template, context)
@@ -766,7 +832,7 @@ def api_history(request, domain):
     result = []
     contact_id = request.GET.get("contact_id", None)
     start_date = request.GET.get("start_date", None)
-    timezone = report_utils.get_timezone(None, domain)
+    timezone = get_timezone_for_user(None, domain)
     domain_obj = Domain.get_by_name(domain, strict=True)
 
     try:
@@ -839,10 +905,13 @@ def api_history(request, domain):
             sender = _("System")
         last_sms = sms
         result.append({
-            "sender" : sender,
-            "text" : sms.text,
-            "timestamp" : tz_utils.adjust_datetime_to_timezone(sms.date, pytz.utc.zone, timezone.zone).strftime("%I:%M%p %m/%d/%y").lower(),
-            "utc_timestamp" : json_format_datetime(sms.date),
+            "sender": sender,
+            "text": sms.text,
+            "timestamp": (
+                ServerTime(sms.date).user_time(timezone)
+                .ui_string("%I:%M%p %m/%d/%y").lower()
+            ),
+            "utc_timestamp": json_format_datetime(sms.date),
             "sent_by_requester": (sms.chat_user_id == request.couch_user.get_id),
         })
     if last_sms:
@@ -884,7 +953,7 @@ def api_last_read_message(request, domain):
 
 class DomainSmsGatewayListView(CRUDPaginatedViewMixin, BaseMessagingSectionView):
     template_name = "sms/gateway_list.html"
-    urlname = 'list_domain_backends_new'
+    urlname = 'list_domain_backends'
     page_title = ugettext_noop("SMS Connectivity")
     strict_domain_fetching = True
 
@@ -916,6 +985,7 @@ class DomainSmsGatewayListView(CRUDPaginatedViewMixin, BaseMessagingSectionView)
         return [
             _("Connection"),
             _("Description"),
+            _("Supported Countries"),
             _("Status"),
             _("Actions"),
         ]
@@ -956,7 +1026,7 @@ class DomainSmsGatewayListView(CRUDPaginatedViewMixin, BaseMessagingSectionView)
                 'template': 'gateway-automatic-template',
             }
         elif self.domain_object.default_sms_backend_id:
-            default_backend = SMSBackend.get(self.domain_object.default_sms_backend_id)
+            default_backend = SMSBackend.get_wrapped(self.domain_object.default_sms_backend_id)
             yield {
                 'itemData': self._fmt_backend_data(default_backend),
                 'template': 'gateway-default-template',
@@ -974,15 +1044,27 @@ class DomainSmsGatewayListView(CRUDPaginatedViewMixin, BaseMessagingSectionView)
         return get_available_backends()
 
     def _fmt_backend_data(self, backend):
+        is_editable = not backend.is_global and backend.domain == self.domain
+        if len(backend.supported_countries) > 0:
+            if backend.supported_countries[0] == '*':
+                supported_country_names = _('Multiple%s') % '*'
+            else:
+                supported_country_names = ', '.join(
+                    [_(country_name_from_code(int(c))) for c in backend.supported_countries])
+        else:
+            supported_country_names = ''
         return {
             'id': backend._id,
             'name': backend.name,
             'description': backend.description,
+            'supported_countries': supported_country_names,
             'editUrl': reverse(
                 EditDomainGatewayView.urlname,
                 args=[self.domain, backend.__class__.__name__, backend._id]
-            ) if not backend.is_global else "",
-            'canDelete': not backend.is_global,
+            ) if is_editable else "",
+            'canDelete': is_editable,
+            'isGlobal': backend.is_global,
+            'isShared': not backend.is_global and backend.domain != self.domain,
             'deleteModalId': 'delete_%s' % backend._id,
         }
 
@@ -991,7 +1073,8 @@ class DomainSmsGatewayListView(CRUDPaginatedViewMixin, BaseMessagingSectionView)
             backend = SMSBackend.get(item_id)
         except ResourceNotFound:
             raise Http404()
-        if backend.domain != self.domain or backend.base_doc != "MobileBackend":
+        if (backend.is_global or backend.domain != self.domain or
+            backend.base_doc != "MobileBackend"):
             raise Http404()
         if self.domain_object.default_sms_backend_id == backend._id:
             self.domain_object.default_sms_backend_id = None
@@ -1004,6 +1087,9 @@ class DomainSmsGatewayListView(CRUDPaginatedViewMixin, BaseMessagingSectionView)
         }
 
     def refresh_item(self, item_id):
+        backend = SMSBackend.get_wrapped(item_id)
+        if not backend.domain_is_authorized(self.domain):
+            raise Http404()
         if self.domain_object.default_sms_backend_id == item_id:
             self.domain_object.default_sms_backend_id = None
         else:
@@ -1032,6 +1118,10 @@ class AddDomainGatewayView(BaseMessagingSectionView):
     page_title = ugettext_noop("Add SMS Connection")
 
     @property
+    def is_superuser(self):
+        return self.request.couch_user.is_superuser
+
+    @property
     def backend_class_name(self):
         return self.kwargs.get('backend_class_name')
 
@@ -1039,11 +1129,16 @@ class AddDomainGatewayView(BaseMessagingSectionView):
     def ignored_fields(self):
         return [
             'give_other_domains_access',
+            'phone_numbers',
         ]
 
     @property
     @memoized
     def backend_class(self):
+        # Superusers can create/edit any backend
+        # Regular users can only create/edit Telerivet backends for now
+        if not self.is_superuser and self.backend_class_name != "TelerivetBackend":
+            raise Http404()
         backend_classes = get_available_backends()
         try:
             return backend_classes[self.backend_class_name]
@@ -1101,7 +1196,9 @@ class AddDomainGatewayView(BaseMessagingSectionView):
             for key, value in self.backend_form.cleaned_data.items():
                 if key not in self.ignored_fields:
                     setattr(self.backend, key, value)
-                self.backend.save()
+            if self.use_load_balancing:
+                self.backend.x_phone_numbers = self.backend_form.cleaned_data["phone_numbers"]
+            self.backend.save()
             return HttpResponseRedirect(reverse(DomainSmsGatewayListView.urlname, args=[self.domain]))
         return self.get(request, *args, **kwargs)
 
@@ -1126,7 +1223,9 @@ class EditDomainGatewayView(AddDomainGatewayView):
             backend = self.backend_class.get(self.backend_id)
         except ResourceNotFound:
             raise Http404()
-        if backend.domain != self.domain:
+        if backend.is_global or backend.domain != self.domain:
+            raise Http404()
+        if backend.doc_type != self.backend_class_name:
             raise Http404()
         return backend
 
@@ -1142,6 +1241,9 @@ class EditDomainGatewayView(AddDomainGatewayView):
                 else:
                     initial[field.name] = getattr(self.backend, field.name, None)
             initial['give_other_domains_access'] = len(self.backend.authorized_domains) > 0
+            if self.use_load_balancing:
+                initial["phone_numbers"] = json.dumps(
+                    [{"phone_number": p} for p in self.backend.phone_numbers])
         if self.request.method == 'POST':
             form = form_class(self.request.POST, initial=initial,
                               button_text=self.button_text)
@@ -1218,7 +1320,6 @@ def sms_languages(request, domain):
             tdoc.save()
     context = {
         "domain": domain,
-        "always_deploy": True,
         "sms_langs": tdoc.langs,
         "bulk_upload": {
             "action": reverse("upload_sms_translations",
@@ -1330,8 +1431,8 @@ def upload_sms_translations(request, domain):
 
 
 class SMSSettingsView(BaseMessagingSectionView):
-    urlname = "sms_settings_new"
-    template_name = "sms/settings_new.html"
+    urlname = "sms_settings"
+    template_name = "sms/settings.html"
     page_title = ugettext_noop("SMS Settings")
 
     @property
@@ -1403,6 +1504,8 @@ class SMSSettingsView(BaseMessagingSectionView):
                     domain_obj.sms_case_registration_owner_id,
                 "sms_case_registration_user_id":
                     domain_obj.sms_case_registration_user_id,
+                "sms_mobile_worker_registration_enabled":
+                    enabled_disabled(domain_obj.sms_mobile_worker_registration_enabled),
             }
             form = SettingsForm(initial=initial, cchq_domain=self.domain,
                 cchq_is_previewer=self.previewer)
@@ -1437,6 +1540,8 @@ class SMSSettingsView(BaseMessagingSectionView):
                  "restricted_sms_times_json"),
                 ("sms_conversation_times",
                  "sms_conversation_times_json"),
+                ("sms_mobile_worker_registration_enabled",
+                 "sms_mobile_worker_registration_enabled"),
             ]
             if self.previewer:
                 field_map.append(
@@ -1477,58 +1582,3 @@ class SMSSettingsView(BaseMessagingSectionView):
     @method_decorator(requires_privilege_with_fallback(privileges.OUTBOUND_SMS))
     def dispatch(self, request, *args, **kwargs):
         return super(SMSSettingsView, self).dispatch(request, *args, **kwargs)
-
-
-@domain_admin_required
-@requires_privilege_with_fallback(privileges.OUTBOUND_SMS)
-def sms_settings(request, domain):
-    domain_obj = Domain.get_by_name(domain, strict=True)
-    is_previewer = request.couch_user.is_previewer()
-    if request.method == "POST":
-        form = SMSSettingsForm(request.POST, _cchq_is_previewer=is_previewer)
-        if form.is_valid():
-            domain_obj.use_default_sms_response = form.cleaned_data["use_default_sms_response"]
-            domain_obj.default_sms_response = form.cleaned_data["default_sms_response"]
-            if settings.SMS_QUEUE_ENABLED:
-                domain_obj.restricted_sms_times = form.cleaned_data["restricted_sms_times_json"]
-            if is_previewer:
-                domain_obj.custom_case_username = form.cleaned_data["custom_case_username"]
-                domain_obj.chat_message_count_threshold = form.cleaned_data["custom_message_count_threshold"]
-                domain_obj.custom_chat_template = form.cleaned_data["custom_chat_template"]
-                domain_obj.filter_surveys_from_chat = form.cleaned_data["filter_surveys_from_chat"]
-                domain_obj.show_invalid_survey_responses_in_chat = form.cleaned_data["show_invalid_survey_responses_in_chat"]
-                domain_obj.count_messages_as_read_by_anyone = form.cleaned_data["count_messages_as_read_by_anyone"]
-                domain_obj.send_to_duplicated_case_numbers = form.cleaned_data["send_to_duplicated_case_numbers"]
-                if settings.SMS_QUEUE_ENABLED:
-                    domain_obj.sms_conversation_times = form.cleaned_data["sms_conversation_times_json"]
-                    domain_obj.sms_conversation_length = int(form.cleaned_data["sms_conversation_length"])
-            domain_obj.save()
-            messages.success(request, _("Changes Saved."))
-    else:
-        initial = {
-            "use_default_sms_response" : domain_obj.use_default_sms_response,
-            "default_sms_response" : domain_obj.default_sms_response,
-            "use_custom_case_username" : domain_obj.custom_case_username is not None,
-            "custom_case_username" : domain_obj.custom_case_username,
-            "use_custom_message_count_threshold" : domain_obj.chat_message_count_threshold is not None,
-            "custom_message_count_threshold" : domain_obj.chat_message_count_threshold,
-            "use_custom_chat_template" : domain_obj.custom_chat_template is not None,
-            "custom_chat_template" : domain_obj.custom_chat_template,
-            "restricted_sms_times" : domain_obj.restricted_sms_times,
-            "sms_conversation_times" : domain_obj.sms_conversation_times,
-            "sms_conversation_length" : domain_obj.sms_conversation_length,
-            "filter_surveys_from_chat" : domain_obj.filter_surveys_from_chat,
-            "show_invalid_survey_responses_in_chat" : domain_obj.show_invalid_survey_responses_in_chat,
-            "count_messages_as_read_by_anyone" : domain_obj.count_messages_as_read_by_anyone,
-            "send_to_duplicated_case_numbers": domain_obj.send_to_duplicated_case_numbers,
-        }
-        form = SMSSettingsForm(initial=initial)
-
-    context = {
-        "domain" : domain,
-        "form" : form,
-        "is_previewer" : is_previewer,
-        "sms_queue_enabled" : settings.SMS_QUEUE_ENABLED,
-        'can_use_survey': can_use_survey_reminders(request),
-    }
-    return render(request, "sms/settings.html", context)

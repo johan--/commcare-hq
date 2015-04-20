@@ -65,7 +65,10 @@ class ToggleEditView(ToggleBaseView):
             return Toggle(slug=self.toggle_slug)
 
     def toggle_meta(self):
-        return self.toggle_map()[self.toggle_slug]
+        toggle_map = self.toggle_map()
+        if self.toggle_slug in toggle_map:
+            return toggle_map[self.toggle_slug]
+        raise Http404
 
     @property
     def page_context(self):
@@ -87,7 +90,7 @@ class ToggleEditView(ToggleBaseView):
         item_list = request.POST.get('item_list', [])
         if item_list:
             item_list = json.loads(item_list)
-            item_list = [u for u in item_list if u]
+            item_list = [u.strip() for u in item_list if u and u.strip()]
 
         affected_users = set(toggle.enabled_users) | set(item_list)
         toggle.enabled_users = item_list

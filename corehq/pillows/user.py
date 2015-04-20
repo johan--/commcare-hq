@@ -20,7 +20,6 @@ class UserPillow(AliasedElasticPillow):
     es_host = settings.ELASTICSEARCH_HOST
     es_port = settings.ELASTICSEARCH_PORT
     es_timeout = 60
-    es_index_prefix = "hqusers"
     es_alias = "hqusers"
     es_type = "user"
     es_meta = {
@@ -49,6 +48,9 @@ class UserPillow(AliasedElasticPillow):
         """
         return self.calc_mapping_hash({"es_meta": self.es_meta,
                                        "mapping": self.default_mapping})
+
+    def get_unique_id(self):
+        return USER_INDEX
 
     def get_mapping_from_type(self, doc_dict):
         """
@@ -115,8 +117,8 @@ class UnknownUsersPillow(BulkPillow):
 
     def get_fields_from_emitted_dict(self, emitted_dict):
         domain = emitted_dict['key'][1]
-        user_id = emitted_dict['value']['user_id']
-        username = emitted_dict['value']['username']
+        user_id = emitted_dict['value'].get('user_id')
+        username = emitted_dict['value'].get('username')
         xform_id = emitted_dict['id']
         return user_id, username, domain, xform_id
 

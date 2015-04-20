@@ -3,7 +3,7 @@ import copy
 import datetime
 import numbers
 import pytz
-import simplejson
+import json
 import types
 
 from django import template
@@ -16,6 +16,7 @@ from django.utils.html import escape
 from casexml.apps.case.models import CommCareCase
 from casexml.apps.stock.utils import get_current_ledger_transactions
 from corehq.apps.products.models import SQLProduct
+from couchdbkit import ResourceNotFound
 
 register = template.Library()
 
@@ -46,6 +47,7 @@ def render_case(case, options):
     from corehq.apps.hqwebapp.templatetags.proptable_tags import get_tables_as_rows, get_definition
     case = wrapped_case(case)
     timezone = options.get('timezone', pytz.utc)
+    timezone = timezone.localize(datetime.datetime.utcnow()).tzinfo
     _get_tables_as_rows = partial(get_tables_as_rows, timezone=timezone)
     display = options.get('display') or case.get_display_config()
     show_transaction_export = options.get('show_transaction_export') or False
@@ -79,7 +81,7 @@ def render_case(case, options):
     actions = case.to_json()['actions']
     actions.reverse()
 
-    the_time_is_now = datetime.datetime.now()
+    the_time_is_now = datetime.datetime.utcnow()
     tz_offset_ms = int(timezone.utcoffset(the_time_is_now).total_seconds()) * 1000
     tz_abbrev = timezone.localize(the_time_is_now).tzname()
 
@@ -107,7 +109,7 @@ def render_case(case, options):
             "style": "table"
         },
         "case": case,
-        "case_actions": mark_safe(simplejson.dumps(actions)),
+        "case_actions": mark_safe(json.dumps(actions)),
         "timezone": timezone,
         "tz_abbrev": tz_abbrev,
         "case_hierarchy_options": {
@@ -118,6 +120,7 @@ def render_case(case, options):
         "ledgers": ledgers,
         "timezone_offset": tz_offset_ms,
         "show_transaction_export": show_transaction_export,
+        "xform_api_url": reverse('single_case_forms', args=[case.domain, case._id]),
     })
 
 
@@ -291,20 +294,30 @@ def render_case_hierarchy(case, options):
         # has parent case(s)
         # todo: handle duplicates in ancestor path (bubbling up of parent-child
         # relationships)
-        parent_cases = [idx.referenced_case for idx in case.indices]
+        parent_cases = []
+        for idx in case.indices:
+            try:
+                parent_cases.append(idx.referenced_case)
+            except ResourceNotFound:
+                parent_cases.append(None)
         for parent_case in parent_cases:
-            parent_case.edit_data = {
-                'view_url': get_case_url(parent_case.case_id)
-            }
-        last_parent_id = parent_cases[-1].case_id
+            if parent_case:
+                parent_case.edit_data = {
+                    'view_url': get_case_url(parent_case.case_id)
+                }
+                last_parent_id = parent_case.case_id
+            else:
+                last_parent_id = None
 
         for c in case_list:
-            if not getattr(c, 'treetable_parent_node_id', None):
+            if not getattr(c, 'treetable_parent_node_id', None) and last_parent_id:
                 c.treetable_parent_node_id = last_parent_id
 
         case_list = parent_cases + case_list
 
     for c in case_list:
+        if not c:
+            continue
         c.columns = []
         case_dict = c.to_full_dict()
         for column in columns:

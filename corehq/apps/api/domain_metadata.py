@@ -1,18 +1,33 @@
+from datetime import datetime
+import logging
 from corehq import Domain
 from corehq.apps.accounting.models import Subscription
 from corehq.apps.api.resources import HqBaseResource
 from corehq.apps.api.resources.v0_1 import (
     CustomResourceMeta,
-    SuperuserAuthentication,
+    AdminAuthentication,
 )
 from corehq.apps.es.domains import DomainES
 
 from tastypie import fields
 from tastypie.exceptions import NotFound
+import operator
 
 
 def _get_domain(bundle):
     return bundle.obj
+
+
+def get_truth(inp, relate, cut):
+    ops = {'gt': operator.gt,
+           'lt': operator.lt,
+           'gte': operator.ge,
+           'lte': operator.le}
+    if relate not in ops:
+        return True
+    else:
+        cut_datetime = datetime.strptime(cut, '%Y-%m-%d')
+        return ops[relate](inp, cut_datetime)
 
 
 class DomainMetadataResource(HqBaseResource):
@@ -35,14 +50,18 @@ class DomainMetadataResource(HqBaseResource):
 
     def dehydrate_calculated_properties(self, bundle):
         domain = _get_domain(bundle)
-        es_data = (DomainES()
-                   .in_domains([domain.name])
-                   .run()
-                   .raw_hits[0]['_source'])
-        return {
-            raw_hit: es_data[raw_hit]
-            for raw_hit in es_data if raw_hit[:3] == 'cp_'
-        }
+        try:
+            es_data = (DomainES()
+                       .in_domains([domain.name])
+                       .run()
+                       .raw_hits[0]['_source'])
+            return {
+                raw_hit: es_data[raw_hit]
+                for raw_hit in es_data if raw_hit[:3] == 'cp_'
+            }
+        except IndexError:
+            logging.exception('Problem getting calculated properties for {}'.format(domain.name))
+            return {}
 
     def dehydrate_domain_properties(self, bundle):
         return _get_domain(bundle)._doc
@@ -57,10 +76,19 @@ class DomainMetadataResource(HqBaseResource):
         if kwargs.get('domain'):
             return [self.obj_get(bundle, **kwargs)]
         else:
-            return list(Domain.get_all())
+            filters = {}
+            if hasattr(bundle.request, 'GET'):
+                filters = bundle.request.GET
+            domains = list(Domain.get_all())
+            if filters:
+                for key, value in filters.iteritems():
+                    args = key.split('__')
+                    if args and args[0] == 'last_modified':
+                        domains = [domain for domain in domains if get_truth(domain.last_modified, args[1], value)]
+            return domains
 
     class Meta(CustomResourceMeta):
-        authentication = SuperuserAuthentication()
+        authentication = AdminAuthentication()
         list_allowed_methods = ['get']
         detail_allowed_methods = ['get']
         object_class = Domain

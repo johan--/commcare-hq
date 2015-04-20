@@ -1,8 +1,8 @@
 from django.core.urlresolvers import reverse, NoReverseMatch
-import pytz
 from corehq.apps.reports.standard.deployments import DeploymentsReport
 from corehq.apps.reports.datatables import DataTablesHeader, DataTablesColumn
-from dimagi.utils.timezones import utils as tz_utils
+from corehq.const import SERVER_DATETIME_FORMAT
+from corehq.util.timezones.conversions import ServerTime
 from couchforms.models import XFormError
 from corehq.apps.receiverwrapper.filters import SubmissionErrorType, \
     SubmissionTypeFilter
@@ -120,8 +120,8 @@ class SubmissionErrorReport(DeploymentsReport):
                     return 'unable to view form'
             
             def _fmt_date(somedate):
-                time = tz_utils.adjust_datetime_to_timezone(somedate, pytz.utc.zone, self.timezone.zone)
-                return time.strftime("%Y-%m-%d %H:%M:%S")
+                time = ServerTime(somedate).user_time(self.timezone).done()
+                return time.strftime(SERVER_DATETIME_FORMAT)
             
             return [_fmt_url(error_doc.get_id),
                     error_doc.metadata.username if error_doc.metadata else EMPTY_USER,

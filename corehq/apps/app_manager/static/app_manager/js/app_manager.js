@@ -9,6 +9,14 @@
     COMMCAREHQ.app_manager.checkCommcareVersion = function (version) {
         return COMMCAREHQ.app_manager.versionGE(COMMCAREHQ.app_manager.commcareVersion(), version);
     };
+    COMMCAREHQ.app_manager.checkAreWeThereYet = function (version) {
+        if (!COMMCAREHQ.app_manager.latestCommcareVersion()) {
+            // We don't know the latest version. Assume this version has arrived
+            return true;
+        } else {
+            return COMMCAREHQ.app_manager.versionGE(COMMCAREHQ.app_manager.latestCommcareVersion(), version);
+        }
+    };
     COMMCAREHQ.app_manager.versionGE = function (commcareVersion1, commcareVersion2) {
         function parse(version) {
             version = version.split('.');
@@ -27,9 +35,10 @@
         }
     };
     COMMCAREHQ.app_manager.init = function (args) {
-        var appVersion = args.appVersion,
-            edit = args.edit;
+        var appVersion = args.appVersion;
         COMMCAREHQ.app_manager.commcareVersion = ko.observable();
+        COMMCAREHQ.app_manager.latestCommcareVersion = ko.observable();
+        COMMCAREHQ.app_manager.latestCommcareVersion(args.latestCommcareVersion);
 
         function updateDOM(update) {
             if (update.hasOwnProperty('app-version')) {
@@ -60,32 +69,32 @@
         }
         COMMCAREHQ.resetIndexes = resetIndexes;
 
-        if (edit) {
-            (function () {
-                var $forms = $('.save-button-form');
-                $forms.each(function () {
-                    var $form = $(this),
-	                    $buttonHolder = $form.find('.save-button-holder');
-	                COMMCAREHQ.SaveButton.initForm($form, {
-	                    unsavedMessage: "You have unsaved changes",
-	                    success: function (data) {
-	                        var key;
-	                        COMMCAREHQ.app_manager.updateDOM(data.update);
-	                        for (key in data.corrections) {
-	                            if (data.corrections.hasOwnProperty(key)) {
-	                                $form.find('[name="' + key + '"]').val(data.corrections[key]);
-	                                $(document).trigger('correction', [key, data.corrections[key]]);
-	                            }
-	                        }
-                            if (data.hasOwnProperty('case_list-show')
-                                && COMMCAREHQ.app_manager.hasOwnProperty('module_view')){
+        (function () {
+            var $forms = $('.save-button-form');
+            $forms.each(function () {
+                var $form = $(this),
+                    $buttonHolder = $form.find('.save-button-holder'),
+                    button = COMMCAREHQ.SaveButton.initForm($form, {
+                        unsavedMessage: "You have unsaved changes",
+                        success: function (data) {
+                            var key;
+                            COMMCAREHQ.app_manager.updateDOM(data.update);
+                            for (key in data.corrections) {
+                                if (data.corrections.hasOwnProperty(key)) {
+                                    $form.find('[name="' + key + '"]').val(data.corrections[key]);
+                                    $(document).trigger('correction', [key, data.corrections[key]]);
+                                }
+                            }
+                            if (data.hasOwnProperty('case_list-show') &&
+                                COMMCAREHQ.app_manager.hasOwnProperty('module_view')){
                                 COMMCAREHQ.app_manager.module_view.requires_case_details(data['case_list-show']);
                             }
-	                    }
-	                }).ui.appendTo($buttonHolder);
-                });
-            }());
-        }
+                        }
+                    });
+                button.ui.appendTo($buttonHolder);
+                $buttonHolder.data('button', button);
+            });
+        }());
 
         $('#form-tabs').show();
         $('#forms').tab('show');
@@ -242,13 +251,16 @@
 
         COMMCAREHQ.app_manager.commcareVersion.subscribe(function () {
             $('.commcare-feature').each(function () {
-                var version = '' + $(this).data('since-version') || '1.1',
+                // .attr() keeps zero intact in 2.10, data() doesn't
+                var version = '' + $(this).attr('data-since-version') || '1.1',
                     upgradeMessage = $('<span class="upgrade-message"/>'),
                     area = $(this);
 
                 if (COMMCAREHQ.app_manager.checkCommcareVersion(version)) {
                     area.find('upgrade-message').remove();
                     area.find('*:not(".hide")').show();
+                } else if (!COMMCAREHQ.app_manager.checkAreWeThereYet(version)) {
+                    area.parent().hide();
                 } else {
                     area.find('*').hide();
                     upgradeMessage.append(
@@ -269,7 +281,7 @@
             });
         };
         if ($.cookie('suppress_build_errors')) {
-            $.cookie('suppress_build_errors', null, {path: '/'});
+            $.removeCookie('suppress_build_errors', { path: '/' });
         } else {
             COMMCAREHQ.app_manager.fetchAndShowFormValidation();
         }

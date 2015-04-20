@@ -56,23 +56,45 @@
 <p>
     {% if can_view_statement %}
         {% blocktrans %}
-        You can <a href="{{ statements_url }}">view the full statement</a> under
-        Subscription > Billing Statements in your Project Space Settings or by
-        visiting this link: {{ statements_url }}.
+        To view the full billing statement, log into your project space on
+        CommCareHQ and navigate to <a href="{{ statements_url }}">
+        Billing Statements</a>.
         {% endblocktrans %}
     {% else %}
         {% blocktrans %}
-        Your project's administrator can view the full statement under
-        Subscription > Billing Statements in Project Space Settings:
-        {{ statements_url }}.
+        Your project's administrator can view the full billing statement by
+        logging into your project space on CommCareHQ and navigating to
+        <a href="{{ statements_url }}">Billing Statements</a>.
         {% endblocktrans %}
     {% endif %}
 </p>
 
 <p>
     {% blocktrans %}
+    You can pay this bill by credit card or by wire:
+    <ul>
+        <li>
+            To pay by credit card, please go to your
+            <a href="{{ statements_url }}">Billing Statements</a> page, click
+            on the green "Make Payment" button in front of your unpaid
+            invoice(s), and fill in the amount you want to pay as well as your
+            credit card details.
+        </li>
+        <li>
+            To pay by wire, find Dimagi's bank account details on your invoice.
+            Please include the invoice number in your wire payment and make
+            sure to send an email to {{ accounts_email }} after you have made
+            the payment, mentioning the date of the payment, the amount, the
+            invoice number, and the project space.
+        </li>
+    </ul>
+    {% endblocktrans %}
+</p>
+
+<p>
+    {% blocktrans %}
     Thank you for using {{ plan_name }}. If you have any questions, please don't
-    hesitate to contact accounts@dimagi.com.
+    hesitate to contact {{ invoicing_contact_email }}.
     {% endblocktrans %}
 </p>
 
@@ -88,6 +110,6 @@
     {% blocktrans %}
     Statement From:
     CommCare HQ and the corporation Dimagi, Inc.
-    585 Massachusetts Ave, Ste 3, Cambridge, MA 02139 USA
+    585 Massachusetts Ave, Ste 4, Cambridge, MA 02139 USA
     {% endblocktrans %}
 </p>

@@ -1,10 +1,13 @@
 from corehq.apps.commtrack.models import StockState
 from corehq.apps.locations.models import SQLLocation
 from corehq.apps.reports.datatables import DataTablesHeader, DataTablesColumn
-from corehq.apps.reports.filters.fixtures import AsyncLocationFilter
+from corehq.apps.sms.models import SMSLog
 from corehq.apps.users.models import CommCareUser
+from corehq.util.timezones.conversions import ServerTime
+from corehq.const import SERVER_DATETIME_FORMAT_NO_SEC
+from custom.ilsgateway.models import SupplyPointStatusTypes, ILSNotes
 from custom.ilsgateway.tanzania import ILSData, MultiReport
-from custom.ilsgateway.tanzania.reports.utils import decimal_format, float_format
+from custom.ilsgateway.tanzania.reports.utils import decimal_format, float_format, latest_status
 from dimagi.utils.decorators.memoized import memoized
 from django.utils.translation import ugettext as _
 
@@ -15,6 +18,7 @@ class InventoryHistoryData(ILSData):
     slug = 'inventory_history'
     show_chart = False
     show_table = True
+    default_rows = 100
 
     @property
     def headers(self):
@@ -30,7 +34,9 @@ class InventoryHistoryData(ILSData):
         rows = []
         if self.config['location_id']:
             sp = SQLLocation.objects.get(location_id=self.config['location_id']).supply_point_id
-            ss = StockState.objects.filter(sql_product__is_archived=False, case_id=sp)
+            ss = StockState.objects.filter(sql_product__is_archived=False,
+                                           case_id=sp,
+                                           product_id__in=self.config['products'])
             for stock in ss:
                 def calculate_months_remaining(stock_state, quantity):
                     consumption = stock_state.get_monthly_consumption()
@@ -67,26 +73,135 @@ class RegistrationData(ILSData):
 
     @property
     def rows(self):
-        users_in_domain = CommCareUser.by_domain(domain=self.config['domain'])
         location = SQLLocation.objects.get(location_id=self.config['location_id'])
         if self.config['loc_type'] == 'DISTRICT':
             location = location.parent
         elif self.config['loc_type'] == 'REGION':
             location = location.parent.parent
 
-        users = [user for user in users_in_domain if user.get_domain_membership(self.config['domain']).location_id
-                 == location.location_id]
+        users = CommCareUser.get_db().view(
+            'locations/users_by_location_id',
+            startkey=[location.location_id],
+            endkey=[location.location_id, {}],
+            include_docs=True
+        ).all()
         if users:
-            return [[u.full_name, u.user_data['role'], u.phone_number, u.email] for u in users]
+            for user in users:
+                u = user['doc']
+                yield [
+                    '{0} {1}'.format(u['first_name'], u['last_name']),
+                    u['user_data']['role'] if 'role' in u['user_data'] else 'No Role',
+                    u['phone_numbers'][0] if u['phone_numbers'] else '',
+                    u['email']
+                ]
+
+
+class RandRHistory(ILSData):
+    slug = 'randr_history'
+    title = 'R & R History'
+    show_chart = False
+    show_table = True
+
+    @property
+    def rows(self):
+        return latest_status(self.config['location_id'], SupplyPointStatusTypes.R_AND_R_FACILITY)
+
+
+class Notes(ILSData):
+    slug = 'ils_notes'
+    title = 'Notes'
+    show_chart = False
+    show_table = True
+
+    @property
+    def headers(self):
+        return DataTablesHeader(*[
+            DataTablesColumn(_('Name')),
+            DataTablesColumn(_('Role')),
+            DataTablesColumn(_('Date')),
+            DataTablesColumn(_('Phone')),
+            DataTablesColumn(_('Text'))
+        ])
+
+    @property
+    def rows(self):
+        location = SQLLocation.objects.get(location_id=self.config['location_id'])
+        rows = ILSNotes.objects.filter(domain=self.config['domain'], location=location).order_by('date')
+        for row in rows:
+            yield [
+                row.user_name,
+                row.user_role,
+                row.date.strftime(SERVER_DATETIME_FORMAT_NO_SEC),
+                row.user_phone,
+                row.text
+            ]
+
+
+def _fmt_timestamp(timestamp):
+    return dict(
+        sort_key=timestamp,
+        html=timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def _fmt(val):
+    if val is None:
+        val = '-'
+    return dict(sort_key=val, html=val)
+
+
+class RecentMessages(ILSData):
+    slug = 'recent_messages'
+    title = 'Recent messages'
+    show_chart = False
+    show_table = True
+    default_rows = 5
+
+    @property
+    def headers(self):
+        return DataTablesHeader(*[
+            DataTablesColumn('Date'),
+            DataTablesColumn('Direction'),
+            DataTablesColumn('Text')
+        ])
+
+    @property
+    def rows(self):
+        data = SMSLog.by_domain_date(self.config['domain'])
+        messages = []
+        location_id = self.config['location_id']
+        for message in data:
+            if message.location_id != location_id:
+                continue
+
+            timestamp = ServerTime(message.date).user_time(self.config['timezone']).done()
+            messages.append([
+                _fmt_timestamp(timestamp),
+                _fmt(message.direction),
+                _fmt(message.text),
+            ])
+        return sorted(messages, key=lambda x: x[0]['sort_key']) if messages else messages
 
 
 class FacilityDetailsReport(MultiReport):
 
-    title = "Facility Details Report"
-    fields = [AsyncLocationFilter]
+    fields = []
+    hide_filters = True
     name = "Facility Details"
     slug = 'facility_details'
     use_datatables = True
+
+    @property
+    def title(self):
+        if self.location and self.location.location_type.name.upper() == 'FACILITY':
+            return "{0} ({1}) Group {2}".format(self.location.name,
+                                                self.location.site_code,
+                                                self.location.metadata.get('group', '---'))
+        return 'Facility Details Report'
+
+    @classmethod
+    def show_in_navigation(cls, domain=None, project=None, user=None):
+        return False
 
     @property
     @memoized
@@ -94,7 +209,10 @@ class FacilityDetailsReport(MultiReport):
         config = self.report_config
 
         return [
-            InventoryHistoryData(config=config, css_class='row_chart_all'),
+            InventoryHistoryData(config=config),
+            RandRHistory(config=config),
+            Notes(config=config),
+            RecentMessages(config=config),
             RegistrationData(config=dict(loc_type='FACILITY', **config), css_class='row_chart_all'),
             RegistrationData(config=dict(loc_type='DISTRICT', **config), css_class='row_chart_all'),
             RegistrationData(config=dict(loc_type='REGION', **config), css_class='row_chart_all')

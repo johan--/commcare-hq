@@ -1,12 +1,12 @@
 import logging
+from couchdbkit import ResourceNotFound
 from couchdbkit.ext.django.loading import get_db
 from django.http import (
     HttpResponseBadRequest,
     HttpResponseForbidden,
 )
-from casexml.apps.case import get_case_updates
 from casexml.apps.case.models import CommCareCase
-from casexml.apps.case.xform import is_device_report
+from casexml.apps.case.xform import get_case_updates, is_device_report
 from corehq.apps.domain.decorators import login_or_digest_ex, login_or_basic_ex
 from corehq.apps.receiverwrapper.auth import (
     AuthContext,
@@ -62,10 +62,15 @@ def _process_form(request, domain, app_id, user_id, authenticated,
 @csrf_exempt
 @require_POST
 def post(request, domain, app_id=None):
-    if domain_requires_auth(domain):
-        # "redirect" to the secure version
-        # an actual redirect doesn't work because it becomes a GET
-        return secure_post(request, domain, app_id)
+    try:
+        if domain_requires_auth(domain):
+            # "redirect" to the secure version
+            # an actual redirect doesn't work because it becomes a GET
+            return secure_post(request, domain, app_id)
+    except ResourceNotFound:
+        return HttpResponseBadRequest(
+            'No domain with name %s' % domain
+        )
     return _process_form(
         request=request,
         domain=domain,

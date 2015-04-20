@@ -6,13 +6,12 @@ from datetime import datetime
 import hashlib
 from couchdbkit.exceptions import ResourceConflict
 from couchdbkit.ext.django.schema import *
-from couchdbkit.schema import LazyDict
+from corehq.apps.app_manager.exceptions import XFormException
 from dimagi.utils.couch.resource_conflict import retry_resource
 from django.contrib import messages
 from django.core.urlresolvers import reverse
 import magic
 from corehq.apps.app_manager.xform import XFormValidationError
-from couchforms.models import XFormError
 from dimagi.utils.decorators.memoized import memoized
 from corehq.apps.domain.models import LICENSES, LICENSE_LINKS
 from dimagi.utils.couch.database import get_db, SafeSaveDocument, get_safe_read_kwargs, iter_docs
@@ -485,7 +484,7 @@ class ApplicationMediaReference(object):
     def _get_name(self, raw_name, lang=None):
         if not raw_name:
             return ""
-        if not isinstance(raw_name, dict) or not isinstance(raw_name, LazyDict):
+        if not isinstance(raw_name, dict):
             return raw_name
         if lang is None:
             lang = self.app_lang
@@ -506,6 +505,9 @@ class HQMediaMixin(Document):
 
     # keys are the paths to each file in the final application media zip
     multimedia_map = SchemaDictProperty(HQMediaMapItem)
+
+    # paths to custom logos
+    logo_refs = DictProperty()
 
     @property
     @memoized
@@ -535,6 +537,18 @@ class HQMediaMixin(Document):
                 'app_lang': self.default_language,
             }
             _add_menu_media(module, **media_kwargs)
+            if module.case_list_form.form_id:
+                media.append(ApplicationMediaReference(
+                    module.case_list_form.media_audio,
+                    media_class=CommCareAudio,
+                    **media_kwargs)
+                )
+                media.append(ApplicationMediaReference(
+                    module.case_list_form.media_image,
+                    media_class=CommCareImage,
+                    **media_kwargs)
+                )
+
             for f_order, f in enumerate(module.get_forms()):
                 media_kwargs['form_name'] = f.name
                 media_kwargs['form_id'] = f.unique_id
@@ -554,35 +568,44 @@ class HQMediaMixin(Document):
                     for video in parsed.video_references:
                         if video:
                             media.append(ApplicationMediaReference(video, media_class=CommCareVideo, **media_kwargs))
-                except (XFormValidationError, XFormError):
+                except (XFormValidationError, XFormException):
                     self.media_form_errors = True
         return media
 
-    def get_menu_media(self, module, module_index, form=None, form_index=None,
-                       as_json=False):
+    def get_menu_media(self, module, module_index, form=None, form_index=None):
+        if not module:
+            # user_registration isn't a real module, for instance
+            return {}
         media_kwargs = self.get_media_ref_kwargs(
             module, module_index, form=form, form_index=form_index,
             is_menu_media=True)
-        menu_media = {}
         item = form or module
-        if item.media_image or as_json:
-            image_ref = ApplicationMediaReference(
-                item.media_image,
-                media_class=CommCareImage,
-                **media_kwargs
-            )
-            if as_json:
-                image_ref = image_ref.as_dict()
-            menu_media['image'] = image_ref
-        if item.media_audio or as_json:
-            audio_ref = ApplicationMediaReference(
-                item.media_audio,
-                media_class=CommCareAudio,
-                **media_kwargs
-            )
-            if as_json:
-                audio_ref = audio_ref.as_dict()
-            menu_media['audio'] = audio_ref
+        return self._get_item_media(item, media_kwargs)
+
+    def get_case_list_form_media(self, module, module_index):
+        if not module:
+            # user_registration isn't a real module, for instance
+            return {}
+        media_kwargs = self.get_media_ref_kwargs(module, module_index)
+        return self._get_item_media(module.case_list_form, media_kwargs)
+
+    def _get_item_media(self, item, media_kwargs):
+        menu_media = {}
+        image_ref = ApplicationMediaReference(
+            item.media_image,
+            media_class=CommCareImage,
+            **media_kwargs
+        )
+        image_ref = image_ref.as_dict()
+        menu_media['image'] = image_ref
+
+        audio_ref = ApplicationMediaReference(
+            item.media_audio,
+            media_class=CommCareAudio,
+            **media_kwargs
+        )
+        audio_ref = audio_ref.as_dict()
+        menu_media['audio'] = audio_ref
         return menu_media
 
     @property
@@ -606,6 +629,11 @@ class HQMediaMixin(Document):
             'is_menu_media': is_menu_media,
         }
 
+    @property
+    @memoized
+    def logo_paths(self):
+        return set(value['path'] for value in self.logo_refs.values())
+
     def remove_unused_mappings(self):
         """
             This checks to see if the paths specified in the multimedia map still exist in the Application.
@@ -613,14 +641,15 @@ class HQMediaMixin(Document):
         """
         map_changed = False
         paths = self.multimedia_map.keys() if self.multimedia_map else []
+        permitted_paths = self.all_media_paths | self.logo_paths
         for path in paths:
-            if path not in self.all_media_paths:
+            if path not in permitted_paths:
                 map_changed = True
                 del self.multimedia_map[path]
         if map_changed:
             self.save()
 
-    def create_mapping(self, multimedia, form_path):
+    def create_mapping(self, multimedia, form_path, save=True):
         """
             This creates the mapping of a path to the multimedia in an application to the media object stored in couch.
         """
@@ -631,12 +660,13 @@ class HQMediaMixin(Document):
         map_item.media_type = multimedia.doc_type
         self.multimedia_map[form_path] = map_item
 
-        try:
-            self.save()
-        except ResourceConflict:
-            # Attempt to fetch the document again.
-            updated_doc = self.get(self._id)
-            updated_doc.create_mapping(multimedia, form_path)
+        if save:
+            try:
+                self.save()
+            except ResourceConflict:
+                # Attempt to fetch the document again.
+                updated_doc = self.get(self._id)
+                updated_doc.create_mapping(multimedia, form_path)
 
     def get_media_objects(self):
         """

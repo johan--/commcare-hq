@@ -3,11 +3,23 @@ This isn't really a parser, but it's the code that generates case-like
 objects from things from xforms.
 """
 import os
+import datetime
 
 from casexml.apps.case import const
+from casexml.apps.case.models import CommCareCaseAction
 from casexml.apps.case.xml import DEFAULT_VERSION, V1, V2, NS_REVERSE_LOOKUP_MAP
+from dimagi.utils.parsing import string_to_datetime
+
 
 XMLNS_ATTR = "@xmlns"
+KNOWN_PROPERTIES = {
+    'name': '',
+    'external_id': '',
+    'type': '',
+    'owner_id': '',
+    'opened_on': None,
+    'user_id': '',
+}
 
 
 def get_version(case_block):
@@ -55,11 +67,9 @@ class CaseActionBase(object):
         self.attachments = attachments or {}
     
     def get_known_properties(self):
-        prop_list = ["type", "name", "external_id", "user_id",
-                     "owner_id", "opened_on"]
-        return dict((p, getattr(self, p)) for p in prop_list \
+        return dict((p, getattr(self, p)) for p in KNOWN_PROPERTIES.keys()
                     if getattr(self, p) is not None)
-    
+
     @classmethod
     def _from_block_and_mapping(cls, block, mapping):
         def _normalize(val):
@@ -102,7 +112,15 @@ class CaseActionBase(object):
                    const.CASE_TAG_OWNER_ID: "owner_id",
                    const.CASE_TAG_DATE_OPENED: "opened_on"}
         return cls._from_block_and_mapping(block, mapping)
-        
+
+class CaseNoopAction(CaseActionBase):
+    """
+    Form completed against case without updating any properties (empty case block)
+    """
+    action_type_slug = const.CASE_ACTION_UPDATE
+
+    def get_known_properties(self):
+        return {}
 
 class CaseCreateAction(CaseActionBase):
     action_type_slug = const.CASE_ACTION_CREATE
@@ -210,6 +228,7 @@ class CaseIndexAction(CaseActionBase):
             indices.append(CaseIndex(id, data["@case_type"], data.get("#text", "")))
         return cls(block, indices)
     
+
 class CaseUpdate(object):
     """
     A temporary model that parses the data from the form consistently.
@@ -231,7 +250,7 @@ class CaseUpdate(object):
         self.index_block = block.get(const.CASE_ACTION_INDEX, {})
         self.attachment_block = block.get(const.CASE_ACTION_ATTACHMENT, {})
 
-        # referrals? really?
+        # referrals? really? really???
         self.referral_block = block.get(const.REFERRAL_TAG, {})
         
         # actions
@@ -247,7 +266,15 @@ class CaseUpdate(object):
         if self.has_attachments():
             self.actions.append(ATTACHMENT_ACTION_FUNCTION_MAP[self.version](self.attachment_block))
 
-    
+        if not self.actions:
+            self.actions.append(NOOP_ACTION_FUNCTION_MAP[self.version](self.raw_block))
+
+    def guess_modified_on(self):
+        """
+        Guess the modified date, defaulting to the current time in UTC.
+        """
+        return string_to_datetime(self.modified_on_str) if self.modified_on_str else datetime.utcnow()
+
     def creates_case(self):
         # creates have to have actual data in them so this is fine
         return bool(self.create_block)    
@@ -269,6 +296,17 @@ class CaseUpdate(object):
     def has_attachments(self):
         return bool(self.attachment_block)
 
+    def get_case_actions(self, xformdoc):
+        """
+        Gets case actions from this object. These are the actual objects that get stored
+        in the CommCareCase model (as opposed to the parser's representation of those)
+        """
+        return [
+            CommCareCaseAction.from_parsed_action(
+                self.guess_modified_on(), self.user_id, xformdoc, action
+            )
+            for action in self.actions
+        ]
 
     def __str__(self):
         return "%s: %s" % (self.version, self.id)
@@ -317,7 +355,7 @@ class CaseUpdate(object):
     def from_v2(cls, case_block):
         """
         Gets a case update from a version 2 case. 
-        Spec: https://bitbucket.org/commcare/commcare/wiki/casexml20
+        Spec: https://github.com/dimagi/commcare/wiki/casexml20
         """
         
         def _to_attr(val):
@@ -343,6 +381,11 @@ class CaseUpdate(object):
 VERSION_FUNCTION_MAP = {
     V1: CaseUpdate.from_v1,
     V2: CaseUpdate.from_v2
+}
+
+NOOP_ACTION_FUNCTION_MAP = {
+    V1: CaseNoopAction.from_v1,
+    V2: CaseNoopAction.from_v2
 }
 
 CREATE_ACTION_FUNCTION_MAP = {

@@ -15,6 +15,7 @@ from django.core.urlresolvers import reverse
 from django.utils.safestring import mark_safe
 from corehq.apps.reports.generic import GenericTabularReport
 from corehq.apps.reports.util import format_datatables_data
+from corehq.const import USER_DATE_FORMAT
 from couchexport.models import Format
 
 
@@ -37,11 +38,10 @@ class AddItemInterface(GenericTabularReport):
 
 class AccountingInterface(AddItemInterface):
     section_name = "Accounting"
+    name = "Billing Accounts"
+    description = "List of all billing accounts"
+    slug = "accounts"
     dispatcher = AccountingAdminInterfaceDispatcher
-
-    item_name = "Billing Account"
-
-    crud_form_update_url = "/accounting/form/"
 
     fields = ['corehq.apps.accounting.interface.DateCreatedFilter',
               'corehq.apps.accounting.interface.NameFilter',
@@ -49,8 +49,11 @@ class AccountingInterface(AddItemInterface):
               'corehq.apps.accounting.interface.AccountTypeFilter',
               'corehq.apps.accounting.interface.ActiveStatusFilter',
               'corehq.apps.accounting.interface.DimagiContactFilter',
+              'corehq.apps.accounting.interface.EntryPointFilter',
               ]
     hide_filters = False
+
+    item_name = "Billing Account"
 
     def validate_document_class(self):
         return True
@@ -69,6 +72,7 @@ class AccountingInterface(AddItemInterface):
             DataTablesColumn("Account Type"),
             DataTablesColumn("Active Status"),
             DataTablesColumn("Dimagi Contact"),
+            DataTablesColumn("Entry Point"),
         )
 
     @property
@@ -106,6 +110,11 @@ class AccountingInterface(AddItemInterface):
             filters.update(
                 dimagi_contact=dimagi_contact,
             )
+        entry_point = EntryPointFilter.get_value(self.request, self.domain)
+        if entry_point is not None:
+            filters.update(
+                entry_point=entry_point,
+            )
 
         for account in BillingAccount.objects.filter(**filters):
             rows.append([
@@ -115,6 +124,7 @@ class AccountingInterface(AddItemInterface):
                 account.account_type,
                 "Active" if account.is_active else "Inactive",
                 account.dimagi_contact,
+                account.entry_point,
             ])
         return rows
 
@@ -126,20 +136,13 @@ class AccountingInterface(AddItemInterface):
         )
         return context
 
-    name = "Billing Accounts"
-    description = "List of all billing accounts"
-    slug = "accounts"
-
-    crud_item_type = "Billing Account"
-
 
 class SubscriptionInterface(AddItemInterface):
     section_name = "Accounting"
+    name = "Subscriptions"
+    description = "List of all subscriptions"
+    slug = "subscriptions"
     dispatcher = AccountingAdminInterfaceDispatcher
-
-    item_name = "Subscription"
-
-    crud_form_update_url = "/accounting/form/"
 
     fields = [
         'corehq.apps.accounting.interface.StartDateFilter',
@@ -151,8 +154,12 @@ class SubscriptionInterface(AddItemInterface):
         'corehq.apps.accounting.interface.DoNotInvoiceFilter',
         'corehq.apps.accounting.interface.CreatedSubAdjMethodFilter',
         'corehq.apps.accounting.interface.TrialStatusFilter',
+        'corehq.apps.accounting.interface.SubscriptionTypeFilter',
+        'corehq.apps.accounting.interface.ProBonoStatusFilter',
     ]
     hide_filters = False
+
+    item_name = "Subscription"
 
     def validate_document_class(self):
         return True
@@ -174,6 +181,8 @@ class SubscriptionInterface(AddItemInterface):
             DataTablesColumn("End Date"),
             DataTablesColumn("Do Not Invoice"),
             DataTablesColumn("Created By"),
+            DataTablesColumn("Type"),
+            DataTablesColumn("Pro-Bono"),
         )
         if not self.is_rendered_as_email:
             header.add_column(DataTablesColumn("Action"))
@@ -236,6 +245,18 @@ class SubscriptionInterface(AddItemInterface):
             is_trial = trial_status_filter == TrialStatusFilter.TRIAL
             filters.update(is_trial=is_trial)
 
+        service_type = SubscriptionTypeFilter.get_value(self.request, self.domain)
+        if service_type is not None:
+            filters.update(
+                service_type=service_type,
+            )
+
+        pro_bono_status = ProBonoStatusFilter.get_value(self.request, self.domain)
+        if pro_bono_status is not None:
+            filters.update(
+                pro_bono_status=pro_bono_status,
+            )
+
         for subscription in Subscription.objects.filter(**filters):
             try:
                 created_by_adj = SubscriptionAdjustment.objects.filter(
@@ -261,6 +282,8 @@ class SubscriptionInterface(AddItemInterface):
                 subscription.date_end,
                 subscription.do_not_invoice,
                 created_by,
+                subscription.service_type,
+                subscription.pro_bono_status,
             ]
             if not self.is_rendered_as_email:
                 columns.append(mark_safe('<a href="./%d" class="btn">Edit</a>' % subscription.id))
@@ -276,20 +299,13 @@ class SubscriptionInterface(AddItemInterface):
         )
         return context
 
-    name = "Subscriptions"
-    description = "List of all subscriptions"
-    slug = "subscriptions"
-
-    crud_item_type = "Subscription"
-
 
 class SoftwarePlanInterface(AddItemInterface):
     section_name = "Accounting"
+    name = "Software Plans"
+    description = "List of all software plans"
+    slug = "software_plans"
     dispatcher = AccountingAdminInterfaceDispatcher
-
-    item_name = "Software Plan"
-
-    crud_form_update_url = "/accounting/form/"
 
     fields = [
         'corehq.apps.accounting.interface.SoftwarePlanNameFilter',
@@ -297,6 +313,8 @@ class SoftwarePlanInterface(AddItemInterface):
         'corehq.apps.accounting.interface.SoftwarePlanVisibilityFilter',
     ]
     hide_filters = False
+
+    item_name = "Software Plan"
 
     def validate_document_class(self):
         return True
@@ -357,12 +375,6 @@ class SoftwarePlanInterface(AddItemInterface):
         )
         return context
 
-    name = "Software Plans"
-    description = "List of all software plans"
-    slug = "software_plans"
-
-    crud_item_type = "Software_Plan"
-
 
 def get_exportable_column(amount):
     return format_datatables_data(
@@ -419,6 +431,7 @@ class InvoiceInterface(GenericTabularReport):
     @property
     def headers(self):
         header = DataTablesHeader(
+            DataTablesColumn("Invoice #"),
             DataTablesColumn("Account Name (Fogbugz Client Name)"),
             DataTablesColumn("Subscription"),
             DataTablesColumn("Project Space"),
@@ -475,6 +488,7 @@ class InvoiceInterface(GenericTabularReport):
                 contact_info = BillingContactInfo()
 
             columns = [
+                invoice.invoice_number,
                 format_datatables_data(
                     mark_safe(
                         '<a href="%(account_url)s">%(name)s</a>' % {
@@ -513,9 +527,9 @@ class InvoiceInterface(GenericTabularReport):
                 contact_info.country,
                 invoice.subscription.account.salesforce_account_id or "--",
                 invoice.subscription.salesforce_contract_id or "--",
-                invoice.date_start.strftime("%d %B %Y"),
-                invoice.date_end.strftime("%d %B %Y"),
-                invoice.date_due.strftime("%d %B %Y"),
+                invoice.date_start.strftime(USER_DATE_FORMAT),
+                invoice.date_end.strftime(USER_DATE_FORMAT),
+                invoice.date_due.strftime(USER_DATE_FORMAT),
             ]
 
             plan_subtotal, plan_deduction = get_subtotal_and_deduction(
@@ -540,7 +554,7 @@ class InvoiceInterface(GenericTabularReport):
                 get_exportable_column(invoice.subtotal),
                 get_exportable_column(invoice.applied_credit),
                 get_exportable_column(invoice.balance),
-                "Paid" if invoice.date_paid else "Not paid",
+                "Paid" if invoice.is_paid else "Not paid",
                 "YES" if invoice.is_hidden else "no",
             ])
 
@@ -643,6 +657,8 @@ class InvoiceInterface(GenericTabularReport):
                 is_hidden=(is_hidden == IsHiddenFilter.IS_HIDDEN),
             )
 
+        filters.update(is_hidden_to_ops=False)
+
         return filters
 
     @property
@@ -658,9 +674,10 @@ class InvoiceInterface(GenericTabularReport):
     @property
     def report_context(self):
         context = super(InvoiceInterface, self).report_context
-        context.update(
-            adjust_balance_forms=self.adjust_balance_forms,
-        )
+        if self.request.GET.items():  # A performance improvement
+            context.update(
+                adjust_balance_forms=self.adjust_balance_forms,
+            )
         return context
 
     @property
@@ -672,7 +689,7 @@ class InvoiceInterface(GenericTabularReport):
         )
 
     @property
-    @request_cache("default")
+    @request_cache()
     def view_response(self):
         if self.request.method == 'POST':
             if self.adjust_balance_form.is_valid():
@@ -759,7 +776,7 @@ class PaymentRecordInterface(GenericTabularReport):
         for record in self.payment_records:
             rows.append([
                 format_datatables_data(
-                    text=record.date_created.strftime("%B %m %Y"),
+                    text=record.date_created.strftime(USER_DATE_FORMAT),
                     sort_key=record.date_created.isoformat(),
                 ),
                 record.payment_method.account.name,

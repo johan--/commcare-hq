@@ -157,6 +157,13 @@ class FormattedDetailColumn(object):
             sort.order = self.order
             sort.direction = self.sort_element.direction
 
+            # Flag field as index by making order "-2"
+            # this is for the CACHE_AND_INDEX toggle
+            # (I know, I know, it's hacky - blame Clayton)
+            if sort.type == 'index':
+                sort.type = 'string'
+                sort.order = -2
+
         return sort
 
     @property
@@ -273,7 +280,7 @@ class Enum(FormattedDetailColumn):
         if type == 'sort':
             xpath_fragment_template = u"if({xpath} = '{key}', {i}, "
         elif type == 'display':
-            xpath_fragment_template = u"if({xpath} = '{key}', $k{key}, "
+            xpath_fragment_template = u"if({xpath} = '{key}', ${key_as_var}, "
         else:
             raise ValueError('type must be in sort, display')
 
@@ -282,6 +289,7 @@ class Enum(FormattedDetailColumn):
             parts.append(
                 xpath_fragment_template.format(
                     key=item.key,
+                    key_as_var=item.key_as_variable,
                     xpath=self.xpath,
                     i=i,
                 )
@@ -302,11 +310,9 @@ class Enum(FormattedDetailColumn):
     def variables(self):
         variables = {}
         for item in self.column.enum:
-            v_key = u"k{key}".format(key=item.key)
-            v_val= self.id_strings.detail_column_enum_variable(self.module,
-                                                               self.detail_type,
-                                                               self.column,
-                                                               item.key)
+            v_key = item.key_as_variable
+            v_val = self.id_strings.detail_column_enum_variable(
+                self.module, self.detail_type, self.column, v_key)
             variables[v_key] = v_val
         return variables
 

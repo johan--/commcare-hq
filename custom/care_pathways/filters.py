@@ -92,30 +92,47 @@ class GenderFilter(BaseSingleOptionFilter):
     slug = "gender"
     label = "Gender"
     default_text = "Any"
+    template = "care_pathways/filters/single_option_with_helper.html"
+    help_text = "Group composition of members"
 
     @property
     def options(self):
         return [('2', 'All Women'), ('1', 'Some Women'), ('0', 'No Women')]
+
+    @property
+    @memoized
+    def selected(self):
+        return self.get_value(self.request, self.domain) or "2" if self.domain == 'pathways-india-mis' else ''
 
 
 class GroupLeadershipFilter(BaseSingleOptionFilter):
     slug = "group_leadership"
     label = "Group Leadership"
     default_text = "Any"
+    template = "care_pathways/filters/single_option_with_helper.html"
+    help_text = "Group leaders gender composition"
 
     @property
     def options(self):
         return [('2', 'All Women'), ('1', 'Some Women'), ('0', 'No Women')]
+
+    @property
+    @memoized
+    def selected(self):
+        return self.get_value(self.request, self.domain) or "2" if self.domain == 'pathways-india-mis' else ''
 
 
 class CBTNameFilter(BaseSingleOptionFilter):
     slug = 'cbt_name'
     label = ugettext_noop('CBT Name')
     default_text = "All"
+    template = "care_pathways/filters/single_option_with_helper.html"
+    help_text = "Community Based Trainer"
 
     @property
     def options(self):
-        return [(user._id, user.username) for user in CommCareUser.by_domain(self.domain)]
+        return [(user._id, user.username[:user.username.index('@')]) for user in
+                CommCareUser.by_domain(self.domain)]
 
 
 class ScheduleFilter(CareBaseDrilldownOptionFilter):
@@ -175,12 +192,6 @@ class TypeFilter(CareBaseDrilldownOptionFilter):
             'slug': slug,
             'value': val,
         }
-
-
-class TypeFilterWithoutPractices(TypeFilter):
-    @classmethod
-    def get_labels(cls):
-        return [('Value Chain', 'Any', 'value_chain'), ('Domain', '', 'domain')]
 
 
 class GroupByFilter(BaseSingleOptionFilter):

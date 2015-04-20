@@ -1,11 +1,14 @@
-from django.conf.urls.defaults import *
+from django.conf.urls import *
 
 from corehq.apps.domain.utils import grandfathered_domain_re
 
 from .views import (DefaultProjectUserSettingsView, EditWebUserView,
-    EditMyAccountDomainView, ListWebUsersView, InviteWebUserView)
+    EditMyAccountDomainView, ListWebUsersView, InviteWebUserView,
+    NewListWebUsersView,
+)
 from .views.mobile.custom_data_fields import UserFieldsView
-from .views.mobile.groups import EditGroupsView, EditGroupMembersView
+from .views.mobile.groups import (EditGroupsView, EditGroupMembersView,
+    BulkSMSVerificationView)
 from .views.mobile.users import (UploadCommCareUsers, EditCommCareUserView,
     ListCommCareUsersView, AsyncListCommCareUsersView, CreateCommCareUserView,
     ConfirmBillingAccountForExtraUsersView, UserUploadStatusView)
@@ -36,6 +39,8 @@ urlpatterns = patterns('corehq.apps.users.views',
     url(r'^web/delete_invitation/$', 'delete_invitation', name='delete_invitation'),
     url(r'^web/location_restriction_for_users/$', 'location_restriction_for_users', name='location_restriction_for_users'),
     url(r'^web/$', ListWebUsersView.as_view(), name=ListWebUsersView.urlname),
+    url(r'^web_new/$', NewListWebUsersView.as_view(),
+        name=NewListWebUsersView.urlname),
     url(r'^join/(?P<invitation_id>[\w-]+)/$', 'accept_invitation', name='domain_accept_invitation'),
     url(r'^web/role/save/$', 'post_user_role', name='post_user_role'),
     url(r'^web/role/delete/$', 'delete_user_role', name='delete_user_role'),
@@ -62,11 +67,14 @@ patterns("corehq.apps.users.views.mobile.users",
         'user_upload_job_poll', name='user_upload_job_poll'),
     url(r'^commcare/download/$', 'download_commcare_users', name='download_commcare_users'),
     url(r'^commcare/set_group/$', 'set_commcare_user_group', name='set_commcare_user_group'),
-    url(r'^commcare/add_commcare_account/$', CreateCommCareUserView.as_view(), name=CreateCommCareUserView.urlname),
+    url(r'^commcare/add_commcare_account/$', CreateCommCareUserView.as_view(),
+        name=CreateCommCareUserView.urlname),
     url(r'^commcare/confirm_charges/$', ConfirmBillingAccountForExtraUsersView.as_view(),
         name=ConfirmBillingAccountForExtraUsersView.urlname),
 ) +\
 patterns("corehq.apps.users.views.mobile.groups",
     url(r'^groups/$', EditGroupsView.as_view(), name=EditGroupsView.urlname),
     url(r'^groups/(?P<group_id>[ \w-]+)/$', EditGroupMembersView.as_view(), name=EditGroupMembersView.urlname),
+    url(r'^groups/sms_verification/(?P<group_id>[ \w-]+)$', BulkSMSVerificationView.as_view(),
+        name=BulkSMSVerificationView.urlname),
 )

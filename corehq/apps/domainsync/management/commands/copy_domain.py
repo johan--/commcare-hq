@@ -1,11 +1,13 @@
 from multiprocessing import Process, Queue
 import sys
 import os
+from couchdbkit import ResourceNotFound
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from casexml.apps.stock.models import StockTransaction, StockReport, DocDomainMapping
 from corehq.apps.domain.models import Domain
 from corehq.apps.domainsync.management.commands.copy_utils import copy_postgres_data_for_docs
+from corehq.util.dates import iso_string_to_date
 from dimagi.utils.couch.database import get_db, iter_docs
 from corehq.apps.domainsync.config import DocumentTransform, save
 from couchdbkit.client import Database
@@ -14,6 +16,7 @@ from datetime import datetime
 
 # doctypes we want to be careful not to copy, which must be explicitly
 # specified with --include
+from dimagi.utils.parsing import json_format_date
 
 DEFAULT_EXCLUDE_TYPES = [
     'ReportNotification',
@@ -87,7 +90,7 @@ class Command(BaseCommand):
         simulate = options['simulate']
         exclude_attachments = options['exclude_attachments']
 
-        since = datetime.strptime(options['since'], '%Y-%m-%d').isoformat() if options['since'] else None
+        since = json_format_date(iso_string_to_date(options['since'])) if options['since'] else None
 
         if options['list_types']:
             self.list_types(sourcedb, domain, since)
@@ -101,8 +104,11 @@ class Command(BaseCommand):
 
         self.targetdb = get_db()
 
+        try:
+            domain_doc = Domain.get_by_name(domain)
+        except ResourceNotFound:
+            domain_doc = None
 
-        domain_doc = Domain.get_by_name(domain)
         if domain_doc is None:
             self.copy_domain(sourcedb, domain)
 

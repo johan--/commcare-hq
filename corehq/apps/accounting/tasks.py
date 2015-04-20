@@ -6,26 +6,25 @@ from celery.utils.log import get_task_logger
 import datetime
 from couchdbkit import ResourceNotFound
 from django.conf import settings
-from django.contrib.sites.models import Site
 from django.http import HttpRequest, QueryDict
 from django.template.loader import render_to_string
 from django.utils.translation import ugettext
-from corehq import toggles
-from django.db import models
 from corehq.apps.domain.models import Domain
 from corehq.apps.accounting import utils
 from corehq.apps.accounting.exceptions import InvoiceError, CreditLineError, BillingContactInfoError
 from corehq.apps.accounting.invoicing import DomainInvoiceFactory
 
 from corehq.apps.accounting.models import (
-    Subscription, Invoice, BillingAccount, BillingAccountType,
+    Subscription, Invoice,
     SubscriptionAdjustment, SubscriptionAdjustmentReason,
     SubscriptionAdjustmentMethod)
 from corehq.apps.accounting.utils import (
     has_subscription_already_ended, get_dimagi_from_email_by_product,
     fmt_dollar_amount,
+    get_change_status,
 )
 from corehq.apps.users.models import FakeUser, WebUser
+from corehq.const import USER_DATE_FORMAT, USER_MONTH_FORMAT
 from couchexport.export import export_from_tables
 from couchexport.models import Format
 from dimagi.utils.couch.database import iter_docs
@@ -35,7 +34,6 @@ import corehq.apps.accounting.filters as filters
 logger = get_task_logger('accounting')
 
 
-@periodic_task(run_every=crontab(minute=0, hour=0))
 def activate_subscriptions(based_on_date=None):
     """
     Activates all subscriptions starting today (or, for testing, based on the date specified)
@@ -43,12 +41,16 @@ def activate_subscriptions(based_on_date=None):
     starting_date = based_on_date or datetime.date.today()
     starting_subscriptions = Subscription.objects.filter(date_start=starting_date)
     for subscription in starting_subscriptions:
-        if not has_subscription_already_ended(subscription):
+        if not has_subscription_already_ended(subscription) and not subscription.is_active:
             subscription.is_active = True
             subscription.save()
+            _, _, upgraded_privs = get_change_status(None, subscription.plan_version)
+            subscription.subscriber.apply_upgrades_and_downgrades(
+                upgraded_privileges=upgraded_privs,
+                new_subscription=subscription,
+            )
 
 
-@periodic_task(run_every=crontab(minute=0, hour=0))
 def deactivate_subscriptions(based_on_date=None):
     """
     Deactivates all subscriptions ending today (or, for testing, based on the date specified)
@@ -58,7 +60,26 @@ def deactivate_subscriptions(based_on_date=None):
     for subscription in ending_subscriptions:
         subscription.is_active = False
         subscription.save()
+        next_subscription = subscription.next_subscription
+        if next_subscription and next_subscription.date_start == ending_date:
+            new_plan_version = next_subscription.plan_version
+            next_subscription.is_active = True
+            next_subscription.save()
+        else:
+            new_plan_version = None
+        _, downgraded_privs, upgraded_privs = get_change_status(subscription.plan_version, new_plan_version)
+        subscription.subscriber.apply_upgrades_and_downgrades(
+            downgraded_privileges=downgraded_privs,
+            upgraded_privileges=upgraded_privs,
+            old_subscription=subscription,
+            new_subscription=next_subscription,
+        )
 
+
+@periodic_task(run_every=crontab(minute=0, hour=0))
+def update_subscriptions():
+    deactivate_subscriptions()
+    activate_subscriptions()
 
 @periodic_task(run_every=crontab(hour=13, minute=0, day_of_month='1'))
 def generate_invoices(based_on_date=None, check_existing=False, is_test=False):
@@ -68,8 +89,8 @@ def generate_invoices(based_on_date=None, check_existing=False, is_test=False):
     today = based_on_date or datetime.date.today()
     invoice_start, invoice_end = utils.get_previous_month_date_range(today)
     logger.info("[Billing] Starting up invoices for %(start)s - %(end)s" % {
-        'start': invoice_start.strftime("%d %B %Y"),
-        'end': invoice_end.strftime("%d %B %Y"),
+        'start': invoice_start.strftime(USER_DATE_FORMAT),
+        'end': invoice_end.strftime(USER_DATE_FORMAT),
     })
     all_domain_ids = [d['id'] for d in Domain.get_all(include_docs=False)]
     for domain_doc in iter_docs(Domain.get_db(), all_domain_ids):
@@ -157,7 +178,7 @@ def send_bookkeeper_email(month=None, year=None, emails=None):
     emails = emails or settings.BOOKKEEPER_CONTACT_EMAILS
     for email in emails:
         send_HTML_email(
-            "Invoices for %s" % datetime.date(year, month, 1).strftime("%B %Y"),
+            "Invoices for %s" % datetime.date(year, month, 1).strftime(USER_MONTH_FORMAT),
             email,
             email_content,
             email_from=settings.DEFAULT_FROM_EMAIL,
@@ -168,7 +189,7 @@ def send_bookkeeper_email(month=None, year=None, emails=None):
     logger.info(
         "[BILLING] Sent Bookkeeper Invoice Summary for %(month)s "
         "to %(emails)s." % {
-            'month': first_of_month.strftime("%B %Y"),
+            'month': first_of_month.strftime(USER_MONTH_FORMAT),
             'emails': ", ".join(emails)
         })
 
@@ -229,7 +250,7 @@ def send_purchase_receipt(payment_record, core_product,
         'name': name,
         'amount': fmt_dollar_amount(payment_record.amount),
         'project': payment_record.payment_method.billing_admin.domain,
-        'date_paid': payment_record.date_created.strftime('%d %B %Y'),
+        'date_paid': payment_record.date_created.strftime(USER_DATE_FORMAT),
         'product': core_product,
         'transaction_id': payment_record.public_transaction_id,
     }
@@ -325,7 +346,7 @@ def weekly_digest():
     from_email = "Dimagi Accounting <%s>" % settings.DEFAULT_FROM_EMAIL
     send_HTML_email(
         "Subscriptions ending in 40 Days from %s" % today.isoformat(),
-        settings.INVOICING_CONTACT_EMAIL,
+        settings.ACCOUNTS_EMAIL,
         email_content,
         email_from=from_email,
         text_content=email_content_plaintext,

@@ -8,8 +8,9 @@ from lxml import etree
 from django.core.servers.basehttp import FileWrapper
 from django.utils.decorators import method_decorator
 from casexml.apps.phone.middleware import LAST_SYNCTOKEN_HEADER
+from dimagi.utils.parsing import json_format_date
 from django_digest.decorators import httpdigest
-import simplejson
+import json
 from django.http import Http404, HttpResponse
 from django.core.cache import cache
 
@@ -229,7 +230,7 @@ def recompute_dots_casedata(casedoc, couch_user, submit_date=None, sync_token=No
         update_dict = {}
         dots_data = get_dots_case_json(casedoc)
 
-        update_dict['dots'] = simplejson.dumps(dots_data)
+        update_dict['dots'] = json.dumps(dots_data)
         submit_case_update_form(casedoc, update_dict, couch_user, submit_date=submit_date, xmlns=XMLNS_PATIENT_UPDATE_DOT, sync_token=sync_token)
 
 def submit_case_update_form(casedoc, update_dict, couch_user, submit_date=None, xmlns=XMLNS_PATIENT_UPDATE, sync_token=None):
@@ -251,7 +252,8 @@ def submit_case_update_form(casedoc, update_dict, couch_user, submit_date=None, 
 
     update_block = prepare_case_update_xml_block(casedoc, couch_user, update_dict, submit_date)
     form.append(update_block)
-    encounter_date = etree.XML('<encounter_date>%s</encounter_date>' % datetime.utcnow().strftime('%Y-%m-%d'))
+    # todo: this date is based off midnight UTC not local time...
+    encounter_date = etree.XML('<encounter_date>%s</encounter_date>' % json_format_date(datetime.utcnow()))
     form.append(encounter_date)
 
     submission_xml_string = etree.tostring(form)
@@ -274,18 +276,18 @@ def get_all_providers(invalidate=False):
         #requery and cache
         pact_hp_group = Group.by_name(PACT_DOMAIN, PACT_HP_GROUPNAME)
         providers = FixtureDataItem.by_group(pact_hp_group)
-        cache.set(PACT_PROVIDERS_FIXTURE_CACHE_KEY, simplejson.dumps([x.to_json() for x in providers]))
+        cache.set(PACT_PROVIDERS_FIXTURE_CACHE_KEY, json.dumps([x.to_json() for x in providers]))
         return providers
     else:
         try:
-            json_data= simplejson.loads(raw_cached_fixtures)
+            json_data = json.loads(raw_cached_fixtures)
             #not necessary in the grand scheme of things - we could really just use raw JSON
             return [FixtureDataItem.wrap(x) for x in json_data]
         except Exception, ex:
             logging.error("Error loading json from cache key %s: %s" % (PACT_PROVIDERS_FIXTURE_CACHE_KEY, ex))
             return []
 
-#    cache.set('%s_casedoc' % self._id, simplejson.dumps(self._case), PACT_CACHE_TIMEOUT)
+#    cache.set('%s_casedoc' % self._id, json.dumps(self._case), PACT_CACHE_TIMEOUT)
 #        xml_ret = cache.get('%s_schedule_xml' % self._id, None)
         pass
 
@@ -330,7 +332,7 @@ class PactAPI(DomainAPI):
             if scheds is None:
                 scheds = []
 
-            payload = simplejson.dumps(scheds)
+            payload = json.dumps(scheds)
             response = HttpResponse(payload, content_type="application/json")
             return response
         elif self.method == 'providers':
@@ -352,7 +354,7 @@ class PactAPI(DomainAPI):
                 "providers": [x.fields_without_attributes for x in providers],
                 "case_providers": case_providers,
             }
-            resp = HttpResponse(simplejson.dumps(ret), content_type='application/json')
+            resp = HttpResponse(json.dumps(ret), content_type='application/json')
             return resp
         else:
             return HttpResponse("API Method unknown", status=400)
@@ -396,7 +398,7 @@ class PactAPI(DomainAPI):
 
         elif self.method == 'providers':
             try:
-                submitted_provider_ids = simplejson.loads(self.request.POST['selected_providers'])
+                submitted_provider_ids = json.loads(self.request.POST['selected_providers'])
                 case_provider_ids = list(pdoc.get_provider_ids())
 
                 if submitted_provider_ids != case_provider_ids:

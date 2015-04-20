@@ -1,12 +1,14 @@
 # coding=utf-8
 import calendar
-from corehq.apps.products.models import Product
+from corehq.apps.products.models import SQLProduct
 from corehq.apps.locations.models import Location
 from corehq.apps.reports.datatables import DataTablesHeader, DataTablesColumnGroup, DataTablesColumn
 from corehq.apps.reports.sqlreport import DataFormatter, DictDataFormat
 from corehq.util.translation import localize
 from custom.intrahealth.sqldata import NombreData, TauxConsommationData
 from django.utils.translation import ugettext as _
+from dimagi.utils.decorators.memoized import memoized
+from dimagi.utils.parsing import json_format_date
 
 
 def get_localized_months():
@@ -16,10 +18,12 @@ def get_localized_months():
 
 
 class IntraHealthLocationMixin(object):
+
     @property
+    @memoized
     def location(self):
-        loc = Location.get(self.request.GET.get('location_id'))
-        return loc
+        if self.request.GET.get('location_id'):
+            return Location.get(self.request.GET.get('location_id'))
 
 
 class IntraHealthReportConfigMixin(object):
@@ -38,8 +42,8 @@ class IntraHealthReportConfigMixin(object):
             startdate=self.datespan.startdate,
             enddate=self.datespan.enddate,
             visit="''",
-            strsd=self.datespan.startdate.strftime("%Y-%m-%d"),
-            stred=self.datespan.enddate.strftime("%Y-%m-%d")
+            strsd=json_format_date(self.datespan.startdate),
+            stred=json_format_date(self.datespan.enddate)
         )
         self.config_update(config)
         return config
@@ -69,13 +73,13 @@ class IntraHealtMixin(IntraHealthLocationMixin, IntraHealthReportConfigMixin):
         else:
             header.add_column(columns[0].data_tables_column)
 
-        self.groups = [group.name for group in Product.by_domain(self.domain)]
+        self.groups = SQLProduct.objects.filter(domain=self.domain, is_archived=False)
         for group in self.groups:
             if self.model.have_groups:
-                header.add_column(DataTablesColumnGroup(group,
+                header.add_column(DataTablesColumnGroup(group.name,
                     *[columns[j].data_tables_column for j in xrange(1, len(columns))]))
             else:
-                header.add_column(DataTablesColumn(group))
+                header.add_column(DataTablesColumn(group.name))
 
         return header
 
@@ -107,17 +111,19 @@ class IntraHealtMixin(IntraHealthLocationMixin, IntraHealthReportConfigMixin):
                 for localization in localizations:
                     for pps in ppss:
                         for group in self.groups:
-                            if(group, localization) in result_sum:
-                                r = result_sum[(group, localization)]
+                            if(group.code, localization) in result_sum:
+                                r = result_sum[(group.code, localization)]
                                 cols = self.data_source.sum_cols
                                 for col in cols:
-                                    r[col] += result.get((group, pps, localization), {col: 0})[col]
+                                    r[col] += result.get((group.code, pps, localization), {col: 0})[col]
                             else:
                                 helper_dict = {}
                                 for col in self.data_source.sum_cols:
                                     helper_dict[col] = 0
                                 helper_dict['district_name'] = localization
-                                result_sum[(group, localization)] = result.get((group, pps, localization), helper_dict)
+                                result_sum[(group.code, localization)] = result.get((group.code,
+                                                                                     pps, localization),
+                                                                                    helper_dict)
                 result = result_sum
 
             data = dict(formatter.format(result, keys=self.model.keys, group_by=self.model.group_by))
@@ -128,11 +134,11 @@ class IntraHealtMixin(IntraHealthLocationMixin, IntraHealthReportConfigMixin):
         for localization in localizations:
             row = [localization]
             for group in self.groups:
-                if (group, localization) in data:
-                    product = data[(group, localization)]
+                if (group.code, localization) in data:
+                    product = data[(group.code, localization)]
                     row.extend([product[p] for p in self.model.col_names])
-                elif (self._safe_get(reversed_map, group), localization) in data:
-                    product = data[(reversed_map[group], localization)]
+                elif (self._safe_get(reversed_map, group.code), localization) in data:
+                    product = data[(reversed_map[group.code], localization)]
                     row.extend([product[p] for p in self.model.col_names])
                 else:
                     row.extend([self.no_value for p in self.model.col_names])

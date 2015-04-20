@@ -26,6 +26,10 @@ class AppEditingError(AppManagerException):
     pass
 
 
+class ModuleIdMissingException(AppManagerException):
+    pass
+
+
 class RearrangeError(AppEditingError):
     pass
 
@@ -34,23 +38,23 @@ class ConflictingCaseTypeError(AppEditingError):
     pass
 
 
-class XFormError(AppManagerException):
+class XFormException(AppManagerException):
     pass
 
 
-class BlankXFormError(XFormError):
+class BlankXFormError(XFormException):
     pass
 
 
-class CaseError(XFormError):
+class CaseError(XFormException):
     pass
 
 
-class ScheduleError(XFormError):
+class ScheduleError(XFormException):
     pass
 
 
-class XFormValidationError(XFormError):
+class XFormValidationError(XFormException):
     def __init__(self, fatal_error, version="1.0", validation_problems=None):
         self.fatal_error = fatal_error
         self.version = version
@@ -58,12 +62,12 @@ class XFormValidationError(XFormError):
 
     def __str__(self):
         fatal_error_text = self.format_v1(self.fatal_error)
-        ret = "Validation Error%s" % (': %s' % fatal_error_text if fatal_error_text else '')
+        ret = u"Validation Error%s" % (': %s' % fatal_error_text if fatal_error_text else '')
         problems = filter(lambda problem: problem['message'] != self.fatal_error, self.validation_problems)
         if problems:
-            ret += "\n\nMore information:"
+            ret += u"\n\nMore information:"
             for problem in problems:
-                ret += "\n{type}: {msg}".format(type=problem['type'].title(), msg=problem['message'])
+                ret += u"\n{type}: {msg}".format(type=problem['type'].title(), msg=problem['message'])
         return ret
 
     def format_v1(self, msg):
@@ -84,7 +88,7 @@ class XFormValidationError(XFormError):
         return message
 
 
-class BindNotFound(XFormError):
+class BindNotFound(XFormException):
     pass
 
 

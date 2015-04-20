@@ -1,5 +1,6 @@
-import simplejson
+import json
 from django.utils.translation import ugettext_lazy, ugettext as _
+from corehq.util.dates import iso_string_to_date
 from dimagi.utils.dates import DateSpan
 from corehq.apps.reports.filters.base import BaseReportFilter
 import datetime
@@ -19,7 +20,7 @@ class DatespanFilter(BaseReportFilter):
 
     @property
     def datespan(self):
-        datespan = DateSpan.since(self.default_days, format="%Y-%m-%d", timezone=self.timezone, inclusive=self.inclusive)
+        datespan = DateSpan.since(self.default_days, timezone=self.timezone, inclusive=self.inclusive)
         if self.request.datespan.is_valid() and self.slug == 'datespan':
             datespan.startdate = self.request.datespan.startdate
             datespan.enddate = self.request.datespan.enddate
@@ -36,7 +37,7 @@ class DatespanFilter(BaseReportFilter):
 
     @property
     def report_labels(self):
-        return simplejson.dumps({
+        return json.dumps({
             'last_7_days': _('Last 7 Days'),
             'last_month': _('Last Month'),
             'last_30_days': _('Last 30 Days')
@@ -56,7 +57,7 @@ class SingleDateFilter(BaseReportFilter):
         from_req = self.request.GET.get('date')
         if from_req:
             try:
-                return datetime.datetime.strptime(from_req, '%Y-%m-%d').date()
+                return iso_string_to_date(from_req)
             except ValueError:
                 pass
 

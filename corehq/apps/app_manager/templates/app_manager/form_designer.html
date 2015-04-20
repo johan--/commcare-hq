@@ -16,13 +16,18 @@
     <script>
 
         var VELLUM_OPTIONS = {
-            {% if vellum_prerelease %}
-            {# use the default set of plugins otherwise #}
-            {# non-optional plugins don't need to be listed #}
-            plugins: ['itemset'],
-            {% endif %}
+            plugins: {{ plugins|JSON }},
+            features: {{ features|JSON }},
             core: {
+                dataSources: [
+                    {
+                        key: 'fixture',
+                        name: 'Fixtures',
+                        endpoint: '{% url 'fixture_metadata' domain=domain %}'
+                    }
+                ],
                 form: {{ form.source|to_javascript_string }},
+                formId: '{{ form.get_unique_id }}',
                 formName: "{{ form.name|trans:app.langs|escapejs }}",
                 saveType: 'patch',
                 saveUrl: '{% url "edit_form_attr" domain app.id form.get_unique_id "xform" %}',
@@ -38,6 +43,17 @@
                 onFormSave: function (data) {
                     COMMCAREHQ.app_manager.updateDOM(data.update);
                 },
+                {% if vellum_debug == "dev" %}
+                onReady: function () {
+                    var less_error_id = "#less-error-message\\:static-style-less-hqstyle-core",
+                        less_error = $(less_error_id);
+                    if (less_error) {
+                        console.log("hiding less error:", less_error_id);
+                        console.log(less_error.text());
+                        less_error.hide();
+                    }
+                },
+                {% endif %}
                 sessionid: {{ sessionid|JSON }}
             },
             javaRosa: {
@@ -73,6 +89,7 @@
             {% comment %} 
             to use non-built files in HQ:
                 * clone Vellum into submodules/formdesigner
+                * Run make in that directory (requires node.js)
                 * set settings.VELLUM_DEBUG to "dev" or "dev-min"
             {% endcomment %}
             {% if not vellum_debug %}
@@ -99,6 +116,7 @@
             });
         });
 
+        analytics.track("Entered Form-builder");
     </script>
 {% endblock %}
 

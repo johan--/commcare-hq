@@ -1,0 +1,62 @@
+from optparse import make_option
+from couchdbkit.exceptions import BulkSaveError
+from corehq.util.couch import categorize_bulk_save_errors
+from dimagi.utils.couch.database import get_db
+from django.core.management.base import BaseCommand, LabelCommand
+
+
+def bulk_delete(db, docs):
+    if not docs:
+        return
+
+    print("Deleting {} doc revisions".format(len(docs)))
+    try:
+        db.bulk_delete(docs)
+    except BulkSaveError as e:
+        errors = categorize_bulk_save_errors(e)
+        successes = errors.pop(None, [])
+        conflicts = errors.pop('conflict', [])
+        print("BulkSaveError: {} successful, {} conflicts".format(len(successes), len(conflicts)))
+        for error, results in errors.items():
+            print(results)
+    else:
+        print('{} doc revisions deleted'.format(len(docs)))
+
+
+class Command(BaseCommand):
+    help = 'Delete document conflicts'
+
+    option_list = LabelCommand.option_list + (
+        make_option(
+            '--batch_size',
+            action='store',
+            type='int',
+            dest='batch',
+            default=500,
+            help="Only process this many docs."),
+    )
+
+    def handle(self, *args, **options):
+        db = get_db()
+        while True:
+            results = db.view('doc_conflicts/conflicts', reduce=False, limit=options['batch'], include_docs=True, conflicts=True)
+            total = results.total_rows
+            if not total:
+                return
+            print('Processing {} of {} docs'.format(len(results), total))
+            to_delete = []
+            for row in results:
+                doc = row['doc']
+                conflicts = doc.get('_conflicts', [])
+                doc_id = doc['_id']
+                print('Deleting {} conflicts for doc: {}'.format(len(conflicts), doc_id))
+                for rev in conflicts:
+                    to_delete.append({
+                        '_id': doc_id,
+                        '_rev': rev
+                    })
+                    if len(to_delete) > 100:
+                        bulk_delete(db, to_delete)
+                        to_delete = []
+
+            bulk_delete(db, to_delete)

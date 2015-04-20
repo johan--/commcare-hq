@@ -1,23 +1,123 @@
+from functools import partial
 from couchdbkit import ResourceNotFound
 from couchdbkit.ext.django.schema import *
 import itertools
 from corehq.apps.cachehq.mixins import CachedCouchDocumentMixin
-from dimagi.utils.couch.database import get_db, iter_docs
-from django import forms
-from django.core.urlresolvers import reverse
+from dimagi.utils.couch.database import iter_docs
+from dimagi.utils.decorators.memoized import memoized
 from datetime import datetime
 from django.db import models
 import json_field
 from casexml.apps.case.cleanup import close_case
 from corehq.apps.commtrack.const import COMMTRACK_USERNAME
+from corehq.apps.domain.models import Domain
+from corehq.apps.products.models import SQLProduct
+from corehq.toggles import LOCATION_TYPE_STOCK_RATES
 from mptt.models import MPTTModel, TreeForeignKey
+
+
+LOCATION_SHARING_PREFIX = 'locationgroup-'
+LOCATION_REPORTING_PREFIX = 'locationreportinggroup-'
+
+
+class LocationTypeManager(models.Manager):
+    def full_hierarchy(self, domain):
+        """
+        Returns a graph of the form
+        {
+           '<loc_type_id>: (
+               loc_type,
+               {'<child_loc_type_id>': (child_loc_type, [...])}
+           )
+        }
+        """
+        hierarchy = {}
+
+        def insert_loc_type(loc_type):
+            """
+            Get parent location's hierarchy, insert loc_type into it, and return
+            hierarchy below loc_type
+            """
+            if not loc_type.parent_type:
+                lt_hierarchy = hierarchy
+            else:
+                lt_hierarchy = insert_loc_type(loc_type.parent_type)
+            if loc_type.id not in lt_hierarchy:
+                lt_hierarchy[loc_type.id] = (loc_type, {})
+            return lt_hierarchy[loc_type.id][1]
+
+        for loc_type in self.filter(domain=domain).all():
+            insert_loc_type(loc_type)
+
+        return hierarchy
+
+    def by_domain(self, domain):
+        """
+        Sorts location types by hierarchy
+        """
+        ordered_loc_types = []
+        def step_through_graph(hierarchy):
+            for _, (loc_type, children) in hierarchy.items():
+                ordered_loc_types.append(loc_type)
+                step_through_graph(children)
+
+        step_through_graph(self.full_hierarchy(domain))
+        return ordered_loc_types
+
+
+StockLevelField = partial(models.DecimalField, max_digits=10, decimal_places=1)
+
+
+class LocationType(models.Model):
+    domain = models.CharField(max_length=255, db_index=True)
+    name = models.CharField(max_length=255)
+    code = models.SlugField(db_index=False, null=True)
+    parent_type = models.ForeignKey('self', null=True)
+    administrative = models.BooleanField(default=False)
+    shares_cases = models.BooleanField(default=False)
+    view_descendants = models.BooleanField(default=False)
+
+    emergency_level = StockLevelField(default=0.5)
+    understock_threshold = StockLevelField(default=1.5)
+    overstock_threshold = StockLevelField(default=3.0)
+
+    objects = LocationTypeManager()
+
+    def _populate_stock_levels(self):
+        from corehq.apps.commtrack.models import CommtrackConfig
+        ct_config = CommtrackConfig.for_domain(self.domain)
+        if (
+            (ct_config is None)
+            or (not Domain.get_by_name(self.domain).commtrack_enabled)
+            or LOCATION_TYPE_STOCK_RATES.enabled(self.domain)
+        ):
+            return
+        config = ct_config.stock_levels_config
+        self.emergency_level = config.emergency_level
+        self.understock_threshold = config.understock_threshold
+        self.overstock_threshold = config.overstock_threshold
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            from corehq.apps.commtrack.util import unicode_slug
+            self.code = unicode_slug(self.name)
+        self._populate_stock_levels()
+        return super(LocationType, self).save(*args, **kwargs)
+
+    def __unicode__(self):
+        return self.name
+
+    @property
+    @memoized
+    def can_have_children(self):
+        return LocationType.objects.filter(parent_type=self).exists()
 
 
 class SQLLocation(MPTTModel):
     domain = models.CharField(max_length=255, db_index=True)
     name = models.CharField(max_length=100, null=True)
     location_id = models.CharField(max_length=100, db_index=True, unique=True)
-    location_type = models.CharField(max_length=255)
+    location_type = models.ForeignKey(LocationType, null=True)
     site_code = models.CharField(max_length=255)
     external_id = models.CharField(max_length=255, null=True)
     metadata = json_field.JSONField(default={})
@@ -28,16 +128,50 @@ class SQLLocation(MPTTModel):
     longitude = models.DecimalField(max_digits=20, decimal_places=10, null=True)
     parent = TreeForeignKey('self', null=True, blank=True, related_name='children')
 
+    # Use getter and setter below to access this value
+    # since stocks_all_products can cause an empty list to
+    # be what is stored for a location that actually has
+    # all products available.
+    _products = models.ManyToManyField(SQLProduct, null=True)
+    stocks_all_products = models.BooleanField(default=True)
+
     supply_point_id = models.CharField(max_length=255, db_index=True, unique=True, null=True)
+
+    @property
+    def products(self):
+        """
+        If there are no products specified for this location, assume all
+        products for the domain are relevant.
+        """
+        if self.stocks_all_products:
+            return SQLProduct.by_domain(self.domain)
+        else:
+            return self._products.all()
+
+    @products.setter
+    def products(self, value):
+        # this will set stocks_all_products to true if the user
+        # has added all products in the domain to this location
+        self.stocks_all_products = (set(value) ==
+                                    set(SQLProduct.by_domain(self.domain)))
+
+        self._products = value
 
     class Meta:
         unique_together = ('domain', 'site_code',)
+
+    def __unicode__(self):
+        return u"{} ({})".format(self.name, self.domain)
 
     def __repr__(self):
         return "<SQLLocation(domain=%s, name=%s)>" % (
             self.domain,
             self.name
         )
+
+    @property
+    def display_name(self):
+        return u"{} [{}]".format(self.name, self.location_type.name)
 
     def archived_descendants(self):
         """
@@ -56,6 +190,73 @@ class SQLLocation(MPTTModel):
     def root_locations(cls, domain, include_archive_ancestors=False):
         roots = cls.objects.root_nodes().filter(domain=domain)
         return _filter_for_archived(roots, include_archive_ancestors)
+
+    def _make_group_object(self, user_id, case_sharing):
+        def group_name():
+            return '/'.join(
+                list(self.get_ancestors().values_list('name', flat=True)) +
+                [self.name]
+            )
+
+        from corehq.apps.groups.models import UnsavableGroup
+
+        g = UnsavableGroup()
+        g.domain = self.domain
+        g.users = [user_id] if user_id else []
+        g.last_modified = datetime.utcnow()
+
+        if case_sharing:
+            g.name = group_name() + '-Cases'
+            g._id = LOCATION_SHARING_PREFIX + self.location_id
+            g.case_sharing = True
+            g.reporting = False
+        else:
+            # reporting groups
+            g.name = group_name()
+            g._id = LOCATION_REPORTING_PREFIX + self.location_id
+            g.case_sharing = False
+            g.reporting = True
+
+        g.metadata = {
+            'commcare_location_type': self.location_type.name,
+            'commcare_location_name': self.name,
+        }
+        for key, val in self.metadata.items():
+            g.metadata['commcare_location_' + key] = val
+
+        return g
+
+    def case_sharing_group_object(self, user_id=None):
+        """
+        Returns a fake group object that cannot be saved.
+
+        This is used for giving users access via case
+        sharing groups, without having a real group
+        for every location that we have to manage/hide.
+        """
+
+        return self._make_group_object(
+            user_id,
+            True,
+        )
+
+    def reporting_group_object(self, user_id=None):
+        """
+        Returns a fake group object that cannot be saved.
+
+        Similar to case_sharing_group_object method, but for
+        reporting groups.
+        """
+
+        return self._make_group_object(
+            user_id,
+            False,
+        )
+
+    @property
+    @memoized
+    def couch_location(self):
+        return Location.get(self.location_id)
 
 
 def _filter_for_archived(locations, include_archive_ancestors):
@@ -114,26 +315,44 @@ class Location(CachedCouchDocumentMixin, Document):
     def __repr__(self):
         return "%s (%s)" % (self.name, self.location_type)
 
+    def __eq__(self, other):
+        if isinstance(other, Location):
+            return self._id == other._id
+        else:
+            return False
+
+    def __hash__(self):
+        return hash(self._id)
+
+    # Method return a non save SQLLocation object, because when we want sync location in task, we can have some
+    # problems. For example: we can have location in SQL but without location type.
+    # this behavior causes problems when we want go to locations page - 500 error.
+    # SQLlocation object is saved together with Couch object in save method.
     def _sync_location(self):
         properties_to_sync = [
             ('location_id', '_id'),
             'domain',
             'name',
-            'location_type',
             'site_code',
             'external_id',
             'latitude',
             'longitude',
             'is_archived',
+            'metadata'
         ]
 
-        sql_location, _ = SQLLocation.objects.get_or_create(
-            location_id=self._id,
-            defaults={
-                'domain': self.domain,
-                'site_code': self.site_code
-            }
-        )
+        try:
+            is_new = False
+            sql_location = SQLLocation.objects.get(location_id=self._id)
+        except SQLLocation.DoesNotExist:
+            is_new = True
+            sql_location = SQLLocation(domain=self.domain, site_code=self.site_code)
+
+        if is_new or (sql_location.location_type.name != self.location_type):
+            sql_location.location_type, _ = LocationType.objects.get_or_create(
+                domain=self.domain,
+                name=self.location_type,
+            )
 
         for prop in properties_to_sync:
             if isinstance(prop, tuple):
@@ -154,7 +373,7 @@ class Location(CachedCouchDocumentMixin, Document):
         if parent_id:
             sql_location.parent = SQLLocation.objects.get(location_id=parent_id)
 
-        sql_location.save()
+        return sql_location
 
     @property
     def sql_location(self):
@@ -223,7 +442,7 @@ class Location(CachedCouchDocumentMixin, Document):
         one way syncing to the SQLLocation version of this
         location.
         """
-        self.last_modified = datetime.now()
+        self.last_modified = datetime.utcnow()
 
         # lazy migration for site_code
         if not self.site_code:
@@ -233,9 +452,20 @@ class Location(CachedCouchDocumentMixin, Document):
                 Location.site_codes_for_domain(self.domain)
             )
 
+        sql_location = None
         result = super(Location, self).save(*args, **kwargs)
 
-        self._sync_location()
+        # try sync locations and when SQLLocation doesn't returned, removed Couch object from database.
+        # added because when we sync location by tasks we can have behavior that the task can be
+        # killed in _sync_location method and this causes the problems
+        try:
+            sql_location = self._sync_location()
+        finally:
+            if sql_location:
+                sql_location.save()
+            else:
+                self.delete()
+                result = None
 
         return result
 
@@ -262,17 +492,21 @@ class Location(CachedCouchDocumentMixin, Document):
         ).one()['value']
 
     @classmethod
-    def by_domain(cls, domain):
+    def by_domain(cls, domain, include_docs=True):
         relevant_ids = set([r['id'] for r in cls.get_db().view(
             'locations/by_type',
             reduce=False,
             startkey=[domain],
             endkey=[domain, {}],
         ).all()])
-        return (
-            cls.wrap(l) for l in iter_docs(cls.get_db(), list(relevant_ids))
-            if not l.get('is_archived', False)
-        )
+
+        if not include_docs:
+            return relevant_ids
+        else:
+            return (
+                cls.wrap(l) for l in iter_docs(cls.get_db(), list(relevant_ids))
+                if not l.get('is_archived', False)
+            )
 
     @classmethod
     def site_codes_for_domain(cls, domain):
@@ -378,6 +612,21 @@ class Location(CachedCouchDocumentMixin, Document):
         from corehq.apps.commtrack.models import SupplyPointCase
         return SupplyPointCase.get_by_location(self)
 
+    @property
+    def group_id(self):
+        """
+        Returns the id with a prefix because this is
+        the magic id we are force setting the locations
+        case sharing group to be.
+
+        This is also the id that owns supply point cases.
+        """
+        return LOCATION_SHARING_PREFIX + self._id
+
+    @property
+    def location_type_object(self):
+        return self.sql_location.location_type
+
 
 def root_locations(domain):
     results = Location.get_db().view('locations/hierarchy',
@@ -392,58 +641,3 @@ def root_locations(domain):
 def all_locations(domain):
     return Location.view('locations/hierarchy', startkey=[domain], endkey=[domain, {}],
                          reduce=False, include_docs=True).all()
-
-
-class CustomProperty(Document):
-    name = StringProperty()
-    datatype = StringProperty()
-    label = StringProperty()
-    required = BooleanProperty()
-    help_text = StringProperty()
-    unique = StringProperty()
-
-    def field_type(self):
-        return getattr(forms, '%sField' % (self.datatype or 'Char'))
-
-    def field(self, initial=None):
-        kwargs = dict(
-            label=self.label,
-            required=(self.required if self.required is not None else False),
-            help_text=self.help_text,
-            initial=initial,
-        )
-
-        choices = getattr(self, 'choices', None)
-        if choices:
-            if choices['mode'] == 'static':
-                def mk_choice(spec):
-                    return spec if hasattr(spec, '__iter__') else (spec, spec)
-                choices = [mk_choice(c) for c in choices['args']]
-            elif choices['mode'] == 'fixture':
-                raise RuntimeError('choices from fixture not supported yet')
-            else:
-                raise ValueError('unknown choices mode [%s]' % choices['mode'])
-            kwargs['choices'] = choices
-
-        return self.field_type()(**kwargs)
-
-    def custom_validate(self, loc, val, prop_name):
-        if self.unique:
-            self.validate_uniqueness(loc, val, prop_name)
-
-    def validate_uniqueness(self, loc, val, prop_name):
-        def normalize(val):
-            try:
-                return val.lower() # case-insensitive comparison
-            except AttributeError:
-                return val
-        val = normalize(val)
-
-        from corehq.apps.locations.util import property_uniqueness
-        conflict_ids = property_uniqueness(loc.domain, loc, prop_name, val, self.unique)
-
-        if conflict_ids:
-            conflict_loc = Location.get(conflict_ids.pop())
-            raise ValueError('value must be unique; conflicts with <a href="%s">%s %s</a>' %
-                             (reverse('edit_location', kwargs={'domain': loc.domain, 'loc_id': conflict_loc._id}),
-                              conflict_loc.name, conflict_loc.location_type))

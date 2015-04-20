@@ -9,12 +9,37 @@ Project Space: {{ domain }}
 Software Plan: {{ plan_name }}
 Status: {{ payment_status }}
 Amount Due: {{ amount_due }}
+{% endblocktrans %}
 
-You can view the full statement under Subscription > Billing Statements
-in your Project Space Settings or by visiting this link: {{ statements_url }}.
+{% if can_view_statement %}
+{% blocktrans %}
+To view the full billing statement, log into your project space on
+CommCareHQ and navigate to Billing Statements at {{ statements_url }}
+{% endblocktrans %}
+{% else %}
+{% blocktrans %}
+Your project's administrator can view the full billing statement by
+logging into your project space on CommCareHQ and navigating to
+Billing Statements at {{ statements_url }}
+{% endblocktrans %}
+{% endif %}
 
+{% blocktrans %}
+To pay this bill, you can either choose a credit card or wire payment:
+    - To pay by credit card, please go to your Billing Statements page, click
+      on the green "Make Payment" button in front of your unpaid invoice(s),
+      and fill in the amount you want to pay as well as your credit card
+      details.
+    - To pay by wire, find Dimagi's bank account details on your invoice.
+      Please include the invoice number in your wire payment and make sure to
+      send an email to {{ accounts_email }} after you have made the payment,
+      mentioning the date of the payment, the amount, the invoice number, and
+      the project space.
+{% endblocktrans %}
+
+{% blocktrans %}
 Thank you for using {{ plan_name }}. If you have any questions, please don't
-hesitate to contact admin@dimagi.com.
+hesitate to contact {{ invoicing_contact_email }}.
 
 Best Regards,
 The CommCare HQ Team
@@ -23,5 +48,5 @@ www.commcarehq.org
 
 Statement From:
 CommCare HQ and the corporation Dimagi, Inc.
-585 Massachusetts Ave, Ste 3, Cambridge, MA 02139 USA
+585 Massachusetts Ave, Ste 4, Cambridge, MA 02139 USA
 {% endblocktrans %}

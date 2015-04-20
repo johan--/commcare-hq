@@ -1,7 +1,9 @@
 import copy
 from urllib import unquote
+from elasticsearch import Elasticsearch
 import rawes
 from django.conf import settings
+from corehq.pillows.mappings.reportxform_mapping import REPORT_XFORM_INDEX
 from pillowtop.listener import send_to_elasticsearch as send_to_es
 from corehq.pillows.mappings.app_mapping import APP_INDEX
 from corehq.pillows.mappings.case_mapping import CASE_INDEX
@@ -13,9 +15,23 @@ from corehq.pillows.mappings.user_mapping import USER_INDEX
 from corehq.pillows.mappings.xform_mapping import XFORM_INDEX
 
 
+def get_es_new():
+    """
+    Get a handle to the configured elastic search DB.
+    Returns an elasticsearch.Elasticsearch instance.
+    """
+    return Elasticsearch([{
+        'host': settings.ELASTICSEARCH_HOST,
+        'port': settings.ELASTICSEARCH_PORT,
+    }])
+
+
 def get_es(timeout=30):
     """
     Get a handle to the configured elastic search DB
+    Returns a rawes.Elastic instance.
+
+    We are hoping to deprecate and retire this method soonish.
     """
     return rawes.Elastic('%s:%s' % (settings.ELASTICSEARCH_HOST,
                                     settings.ELASTICSEARCH_PORT),
@@ -52,6 +68,7 @@ ES_URLS = {
     "groups": GROUP_INDEX + '/group/_search',
     "sms": SMS_INDEX + '/sms/_search',
     "report_cases": REPORT_CASE_INDEX + '/report_case/_search',
+    "report_xforms": REPORT_XFORM_INDEX + '/report_xform/_search',
 }
 
 ADD_TO_ES_FILTER = {
@@ -62,6 +79,11 @@ ADD_TO_ES_FILTER = {
     ],
     "users": [
         {"term": {"doc_type": "CommCareUser"}},
+        {"term": {"base_doc": "couchuser"}},
+        {"term": {"is_active": True}},
+    ],
+    "web_users": [
+        {"term": {"doc_type": "WebUser"}},
         {"term": {"base_doc": "couchuser"}},
         {"term": {"is_active": True}},
     ],

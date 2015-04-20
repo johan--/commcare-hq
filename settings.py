@@ -12,8 +12,6 @@ import djcelery
 
 djcelery.setup_loader()
 
-CACHE_BACKEND = 'memcached://127.0.0.1:11211/'
-
 DEBUG = True
 TEMPLATE_DEBUG = DEBUG
 LESS_DEBUG = DEBUG
@@ -29,10 +27,6 @@ LESS_WATCH = False
 # "dev" - use raw vellum source (submodules/formdesigner/src)
 # "dev-min" - use built/minified vellum (submodules/formdesigner/_build/src)
 VELLUM_DEBUG = None
-
-# enables all plugins, including ones that haven't been released on production
-# yet
-VELLUM_PRERELEASE = False
 
 try:
     UNIT_TESTING = 'test' == sys.argv[1]
@@ -63,6 +57,7 @@ LANGUAGES = (
     ('fr', 'French'),
     ('fra', 'French'),  # we need this alias
     ('hin', 'Hindi'),
+    ('sw', 'Swahili'),
 )
 
 SITE_ID = 1
@@ -129,6 +124,7 @@ MIDDLEWARE_CLASSES = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'corehq.middleware.OpenRosaMiddleware',
+    'corehq.util.global_request.middleware.GlobalRequestMiddleware',
     'corehq.apps.users.middleware.UsersMiddleware',
     'corehq.apps.domain.middleware.CCHQPRBACMiddleware',
     'casexml.apps.phone.middleware.SyncTokenMiddleware',
@@ -178,7 +174,6 @@ DEFAULT_APPS = (
     'django.contrib.sessions',
     'django.contrib.sites',
     'django.contrib.staticfiles',
-    'django.contrib.humanize',
     'south',
     'djcelery',
     'djtables',
@@ -187,7 +182,7 @@ DEFAULT_APPS = (
     'djangular',
     'couchdbkit.ext.django',
     'crispy_forms',
-    'django.contrib.markup',
+    'markup_deprecated',
     'gunicorn',
     'raven.contrib.django.raven_compat',
     'compressor',
@@ -205,8 +200,6 @@ HQ_APPS = (
     'django_digest',
     'rosetta',
     'auditcare',
-    'djangocouch',
-    'djangocouchuser',
     'hqscripts',
     'casexml.apps.case',
     'casexml.apps.phone',
@@ -243,7 +236,6 @@ HQ_APPS = (
     'corehq.apps.crud',
     'corehq.apps.custom_data_fields',
     'corehq.apps.receiverwrapper',
-    'corehq.apps.migration',
     'corehq.apps.app_manager',
     'corehq.apps.es',
     'corehq.apps.facilities',
@@ -298,6 +290,7 @@ HQ_APPS = (
     'corehq.apps.styleguide',
     'corehq.apps.grapevine',
     'corehq.apps.dashboard',
+    'corehq.apps.public',
     'corehq.util',
 
     # custom reports
@@ -308,7 +301,8 @@ HQ_APPS = (
     'custom.apps.gsid',
     'hsph',
     'mvp',
-    'mvp_apps',
+    'mvp_docs',
+    'mvp_indicators',
     'custom.opm',
     'pathfinder',
     'pathindia',
@@ -335,9 +329,13 @@ HQ_APPS = (
     'custom.intrahealth',
     'custom.world_vision',
     'custom.tdh',
+    'custom.up_nrhm',
 
     'custom.care_pathways',
+    'custom.common',
     'bootstrap3_crispy',
+
+    'custom.dhis2',
 )
 
 TEST_APPS = ()
@@ -382,6 +380,7 @@ APPS_TO_EXCLUDE_FROM_TESTS = (
     'fluff_filter',
     'freddy',
     'pillowtop',
+    'pillow_retry',
 )
 
 INSTALLED_APPS = DEFAULT_APPS + HQ_APPS
@@ -457,8 +456,13 @@ SERVER_EMAIL = 'commcarehq-noreply@dimagi.com'
 DEFAULT_FROM_EMAIL = 'commcarehq-noreply@dimagi.com'
 SUPPORT_EMAIL = "commcarehq-support@dimagi.com"
 CCHQ_BUG_REPORT_EMAIL = 'commcarehq-bug-reports@dimagi.com'
+ACCOUNTS_EMAIL = 'accounts@dimagi.com'
+SUBSCRIPTION_CHANGE_EMAIL = 'accounts+subchange@dimagi.com'
 BILLING_EMAIL = 'billing-comm@dimagi.com'
-INVOICING_CONTACT_EMAIL = 'accounts@dimagi.com'
+INVOICING_CONTACT_EMAIL = SUPPORT_EMAIL
+MASTER_LIST_EMAIL = 'master-list@dimagi.com'
+EULA_CHANGE_EMAIL = 'eula-notifications@dimagi.com'
+CONTACT_EMAIL = 'info@dimagi.com'
 BOOKKEEPER_CONTACT_EMAILS = []
 EMAIL_SUBJECT_PREFIX = '[commcarehq] '
 
@@ -471,23 +475,27 @@ PAGINATOR_MAX_PAGE_LINKS = 5
 OPENROSA_VERSION = "1.0"
 
 # OTA restore fixture generators
-FIXTURE_GENERATORS = [
-    "corehq.apps.fixtures.fixturegenerators.hq_fixtures",
-]
+FIXTURE_GENERATORS = {
+    # fixtures that may be sent to the phone independent of cases
+    'standalone': [
+        # core
+        "corehq.apps.users.fixturegenerators.user_groups",
+        "corehq.apps.fixtures.fixturegenerators.item_lists",
+        "corehq.apps.callcenter.fixturegenerators.indicators_fixture_generator",
+        "corehq.apps.products.fixtures.product_fixture_generator",
+        "corehq.apps.programs.fixtures.program_fixture_generator",
+        # custom
+        "custom.bihar.reports.indicators.fixtures.generator",
+        "custom.m4change.fixtures.report_fixtures.generator",
+        "custom.m4change.fixtures.location_fixtures.generator",
+    ],
+    # fixtures that must be sent along with the phones cases
+    'case': [
+        "corehq.apps.locations.fixtures.location_fixture_generator",
+    ]
+}
 
-HQ_FIXTURE_GENERATORS = [
-    # core
-    "corehq.apps.users.fixturegenerators.user_groups",
-    "corehq.apps.fixtures.fixturegenerators.item_lists",
-    "corehq.apps.callcenter.fixturegenerators.indicators_fixture_generator",
-    "corehq.apps.products.fixtures.product_fixture_generator",
-    "corehq.apps.programs.fixtures.program_fixture_generator",
-    "corehq.apps.locations.fixtures.location_fixture_generator",
-    # custom
-    "custom.bihar.reports.indicators.fixtures.generator",
-    "custom.m4change.fixtures.report_fixtures.generator",
-    "custom.m4change.fixtures.location_fixtures.generator",
-]
+RESTORE_PAYLOAD_DIR = None  # Defaults to tempfile.gettempdir()
 
 GET_URL_BASE = 'dimagi.utils.web.get_url_base'
 
@@ -496,6 +504,10 @@ SMS_GATEWAY_PARAMS = "user=my_username&password=my_password&id=%(phone_number)s&
 
 # celery
 BROKER_URL = 'django://'  # default django db based
+
+from settingshelper import celery_failure_handler
+
+CELERY_ANNOTATIONS = {'*': {'on_failure': celery_failure_handler}}
 
 CELERY_MAIN_QUEUE = 'celery'
 
@@ -513,8 +525,6 @@ CELERY_REMINDER_RULE_QUEUE = CELERY_MAIN_QUEUE
 # on its own queue.
 CELERY_REMINDER_CASE_UPDATE_QUEUE = CELERY_MAIN_QUEUE
 
-SKIP_SOUTH_TESTS = True
-#AUTH_PROFILE_MODULE = 'users.HqUserProfile'
 TEST_RUNNER = 'testrunner.TwoStageTestRunner'
 # this is what gets appended to @domain after your accounts
 HQ_ACCOUNT_ROOT = "commcarehq.org"
@@ -545,6 +555,7 @@ COUCHLOG_DISPLAY_COLS = ["id", "archived?", "date", "exception type", "message",
                          "domain", "user", "url", "actions", "report"]
 COUCHLOG_RECORD_WRAPPER = "corehq.apps.hqcouchlog.wrapper"
 COUCHLOG_DATABASE_NAME = "commcarehq-couchlog"
+COUCHLOG_AUTH_DECORATOR = 'corehq.apps.domain.decorators.require_superuser_or_developer'
 
 # couchlog/case search
 LUCENE_ENABLED = False
@@ -637,32 +648,34 @@ PILLOW_RETRY_QUEUE_MAX_PROCESSING_ATTEMPTS = 3
 # next_interval = PILLOW_RETRY_REPROCESS_INTERVAL * attempts^PILLOW_RETRY_BACKOFF_FACTOR
 PILLOW_RETRY_BACKOFF_FACTOR = 2
 
+# After an error's total attempts exceeds this number it will only be re-attempted
+# once after being reset. This is to prevent numerous retries of errors that aren't
+# getting fixed
+PILLOW_RETRY_MULTI_ATTEMPTS_CUTOFF = PILLOW_RETRY_QUEUE_MAX_PROCESSING_ATTEMPTS * 3
 
 ####### auditcare parameters #######
 AUDIT_MODEL_SAVE = [
     'corehq.apps.app_manager.Application',
     'corehq.apps.app_manager.RemoteApp',
 ]
+
 AUDIT_VIEWS = [
-    'corehq.apps.domain.views.registration_request',
-    'corehq.apps.domain.views.registration_confirm',
-    'corehq.apps.domain.views.password_change',
-    'corehq.apps.domain.views.password_change_done',
-    'corehq.apps.reports.views.submit_history',
-    'corehq.apps.reports.views.active_cases',
-    'corehq.apps.reports.views.submit_history',
-    'corehq.apps.reports.views.default',
-    'corehq.apps.reports.views.submission_log',
-    'corehq.apps.reports.views.form_data',
-    'corehq.apps.reports.views.export_data',
-    'corehq.apps.reports.views.excel_report_data',
-    'corehq.apps.reports.views.daily_submissions',
+    'corehq.apps.settings.views.ChangeMyPasswordView',
+]
+
+AUDIT_MODULES = [
+    'corehq.apps.reports',
+    'corehq.apps.userreports',
+    'corehq.apps.data',
+    'corehq.apps.registration',
 ]
 
 # Don't use google analytics unless overridden in localsettings
 ANALYTICS_IDS = {
     'GOOGLE_ANALYTICS_ID': '',
-    'PINGDOM_ID': ''
+    'PINGDOM_ID': '',
+    'ANALYTICS_ID_PUBLIC_COMMCARE': '',
+    'SEGMENT_ANALYTICS_KEY': '',
 }
 
 OPEN_EXCHANGE_RATES_ID = ''
@@ -856,7 +869,8 @@ INVOICE_FROM_ADDRESS = {}
 BANK_ADDRESS = {}
 BANK_NAME = ''
 BANK_ACCOUNT_NUMBER = ''
-BANK_ROUTING_NUMBER = ''
+BANK_ROUTING_NUMBER_ACH = ''
+BANK_ROUTING_NUMBER_WIRE = ''
 BANK_SWIFT_CODE = ''
 
 STRIPE_PUBLIC_KEY = ''
@@ -868,6 +882,17 @@ MAILCHIMP_COMMCARE_USERS_ID = ''
 MAILCHIMP_MASS_EMAIL_ID = ''
 
 SQL_REPORTING_DATABASE_URL = None
+
+# number of days since last access after which a saved export is considered unused
+SAVED_EXPORT_ACCESS_CUTOFF = 35
+
+# override for production
+DEFAULT_PROTOCOL = 'http'
+
+####### South Settings #######
+SKIP_SOUTH_TESTS = True
+SOUTH_TESTS_MIGRATE = False
+
 
 try:
     # try to see if there's an environmental variable set for local_settings
@@ -912,12 +937,15 @@ if not SQL_REPORTING_DATABASE_URL or UNIT_TESTING:
         **db_settings
     )
 
-####### South Settings #######
-#SKIP_SOUTH_TESTS=True
-#SOUTH_TESTS_MIGRATE=False
+MVP_INDICATOR_DB = 'mvp-indicators'
+
+INDICATOR_CONFIG = {
+    "mvp-sauri": ['mvp_indicators'],
+    "mvp-potou": ['mvp_indicators'],
+}
 
 ####### Couch Forms & Couch DB Kit Settings #######
-from settingshelper import get_dynamic_db_settings, make_couchdb_tuples
+from settingshelper import get_dynamic_db_settings, make_couchdb_tuples, get_extra_couchdbs
 
 _dynamic_db_settings = get_dynamic_db_settings(
     COUCH_SERVER_ROOT,
@@ -965,7 +993,6 @@ COUCHDB_APPS = [
     'importer',
     'indicators',
     'locations',
-    'migration',
     'mobile_auth',
     'phone',
     'pillowtop',
@@ -990,6 +1017,7 @@ COUCHDB_APPS = [
     'crs_reports',
     'grapevine',
     'uth',
+    'dhis2',
 
     # custom reports
     'penn_state',
@@ -998,6 +1026,7 @@ COUCHDB_APPS = [
     'gsid',
     'hsph',
     'mvp',
+    ('mvp_docs', MVP_INDICATOR_DB),
     'pathfinder',
     'pathindia',
     'pact',
@@ -1020,13 +1049,14 @@ COUCHDB_APPS = [
     ('cvsu', 'fluff-cvsu'),
     ('mc', 'fluff-mc'),
     ('m4change', 'm4change'),
-    ('wvindia2', 'wvindia2'),
+    ('export', 'meta'),
     'tdhtesting'
 ]
 
 COUCHDB_APPS += LOCAL_COUCHDB_APPS
 
 COUCHDB_DATABASES = make_couchdb_tuples(COUCHDB_APPS, COUCH_DATABASE)
+EXTRA_COUCHDB_DATABASES = get_extra_couchdbs(COUCHDB_APPS, COUCH_DATABASE)
 
 INSTALLED_APPS += LOCAL_APPS
 
@@ -1123,11 +1153,6 @@ SELENIUM_APP_SETTING_DEFAULTS = {
     },
 }
 
-INDICATOR_CONFIG = {
-    "mvp-sauri": ['mvp_indicators'],
-    "mvp-potou": ['mvp_indicators'],
-}
-
 CASE_WRAPPER = 'corehq.apps.hqcase.utils.get_case_wrapper'
 
 PILLOWTOPS = {
@@ -1151,6 +1176,7 @@ PILLOWTOPS = {
         'corehq.pillows.reportcase.ReportCasePillow',
         'corehq.pillows.reportxform.ReportXFormPillow',
         'corehq.apps.userreports.pillow.ConfigurableIndicatorPillow',
+        'corehq.apps.userreports.pillow.CustomDataSourcePillow',
     ],
     'cache': [
         'corehq.pillows.cacheinvalidate.CacheInvalidatePillow',
@@ -1178,6 +1204,7 @@ PILLOWTOPS = {
         'custom.intrahealth.models.RecapPassagePillow',
         'custom.intrahealth.models.TauxDeRuptureFluffPillow',
         'custom.intrahealth.models.LivraisonFluffPillow',
+        'custom.intrahealth.models.RecouvrementFluffPillow',
         'custom.care_pathways.models.GeographyFluffPillow',
         'custom.care_pathways.models.FarmerRecordFluffPillow',
         'custom.world_vision.models.WorldVisionMotherFluffPillow',
@@ -1190,12 +1217,21 @@ PILLOWTOPS = {
         'custom.tdh.models.TDHNewbornTreatmentFluffPillow',
         'custom.tdh.models.TDHChildClassificationFluffPillow',
         'custom.tdh.models.TDHChildTreatmentFluffPillow',
+        'custom.succeed.models.UCLAPatientFluffPillow'
     ],
-    'mvp': [
-        'corehq.apps.indicators.pillows.FormIndicatorPillow',
-        'corehq.apps.indicators.pillows.CaseIndicatorPillow',
+    'mvp_indicators': [
+        'mvp_docs.pillows.MVPFormIndicatorPillow',
+        'mvp_docs.pillows.MVPCaseIndicatorPillow',
     ],
 }
+
+
+CUSTOM_DATA_SOURCES = [
+    os.path.join('custom', 'up_nrhm', 'data_sources', 'location_hierarchy.json'),
+    os.path.join('custom', 'up_nrhm', 'data_sources', 'asha_facilitators.json'),
+    os.path.join('custom', 'succeed', 'data_sources', 'submissions.json'),
+]
+
 
 for k, v in LOCAL_PILLOWTOPS.items():
     plist = PILLOWTOPS.get(k, [])
@@ -1280,12 +1316,17 @@ DOMAIN_MODULE_MAP = {
     'mvp-ruhiira': 'mvp',
     'mvp-mwandama': 'mvp',
     'mvp-sada': 'mvp',
+    'mvp-tiby': 'mvp',
+    'mvp-mbola': 'mvp',
+    'mvp-koraro': 'mvp',
+    'mvp-pampaida': 'mvp',
     'opm': 'custom.opm',
     'psi-unicef': 'psi',
     'project': 'custom.apps.care_benin',
 
     'ipm-senegal': 'custom.intrahealth',
     'testing-ipm-senegal': 'custom.intrahealth',
+    'up-nrhm': 'custom.up_nrhm',
 
     'crs-remind': 'custom.apps.crs_reports',
 
@@ -1294,6 +1335,7 @@ DOMAIN_MODULE_MAP = {
     'ilsgateway-test-1': 'custom.ilsgateway',
     'ilsgateway-test-2': 'custom.ilsgateway',
     'ewsghana-test-1': 'custom.ewsghana',
+    'ewsghana-test-2': 'custom.ewsghana',
     'test-pathfinder': 'custom.m4change',
     'wvindia2': 'custom.world_vision',
     'pathways-india-mis': 'custom.care_pathways',
@@ -1304,18 +1346,16 @@ DOMAIN_MODULE_MAP = {
 
 CASEXML_FORCE_DOMAIN_CHECK = True
 
-# arbitrarily split up tests into three chunks
+# arbitrarily split up tests into two chunks
 # that have approximately equal run times,
-# The two groups shown here, plus a third group consisting of everything else
+# the group shown here, plus a second group consisting of everything else
 TRAVIS_TEST_GROUPS = (
     (
         'accounting', 'adm', 'announcements', 'api', 'app_manager', 'appstore',
         'auditcare', 'bihar', 'builds', 'cachehq', 'callcenter', 'care_benin',
-    ),
-    (
         'care_sa', 'case', 'cleanup', 'cloudcare', 'commtrack', 'consumption',
         'couchapps', 'couchlog', 'crud', 'cvsu', 'dca', 'django_digest',
-        'djangocouch', 'djangocouchuser', 'domain', 'domainsync', 'export',
+        'domain', 'domainsync', 'export',
         'facilities', 'fixtures', 'fluff_filter', 'formplayer',
         'formtranslate', 'fri', 'grapevine', 'groups', 'gsid', 'hope',
         'hqadmin', 'hqcase', 'hqcouchlog', 'hqmedia',
@@ -1337,3 +1377,5 @@ COMPRESS_OFFLINE_CONTEXT = {
     'less_debug': LESS_DEBUG,
     'less_watch': LESS_WATCH,
 }
+
+COMPRESS_CSS_HASHING_METHOD = 'content'

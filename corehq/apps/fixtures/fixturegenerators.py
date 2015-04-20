@@ -6,18 +6,23 @@ from corehq.apps.users.models import CommCareUser
 from dimagi.utils.modules import to_function
 
 
-def hq_fixtures(user, version, case_sync_op=None, last_sync=None):
-    if hasattr(user, "_hq_user") and user._hq_user is not None:
-        user = user._hq_user
-    if isinstance(user, CommCareUser):
-        for func_path in settings.HQ_FIXTURE_GENERATORS:
-            func = to_function(func_path)
-            if func:
-                for fixture in func(user, version, case_sync_op, last_sync):
-                    yield fixture
+def item_lists_by_domain(domain):
+    ret = list()
+    for data_type in FixtureDataType.by_domain(domain):
+        ret.append({
+            'sourceUri': 'jr://fixture/item-list:%s' % data_type.tag,
+            'defaultId': data_type.tag,
+            'initialQuery': "instance('{tag}')/item-list:{tag}/{tag}".format(tag=data_type.tag),
+            'name': data_type.tag,
+            'structure': {
+                f.field_name: {
+                    'name': f.field_name,
+                    'no_option': True
+                } for f in data_type.fields},
+        })
+    return ret
 
-
-def item_lists(user, version, case_sync_op=None, last_sync=None):
+def item_lists(user, version, last_sync=None):
     assert isinstance(user, CommCareUser)
 
     all_types = dict([(t._id, t) for t in FixtureDataType.by_domain(user.domain)])

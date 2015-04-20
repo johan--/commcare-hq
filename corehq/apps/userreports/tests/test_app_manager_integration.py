@@ -2,8 +2,8 @@ import json
 import os
 from django.test import SimpleTestCase
 from corehq.apps.app_manager.models import Application
-from corehq.apps.userreports.app_manager import get_case_data_sources, \
-    get_default_case_property_datatypes, get_form_data_sources
+from corehq.apps.userreports.app_manager import get_case_data_sources, get_form_data_sources
+from corehq.apps.userreports.reports.builder import DEFAULT_CASE_PROPERTY_DATATYPES
 
 
 class AppManagerDataSourceConfigTest(SimpleTestCase):
@@ -24,14 +24,20 @@ class AppManagerDataSourceConfigTest(SimpleTestCase):
         self.assertEqual('ticket', data_source.display_name)
 
         # test the filter
-        generated_filter = data_source.filter
-        self.assertTrue(generated_filter.filter({'doc_type': 'CommCareCase', 'domain': app.domain, 'type': 'ticket'}))
-        self.assertFalse(generated_filter.filter({'doc_type': 'CommCareCase', 'domain': 'wrong domain', 'type': 'ticket'}))
-        self.assertFalse(generated_filter.filter({'doc_type': 'NotCommCareCase', 'domain': app.domain, 'type': 'ticket'}))
-        self.assertFalse(generated_filter.filter({'doc_type': 'CommCareCase', 'domain': app.domain, 'type': 'not-ticket'}))
+        self.assertTrue(data_source.filter(
+            {'doc_type': 'CommCareCase', 'domain': app.domain, 'type': 'ticket'}))
+        self.assertFalse(data_source.filter(
+            {'doc_type': 'CommCareCase', 'domain': 'wrong domain', 'type': 'ticket'}))
+        self.assertFalse(data_source.filter(
+            {'doc_type': 'NotCommCareCase', 'domain': app.domain, 'type': 'ticket'}))
+        self.assertFalse(data_source.filter(
+            {'doc_type': 'CommCareCase', 'domain': app.domain, 'type': 'not-ticket'}))
 
         # check the indicators
-        expected_columns = set(["doc_id", "modified_on", "user_id", "opened_on", "owner_id", "name", "category", "priority", "starred", "estimate"])
+        expected_columns = set(
+            ["doc_id", "modified_on", "user_id", "opened_on",
+             "owner_id", "name", "category", "priority", "starred", "estimate"]
+        )
         self.assertEqual(expected_columns, set(col_back.id for col_back in data_source.get_columns()))
 
         sample_doc = dict(
@@ -47,20 +53,22 @@ class AppManagerDataSourceConfigTest(SimpleTestCase):
             category='bug',
             priority='4',
             starred='yes',
-            estimate=2,
+            estimate='2',
         )
+
         def _get_column_property(column):
             return column.id if column.id != 'doc_id' else '_id'
 
-
-        default_case_property_datatypes = get_default_case_property_datatypes()
-        for result in data_source.get_values(sample_doc):
-            self.assertEqual(sample_doc[_get_column_property(result.column)], result.value)
-            if result.column.id in default_case_property_datatypes:
-                self.assertEqual(
-                    result.column.datatype,
-                    default_case_property_datatypes[result.column.id]
-                )
+        default_case_property_datatypes = DEFAULT_CASE_PROPERTY_DATATYPES
+        [row] = data_source.get_all_values(sample_doc)
+        for result in row:
+            if result.column.id != "repeat_iteration":
+                self.assertEqual(sample_doc[_get_column_property(result.column)], result.value)
+                if result.column.id in default_case_property_datatypes:
+                    self.assertEqual(
+                        result.column.datatype,
+                        default_case_property_datatypes[result.column.id]
+                    )
 
     def test_simple_form_management(self):
         app = Application.wrap(self.get_json('simple_app.json'))

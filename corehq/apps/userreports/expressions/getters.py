@@ -1,3 +1,4 @@
+from decimal import Decimal
 
 
 class TransformedGetter(object):
@@ -10,8 +11,8 @@ class TransformedGetter(object):
         self.getter = getter
         self.transform = transform
 
-    def __call__(self, item):
-        extracted = self.getter(item)
+    def __call__(self, item, context=None):
+        extracted = self.getter(item, context)
         if self.transform:
             return self.transform(extracted)
         return extracted
@@ -22,7 +23,7 @@ class DictGetter(object):
     def __init__(self, property_name):
         self.property_name = property_name
 
-    def __call__(self, item):
+    def __call__(self, item, context=None):
         if not isinstance(item, dict):
             return None
         try:
@@ -41,12 +42,14 @@ class NestedDictGetter(object):
     def __init__(self, property_path):
         self.property_path = property_path
 
-    def __call__(self, item):
+    def __call__(self, item, context=None):
         if not isinstance(item, dict):
             return None
         try:
             return recursive_lookup(item, self.property_path)
-        except KeyError:
+        except (KeyError, TypeError):
+            # key errors are missing keys
+            # type errors are valid keys that return the wrong type
             return None
 
 
@@ -73,3 +76,54 @@ def recursive_lookup(dict_object, keys):
 def transform_date(item):
     # postgres crashes on empty strings, but is happy to take null dates
     return item or None
+
+
+def transform_datetime(item):
+    return item or None
+
+
+def transform_int(item):
+    try:
+        return int(item)
+    except (ValueError, TypeError):
+        return None
+
+
+def transform_decimal(item):
+    try:
+        return Decimal(item)
+    except (ValueError, TypeError):
+        return None
+
+
+def transform_unicode(item):
+    if item is None:
+        return None
+    try:
+        return unicode(item)
+    except (ValueError, TypeError):
+        return None
+
+
+def transform_from_datatype(datatype):
+    """
+    Given a datatype, return a transform for that type.
+    """
+    identity = lambda x: x
+    return {
+        'date': transform_date,
+        'datetime': transform_datetime,
+        'decimal': transform_decimal,
+        'integer': transform_int,
+        'string': transform_unicode,
+    }.get(datatype) or identity
+
+
+def getter_from_property_reference(spec):
+    if spec.property_name:
+        assert not spec.property_path, \
+            'indicator {} has both a name and path specified! you must only pick one.'.format(spec.property_name)
+        return DictGetter(property_name=spec.property_name)
+    else:
+        assert spec.property_path, spec.property_name
+        return NestedDictGetter(property_path=spec.property_path)

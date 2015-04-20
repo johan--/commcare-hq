@@ -8,9 +8,11 @@
     {% if app.get_doc_type == "Application" %}
         <script src="{% static 'translations/js/translations.js' %}"></script>
     {% endif %}
-    <script src="{% static 'hqwebapp/js/knockout-bindings.js' %}"></script>
+    <script src="{% static 'style/ko/knockout_bindings.ko.js' %}"></script>
+    <script src="{% static 'style/lib/knockout_plugins/knockout_mapping.ko.min.js' %}"></script>
     <script src="{% static 'hqwebapp/ko/bulk_upload_file.js' %}"></script>
     <script src="{% static 'app_manager/js/supported-languages.js' %}"></script>
+    <script type="text/javascript" src="{% static 'hqmedia/js/hqmedia.reference_controller.js' %}"></script>
 {% endblock %}
 {% block js-inline %}
     {{ block.super }}
@@ -20,10 +22,12 @@
             settings: {
                 sections: {{ settings_layout|JSON }},
                 values: {{ settings_values|JSON }},
+                {% if request|toggle_enabled:"CUSTOM_PROPERTIES" %}
+                customProperties: {{ custom_properties|JSON }},
+                {% endif %}
                 urls: {
                     save: '{% url "edit_commcare_settings" domain app.id %}'
                 },
-                edit: {{ edit|BOOL }},
                 user: {
                     is_previewer: {{ request.couch_user.is_previewer|BOOL }}
                 },
@@ -78,18 +82,59 @@
         });
 
     </script>
+    {% include 'hqmedia/partials/multimedia_init.html' %}
+    <script type="text/javascript">
+        var refs = {{ refs|JSON }};
+        var media_info = {{ media_info|JSON }};
+        var image_refs = {};
+        for (var slug in refs) {
+            image_refs[slug] = new ImageReference(refs[slug]);
+            image_refs[slug].upload_controller = HQMediaUploaders[slug];
+            image_refs[slug].setObjReference(media_info[slug]);
+        }
+        function urlFromLogo(slug) {
+            return image_refs[slug].url;
+        }
+        function thumbUrlFromLogo(slug) {
+            return image_refs[slug].thumb_url;
+        }
+        function triggerUploadForLogo(slug) {
+            if(image_refs[slug]) {
+                image_refs[slug].triggerUpload();
+            }
+        }
+        function uploadCompleteForLogo(slug, response) {
+            if(image_refs[slug]) {
+                image_refs[slug].uploadComplete(null, null, response);
+            }
+        }
+        function getPathFromSlug(slug) {
+            return image_refs[slug].path;
+        }
+        function removeLogo(slug) {
+            $.post(
+                '{% url "hqmedia_remove_logo" domain app.id %}',
+                {
+                    logo_slug: slug
+                },
+                function(data, status) {
+                    if(status == 'success'){
+                        image_refs[slug].url("");
+                    }
+                }
+            );
+        }
+    </script>
     <script>
         $(function () {
             var langs = {{ app.langs|JSON }};
             var buildLangs = {{ app.build_langs|JSON }};
             var saveURL = "{% url "edit_app_langs" domain app.id %}";
-            var edit = {{ edit|JSON }};
             var validate = !{{ app.is_remote_app|BOOL }};
             ko.applyBindings(new SupportedLanguages({
                 langs: langs,
                 buildLangs: buildLangs,
                 saveURL: saveURL,
-                edit: edit,
                 validate: validate
             }), $("#supported-languages").get(0));
         });
@@ -188,7 +233,6 @@
                     url: "{% url "edit_app_translations" domain app.id %}",
                     suggestion_url: "{% url "get_app_translations" domain %}",
                     lang: "{{ lang }}",
-                    edit: {{ edit|yesno:"true,false" }},
                     allow_autofill: "{{ lang }}" !== 'en',
                     $home: $translation_ui
                 });
@@ -313,4 +357,10 @@
             </form>
         </div>
     </div>
+{% endblock %}
+
+{% block modals %}{{ block.super }}
+{% for uploader in uploaders %}
+{% include 'hqmedia/partials/multimedia_uploader.html' %}
+{% endfor %}
 {% endblock %}

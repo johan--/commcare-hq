@@ -6,7 +6,6 @@ import numpy
 import datetime
 from couchdbkit.ext.django.schema import Document, StringProperty, IntegerProperty, DateTimeProperty
 from couchdbkit.schema.base import DocumentSchema
-from couchdbkit.schema.properties import LazyDict
 from casexml.apps.case.models import CommCareCase
 from corehq.apps.crud.models import AdminCRUDDocumentMixin
 from corehq.apps.indicators.admin.crud import (IndicatorAdminCRUDManager,
@@ -170,6 +169,7 @@ class IndicatorDefinition(Document, AdminCRUDDocumentMixin):
     @classmethod
     @memoized
     def get_current(cls, namespace, domain, slug, version=None, wrap=True, **kwargs):
+
         couch_key = cls._generate_couch_key(
             namespace=namespace,
             domain=domain,
@@ -189,7 +189,8 @@ class IndicatorDefinition(Document, AdminCRUDDocumentMixin):
         if wrap and doc:
             try:
                 doc_class = to_function(doc.get('value', "%s.%s" % (cls._class_path, cls.__name__)))
-                return doc_class.get(doc.get('id'))
+                doc_instance = doc_class.get(doc.get('id'))
+                return doc_instance
             except Exception as e:
                 logging.error("No matching documents found for indicator %s: %s" % (slug, e))
                 return None
@@ -381,15 +382,12 @@ class CouchIndicatorDef(DynamicIndicatorDefinition):
                 datespan.startdate = datespan.enddate - datetime.timedelta(days=self.fixed_datespan_days,
                                                                            microseconds=-1)
             if self.fixed_datespan_months:
-                start_year, start_month = add_months(datespan.enddate.year, datespan.enddate.month,
-                    -self.fixed_datespan_months)
-                try:
-                    datespan.startdate = datetime.datetime(start_year, start_month, datespan.enddate.day,
-                        datespan.enddate.hour, datespan.enddate.minute, datespan.enddate.second,
-                        datespan.enddate.microsecond) + datetime.timedelta(microseconds=1)
-                except ValueError:
-                    # day is out of range for month
-                    datespan.startdate = self.get_last_day_of_month(start_year, start_month)
+                # By making the assumption that the end date is always the end of the month
+                # the first months adjustment is accomplished by moving the start date to
+                # the beginning of the month. Any additional months are subtracted in the usual way
+                start = self.get_first_day_of_month(datespan.enddate.year, datespan.enddate.month)
+                start_year, start_month = add_months(start.year, start.month, -(self.fixed_datespan_months - 1))
+                datespan.startdate = start.replace(year=start_year, month=start_month)
 
             if self.startdate_shift:
                 datespan.startdate = datespan.startdate + datetime.timedelta(days=self.startdate_shift)
@@ -421,7 +419,13 @@ class CouchIndicatorDef(DynamicIndicatorDefinition):
                 reduce=reduce
             )
 
-        return cache_core.cached_view(self.get_db(), self.couch_view, cache_expire=60*60*6, **view_kwargs)
+        # Pull Data from the MVP-only DB
+        from mvp_docs.models import IndicatorXForm
+        db = IndicatorXForm.get_db()
+        section = self.couch_view.split('/')
+        couch_view = "%s_indicators/%s" % (section[0], section[1])
+
+        return cache_core.cached_view(db, couch_view, cache_expire=60*60*6, **view_kwargs)
 
     def get_raw_results(self, user_ids, datespan=False, date_group_level=False, reduce=False):
         """
@@ -447,11 +451,11 @@ class CouchIndicatorDef(DynamicIndicatorDefinition):
 
     def _get_value_from_result(self, result):
         value = 0
-        if isinstance(result, dict) or isinstance(result, LazyDict):
+        if isinstance(result, dict):
             result = [result]
         for item in result:
             new_val = item.get('value')
-            if isinstance(new_val, dict) or isinstance(new_val, LazyDict):
+            if isinstance(new_val, dict):
                 if '_total_unique' in new_val:
                     value += new_val.get('_total_unique', 0)
                 elif '_sum_unique':
@@ -726,7 +730,7 @@ class BaseDocumentIndicatorDefinition(IndicatorDefinition):
         """
         update_computed = True
         existing_indicator = computed.get(self.slug)
-        if isinstance(existing_indicator, dict) or isinstance(existing_indicator, LazyDict):
+        if isinstance(existing_indicator, dict):
             update_computed = existing_indicator.get('version') != self.version
         if update_computed:
             computed[self.slug] = self.get_doc_dict(document)
@@ -756,7 +760,7 @@ class FormDataIndicatorDefinitionMixin(DocumentSchema):
             question_id = question_id.split('.')
         if len(question_id) > 0 and form_data:
             return self.get_from_form(form_data.get(question_id[0]), question_id[1:])
-        if (isinstance(form_data, dict) or isinstance(form_data, LazyDict)) and '#text' in form_data:
+        if isinstance(form_data, dict) and '#text' in form_data:
             return form_data['#text']
         return form_data
 
@@ -769,7 +773,7 @@ class FormIndicatorDefinition(BaseDocumentIndicatorDefinition, FormDataIndicator
     base_doc = "FormIndicatorDefinition"
 
     def get_clean_value(self, doc):
-        if not isinstance(doc, XFormInstance):
+        if not isinstance(doc, XFormInstance) or not issubclass(doc.__class__, XFormInstance):
             raise ValueError("The document provided must be an instance of XFormInstance.")
         if not doc.xmlns == self.xmlns:
             raise DocumentMismatchError("The xmlns of the form provided does not match the one for this definition.")
@@ -887,7 +891,7 @@ class CaseIndicatorDefinition(BaseDocumentIndicatorDefinition):
     base_doc = "CaseIndicatorDefinition"
 
     def get_clean_value(self, doc):
-        if not isinstance(doc, CommCareCase):
+        if not isinstance(doc, CommCareCase) or not issubclass(doc.__class__, CommCareCase):
             raise ValueError("The document provided must be an instance of CommCareCase.")
         if not doc.type == self.case_type:
             raise DocumentMismatchError("The case provided should be a '%s' type case." % self.case_type)
@@ -909,7 +913,7 @@ class FormDataInCaseIndicatorDefinition(CaseIndicatorDefinition, FormDataIndicat
     _admin_crud_class = FormDataInCaseAdminCRUDManager
 
     def get_related_forms(self, case):
-        if not isinstance(case, CommCareCase):
+        if not isinstance(case, CommCareCase) or not issubclass(case.__class__, CommCareCase):
             raise ValueError("case is not an instance of CommCareCase.")
         all_forms = case.get_forms()
         all_forms.reverse()
@@ -921,11 +925,11 @@ class FormDataInCaseIndicatorDefinition(CaseIndicatorDefinition, FormDataIndicat
 
     def get_value(self, doc):
         existing_value = self.get_existing_value(doc)
-        if not (isinstance(existing_value, dict) or isinstance(existing_value, LazyDict)):
+        if not isinstance(existing_value, dict):
             existing_value = dict()
         forms = self.get_related_forms(doc)
         for form in forms:
-            if isinstance(form, XFormInstance):
+            if isinstance(form, XFormInstance) or not issubclass(doc.__class__, XFormInstance):
                 form_data = form.form
                 existing_value[form.get_id] = {
                     'value': self.get_from_form(form_data, self.question_id),
