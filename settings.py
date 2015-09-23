@@ -238,6 +238,7 @@ HQ_APPS = (
     'langcodes',
     'corehq.apps.analytics',
     'corehq.apps.callcenter',
+    'corehq.apps.change_feed',
     'corehq.apps.crud',
     'corehq.apps.custom_data_fields',
     'corehq.apps.receiverwrapper',
@@ -960,6 +961,9 @@ ENVIRONMENT_HOSTS = {
 # encryption or signing workflows.
 HQ_PRIVATE_KEY = None
 
+
+KAFKA_URL = 'localhost:9092'
+
 try:
     # try to see if there's an environmental variable set for local_settings
     if os.environ.get('CUSTOMSETTINGS', None) == "demo":
@@ -1333,6 +1337,9 @@ PILLOWTOPS = {
         'mvp_docs.pillows.MVPFormIndicatorPillow',
         'mvp_docs.pillows.MVPCaseIndicatorPillow',
     ],
+    'experimental': [
+        'corehq.apps.change_feed.pillow.ChangeFeedPillow',
+    ]
 }
 
 
