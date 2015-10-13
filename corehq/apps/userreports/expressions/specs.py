@@ -12,6 +12,7 @@ from corehq.apps.userreports.expressions.getters import (
 from corehq.apps.userreports.indicators.specs import DataTypeProperty
 from corehq.apps.userreports.specs import TypeProperty, EvaluationContext
 from corehq.util.quickcache import quickcache
+from corehq.apps.commtrack.models import StockState
 
 
 class IdentityExpressionSpec(JsonObject):
@@ -201,4 +202,46 @@ class NestedExpressionSpec(JsonObject):
 
     def __call__(self, item, context=None):
         argument = self._argument_expression(item, context)
+        return self._value_expression(argument, context)
+
+
+class LedgerExpressionSpec(JsonObject):
+    """
+    Expression to get the value of a specified ledger for a specific product.
+    {
+        "type": "ledger",
+        "case_id_expression": {
+            "type": "property_name",
+            "property_name": "_id",
+            "datatype": "string"
+        },
+        "ledger_section": "stock",
+        "product_id": "ge3243lg51o16n8bf1yt743n46e493"
+    }
+    """
+    type = TypeProperty('ledger')
+    case_id_expression = DictProperty(required=True)
+    ledger_section = StringProperty(required=True)
+    product_id = StringProperty(required=True)
+
+    def __init__(self, *args, **kwargs):
+        print "*"*40, 'ESOE:__init__ ', "*"*40
+        return super(LedgerExpressionSpec, self).__init__(*args, **kwargs)
+
+    #  def get_all_products_stock(self):
+        #  # TODO How do I get case_id?
+        #  stock = (StockState.objects
+                 #  .filter(section_id=self.ledger_section,
+                         #  case_id=None)
+                 #  .values_list('sql_product__product_id', 'stock_on_hand'))
+        #  return {product_id: soh for product_id, soh in stock}
+
+    def configure(self, case_id_expression):
+        #  if is_not_valid(product_id):
+            #  raise BadSpecError(u'Cannot determine database for document type {}!'.format(self.related_doc_type))
+
+        self._case_id_expression = case_id_expression
+
+    def __call__(self, doc, context=None):
+        argument = self._argument_expression(doc, context)
         return self._value_expression(argument, context)

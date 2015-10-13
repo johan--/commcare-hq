@@ -603,3 +603,30 @@ class DocJoinExpressionTest(SimpleTestCase):
 
         same_expression = ExpressionFactory.from_spec(self.spec)
         self.assertEqual('foo', same_expression(my_doc, EvaluationContext(my_doc, 0)))
+
+
+class LedgerExpressionTest(SimpleTestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = {
+            "type": "ledger",
+            "case_id_expression": {
+                "type": "property_name",
+                "property_name": "_id",
+                "datatype": "string"
+            },
+            "ledger_section": "stock",
+            "product_id": "ge3243lg51o16n8bf1yt743n46e493"
+        }
+        cls.expression = ExpressionFactory.from_spec(spec)
+
+    def testCases(self):
+        self.assertEqual('foo', self.expression({
+            'test': 'apple',
+            'apple': 'foo'
+        }))
+
+    def testDefault(self):
+        self.assertEqual('orange', self.expression({
+            'test': 'value not in cases',
+        }))
