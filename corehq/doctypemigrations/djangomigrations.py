@@ -1,4 +1,7 @@
 from django.conf import settings
+from django.db import connections
+from django.db.migrations.loader import MigrationLoader
+
 
 
 MIGRATION_MESSAGE = """
@@ -36,7 +39,10 @@ class MigrationNotComplete(Exception):
 
 
 def assert_initial_complete(migrator):
+    connection = connections['default']
+    loader = MigrationLoader(connection, ignore_no_migrations=True)
+
     def forwards(apps, schema_editor):
-        if not migrator.last_seq and not settings.UNIT_TESTING:
+        if not migrator.last_seq and not settings.UNIT_TESTING and len(loader.applied_migrations) > 0:
             raise MigrationNotComplete(MIGRATION_MESSAGE.format(slug=migrator.slug))
     return forwards
