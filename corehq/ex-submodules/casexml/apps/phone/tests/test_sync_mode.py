@@ -5,7 +5,7 @@ from django.test.utils import override_settings
 from django.test import TestCase
 import os
 from casexml.apps.phone.exceptions import MissingSyncLog, RestoreException
-from casexml.apps.phone.tests.restore_test_utils import run_with_all_restore_configs
+from casexml.apps.phone.tests.restore_test_utils import run_with_all_restore_configs, run_with_cleanliness_restore
 from casexml.apps.phone.tests.utils import get_exactly_one_wrapped_sync_log, generate_restore_payload
 from casexml.apps.case.mock import CaseBlock, CaseFactory, CaseStructure, CaseIndex
 from casexml.apps.phone.tests.utils import synclog_from_restore_payload
@@ -20,6 +20,7 @@ from casexml.apps.phone.models import SyncLog, User, get_properly_wrapped_sync_l
 from casexml.apps.phone.restore import CachedResponse, RestoreConfig, RestoreParams, RestoreCacheSettings
 from casexml.apps.case.xml import V2, V1
 from casexml.apps.case.sharedmodels import CommCareCaseIndex
+from casexml.apps.case.const import CASE_INDEX_EXTENSION
 from datetime import datetime
 
 USER_ID = "main_user"
@@ -685,6 +686,246 @@ class SyncTokenUpdateTest(SyncBaseTest):
         sync_log = get_properly_wrapped_sync_log(self.sync_log._id)
         # before this test was written, the case stayed on the sync log even though it was closed
         self.assertFalse(sync_log.phone_is_holding_case(case_id))
+
+
+class ExtensionCasesSyncTokenUpdates(SyncBaseTest):
+    """Makes sure the extension case trees are propertly updated
+    """
+
+    @run_with_cleanliness_restore
+    def test_create_extension(self):
+        """creating an extension should add it to the extension_index_tree
+        """
+        case_type = 'case'
+        index_identifier = 'idx'
+        host = CaseStructure(case_id='host',
+                             attrs={'create': True})
+        extension = CaseStructure(
+            case_id='extension',
+            attrs={'create': True, 'owner_id': '-'},
+            indices=[CaseIndex(
+                host,
+                identifier=index_identifier,
+                relationship='extension',
+                related_type=case_type,
+            )],
+        )
+
+        self.factory.create_or_update_cases([extension])
+        sync_log = get_properly_wrapped_sync_log(self.sync_log._id)
+        self.assertDictEqual(sync_log.index_tree.indices, {})
+        self.assertDictEqual(sync_log.extension_index_tree.indices,
+                             {extension.case_id: {index_identifier: host.case_id}})
+        self.assertEqual(sync_log.dependent_case_ids_on_phone, set([extension.case_id]))
+        self.assertEqual(sync_log.case_ids_on_phone, set([extension.case_id, host.case_id]))
+
+    @run_with_cleanliness_restore
+    def test_create_multiple_indices(self):
+        """creating multiple indices should add to the right tree
+        """
+        case_type = 'case'
+        host = CaseStructure(case_id='host',
+                             attrs={'create': True})
+        extension = CaseStructure(
+            case_id='extension',
+            attrs={'create': True, 'owner_id': '-'},
+            indices=[CaseIndex(
+                host,
+                identifier='host',
+                relationship='extension',
+                related_type=case_type,
+            ), CaseIndex(
+                CaseStructure(case_id=host.case_id, attrs={'create': False}),
+                identifier='child',
+                relationship='child',
+                related_type=case_type,
+            )],
+        )
+
+        self.factory.create_or_update_cases([extension])
+        sync_log = get_properly_wrapped_sync_log(self.sync_log._id)
+        self.assertDictEqual(sync_log.index_tree.indices,
+                             {extension.case_id: {'child': host.case_id}})
+        self.assertDictEqual(sync_log.extension_index_tree.indices,
+                             {extension.case_id: {'host': host.case_id}})
+
+    @run_with_cleanliness_restore
+    def test_create_extension_with_extension(self):
+        """creating multiple extensions should be added to the right tree
+        """
+        case_type = 'case'
+        host = CaseStructure(case_id='host',
+                             attrs={'create': True})
+        extension = CaseStructure(
+            case_id='extension',
+            attrs={'create': True, 'owner_id': '-'},
+            indices=[CaseIndex(
+                host,
+                identifier='host',
+                relationship='extension',
+                related_type=case_type,
+            )],
+        )
+        extension_extension = CaseStructure(
+            case_id='extension_extension',
+            attrs={'create': True, 'owner_id': '-'},
+            indices=[CaseIndex(
+                extension,
+                identifier='host_2',
+                relationship='extension',
+                related_type=case_type,
+            )]
+        )
+
+        self.factory.create_or_update_cases([extension_extension])
+        sync_log = get_properly_wrapped_sync_log(self.sync_log._id)
+        expected_extension_tree = {extension.case_id: {'host': host.case_id},
+                                   extension_extension.case_id: {'host_2': extension.case_id}}
+        self.assertDictEqual(sync_log.index_tree.indices, {})
+        self.assertDictEqual(sync_log.extension_index_tree.indices, expected_extension_tree)
+
+    @run_with_cleanliness_restore
+    def test_create_extension_then_delegate(self):
+        """A delegated extension should still remain on the phone with the host
+        """
+        case_type = 'case'
+        host = CaseStructure(case_id='host',
+                             attrs={'create': True})
+        extension = CaseStructure(
+            case_id='extension',
+            attrs={'create': True, 'owner_id': '-'},
+            indices=[CaseIndex(
+                host,
+                identifier='host',
+                relationship='extension',
+                related_type=case_type,
+            )],
+        )
+        self.factory.create_or_update_case(extension)
+
+        delegated_extension = CaseStructure(case_id=extension.case_id, attrs={'owner_id': 'me'})
+        self.factory.create_or_update_case(delegated_extension)
+
+        expected_extension_tree = {extension.case_id: {'host': host.case_id}}
+        sync_log = get_properly_wrapped_sync_log(self.sync_log._id)
+        self.assertDictEqual(sync_log.extension_index_tree.indices, expected_extension_tree)
+        self.assertEqual(sync_log.dependent_case_ids_on_phone, set([extension.case_id]))
+        self.assertEqual(sync_log.case_ids_on_phone, set([extension.case_id, host.case_id]))
+
+    @run_with_cleanliness_restore
+    def test_create_delegated_extension(self):
+        case_type = 'case'
+        host = CaseStructure(case_id='host',
+                             attrs={'create': True})
+        extension = CaseStructure(
+            case_id='extension',
+            attrs={'create': True, 'owner_id': 'foobar'},
+            indices=[CaseIndex(
+                host,
+                identifier='host',
+                relationship='extension',
+                related_type=case_type,
+            )],
+        )
+        self.factory.create_or_update_case(extension)
+
+        expected_extension_tree = {extension.case_id: {'host': host.case_id}}
+        sync_log = get_properly_wrapped_sync_log(self.sync_log._id)
+        self.assertDictEqual(sync_log.extension_index_tree.indices, expected_extension_tree)
+        self.assertEqual(sync_log.case_ids_on_phone, set([host.case_id, extension.case_id]))
+
+    @run_with_cleanliness_restore
+    def test_close_host(self):
+        """closing a host should update the appropriate trees
+        """
+        case_type = 'case'
+        index_identifier = 'idx'
+        host = CaseStructure(case_id='host',
+                             attrs={'create': True})
+        extension = CaseStructure(
+            case_id='extension',
+            attrs={'create': True, 'owner_id': '-'},
+            indices=[CaseIndex(
+                host,
+                identifier=index_identifier,
+                relationship='extension',
+                related_type=case_type,
+            )],
+        )
+
+        self.factory.create_or_update_cases([extension])
+        sync_log = get_properly_wrapped_sync_log(self.sync_log._id)
+        self.assertDictEqual(sync_log.extension_index_tree.indices,
+                             {extension.case_id: {index_identifier: host.case_id}})
+
+        closed_host = CaseStructure(case_id=host.case_id, attrs={'close': True})
+        self.factory.create_or_update_case(closed_host)
+        sync_log = get_properly_wrapped_sync_log(self.sync_log._id)
+        self.assertDictEqual(sync_log.extension_index_tree.indices, {})
+        self.assertEqual(sync_log.dependent_case_ids_on_phone, set([]))
+        self.assertEqual(sync_log.case_ids_on_phone, set([]))
+
+    @run_with_cleanliness_restore
+    def test_long_chain_with_children(self):
+        """
+                  +----+
+                  | E1 |
+                  +--^-+
+                     |e
+        +---+     +--+-+
+        |O  +--c->| C  |
+        +---+     +--^-+
+       (owned)       |e
+                  +--+-+
+                  | E2 |
+                  +----+
+        """
+        case_type = 'case'
+
+        E1 = CaseStructure(
+            case_id='extension_1',
+            attrs={'create': True, 'owner_id': '-'},
+        )
+
+        C = CaseStructure(
+            case_id='child',
+            attrs={'create': True, 'owner_id': '-'},
+            indices=[CaseIndex(
+                E1,
+                identifier='extension_1',
+                relationship='extension',
+                related_type=case_type,
+            )]
+        )
+
+        O = CaseStructure(
+            case_id='owned',
+            attrs={'create': True},
+            indices=[CaseIndex(
+                C,
+                identifier='child',
+                relationship='child',
+                related_type=case_type,
+            )]
+        )
+        E2 = CaseStructure(
+            case_id='extension_2',
+            attrs={'create': True, 'owner_id': '-'},
+            indices=[CaseIndex(
+                E1,
+                identifier='extension',
+                relationship='extension',
+                related_type=case_type,
+            )]
+        )
+        self.factory.create_or_update_cases([O, E2])
+        sync_log = get_properly_wrapped_sync_log(self.sync_log._id)
+
+        expected_dependent_ids = set([C.case_id, E1.case_id, E2.case_id])
+        self.assertEqual(sync_log.dependent_case_ids_on_phone, expected_dependent_ids)
+
+        all_ids = set([E1.case_id, E2.case_id, O.case_id, C.case_id])
+        self.assertEqual(sync_log.case_ids_on_phone, all_ids)
 
 
 class ChangingOwnershipTest(SyncBaseTest):
