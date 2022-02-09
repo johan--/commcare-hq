@@ -6,7 +6,7 @@ werkzeug
 line_profiler==1.0b3
 git+git://github.com/dimagi/couchdbkit-debugpanel.git
 Fabric==1.10.0
-ansible==1.8.2  # to run fab development *
+ansible==4.2.0  # to run fab development *
 Sphinx==1.3.1
 sphinx-rtd-theme==0.1.8
 Jinja2==2.8
