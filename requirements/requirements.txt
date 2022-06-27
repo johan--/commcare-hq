@@ -70,7 +70,7 @@ fakecouch==0.0.8
 # WeasyPrint==0.20.2
 twilio==3.6.4
 django-countries==3.3
-reportlab==3.0
+reportlab==3.5.55
 stripe==1.12.2
 django-compressor==1.4
 django-angular==0.7.8
